@@ -32,10 +32,12 @@ pip3 install --user rumps
 ```
 
 Press **Ctrl+C** (or click "Stop Recording" in the menu bar) to stop. Mic and
-system audio are recorded and merged as **separate original files**:
+system audio are recorded and merged as **separate original files**, and
+every recording gets its own timestamped + unique-ID folder so multiple
+recordings on the same day never collide or overwrite each other:
 
 ```
-~/ZoomRecordings/<YYYY-MM-DD>/
+~/ZoomRecordings/<YYYY-MM-DD>/<HH-MM-SS>_<uid>/
   recording_mic.wav       read-only original, mic track
   recording_sys.wav       read-only original, system/loopback track (if used)
   .segments/              raw crash-safe segments, archived not deleted
@@ -45,6 +47,12 @@ system audio are recorded and merged as **separate original files**:
   capture.log
 ~/ZoomRecordings/manifest.jsonl   append-only sha256 + duration + coverage log
 ```
+
+`<uid>` is an 8-character random ID appended to the start time (e.g.
+`15-26-03_a1b2c3f4`); it exists so that even a same-second start is a hard
+error (folder creation fails loudly) rather than two recordings silently
+sharing one folder. Each manifest line records both `date` and `session` so
+you can tell same-day recordings apart at a glance.
 
 ### Why originals are protected
 
@@ -62,13 +70,14 @@ that structurally impossible:
   answers "does this still match what was recorded," forever.
 - Any downstream tool (transcription, enhancement, etc.) should write into
   `derived/`, never over an original. Wrap it with `safe_derive.py`, which
-  refuses to run if the declared output path lands inside a dated recording
-  folder outside `derived/`:
+  refuses to run if the declared output path lands inside a recording
+  session's folder (detected by the `capture.log` it contains, not by name)
+  outside that session's `derived/`:
 
   ```bash
-  ./safe_derive.py --out ~/ZoomRecordings/2026-09-16/derived/enhanced.wav -- \
-      some-enhancer --in ~/ZoomRecordings/2026-09-16/recording_mic.wav \
-                     --out ~/ZoomRecordings/2026-09-16/derived/enhanced.wav
+  ./safe_derive.py --out ~/ZoomRecordings/2026-09-16/15-26-03_a1b2c3f4/derived/enhanced.wav -- \
+      some-enhancer --in ~/ZoomRecordings/2026-09-16/15-26-03_a1b2c3f4/recording_mic.wav \
+                     --out ~/ZoomRecordings/2026-09-16/15-26-03_a1b2c3f4/derived/enhanced.wav
   ```
 
 ### Verification on stop

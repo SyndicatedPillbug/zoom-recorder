@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -644,7 +645,8 @@ def append_manifest(basedir: Path, outdir: Path, path: Path,
     no backup daemon, just a flat manifest next to the recordings."""
     manifest_path = basedir / "manifest.jsonl"
     entry = {
-        "date": outdir.name,
+        "date": outdir.parent.name,
+        "session": outdir.name,
         "path": str(path),
         "sha256": sha256_file(path),
         "duration_s": round(verify.duration_s, 1) if verify else None,
@@ -705,14 +707,14 @@ def transcribe(cfg: Config, merged: Path, log: Log) -> None:
         log.warn("Install it: brew install whisper-cpp")
 
 
-def self_test(cfg: Config, system_cands: List[Candidate], outputs: List[Device], log: Log) -> int:
+def self_test(probe_seconds_arg: float, system_cands: List[Candidate], outputs: List[Device], log: Log) -> int:
     log.info("Self-test: outputs = {}".format(
         ", ".join(o.name for o in outputs) if outputs else "(none reported by ffmpeg)"))
     if not system_cands:
         log.warn("No loopback/system input found. Zoom audio will not be captured.")
         log.warn("Install a loopback device (BlackHole) or run Zoom so ZoomAudioDevice appears.")
         return 1
-    probe_seconds = max(1.5, cfg.probe_seconds)
+    probe_seconds = max(1.5, probe_seconds_arg)
     total = probe_seconds * len(system_cands) + 2.0
     tmp = Path(tempfile.mkdtemp(prefix="zoomrec_"))
     tone = tmp / "tone.wav"
@@ -802,8 +804,29 @@ def main(argv: List[str]) -> int:
     minutes = args.minutes_opt if args.minutes_opt is not None else args.minutes
     segment_seconds = int((minutes if minutes else 5) * 60)
     basedir = Path(os.path.expanduser(args.basedir))
-    outdir = basedir / datetime.now().strftime("%Y-%m-%d")
-    outdir.mkdir(parents=True, exist_ok=True)
+
+    mic_cands = build_mic_candidates(inputs)
+    system_cands = build_system_candidates(inputs)
+
+    if args.self_test:
+        # No recording happens, so no dated/session folder is created for it --
+        # just log to the console.
+        code = self_test(args.probe_seconds, system_cands, outputs, Log(None))
+        return code
+
+    # Every recording gets its own folder: <basedir>/<day>/<HH-MM-SS>_<uid>/.
+    # The UID makes a same-second collision (already effectively impossible)
+    # a hard error instead of two recordings silently landing in one folder.
+    started = datetime.now()
+    day_dir = basedir / started.strftime("%Y-%m-%d")
+    session_name = "{}_{}".format(started.strftime("%H-%M-%S"), uuid.uuid4().hex[:8])
+    outdir = day_dir / session_name
+    try:
+        outdir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        print("ERROR: session folder {} already exists -- rerun to get a fresh "
+              "timestamp/UID.".format(outdir), file=sys.stderr)
+        return 1
     workdir = Path(tempfile.mkdtemp(prefix="zoomrec_"))
     log = Log(outdir / "capture.log")
 
@@ -823,14 +846,6 @@ def main(argv: List[str]) -> int:
         outdir=outdir,
         workdir=workdir,
     )
-
-    mic_cands = build_mic_candidates(inputs)
-    system_cands = build_system_candidates(inputs)
-
-    if args.self_test:
-        code = self_test(cfg, system_cands, outputs, log)
-        log.close()
-        return code
 
     log.info("zoom-recorder starting. Output: {}".format(outdir))
     log.info("Inputs detected: {}".format(", ".join(d.name for d in inputs) or "(none)"))
