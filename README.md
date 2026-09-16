@@ -96,6 +96,31 @@ mic-access process for an EDR to flag or that could record something by
 accident. Click "Stop Recording" to send the same clean-shutdown signal
 Ctrl+C would.
 
+**Note:** the repo must live outside `~/Documents`, `~/Desktop`, and
+`~/Downloads`. Those are TCC-protected on macOS, and a process spawned by
+launchd (as opposed to one you run from Terminal, which already has its own
+granted access) gets silently denied trying to even read the script.
+
+#### Auto-start at login
+
+```bash
+./install-launch-agent.sh     # installs a LaunchAgent, starts it now, and
+                               # makes it start automatically at every login
+./uninstall-launch-agent.sh   # removes it
+```
+
+This only registers `menubar.py` (the always-visible toggle) to start at
+login -- never the recorder itself. Logs go to
+`~/Library/Logs/zoom-recorder-menubar.log`. If it ever crashes, launchd
+restarts it automatically (`KeepAlive` on non-zero exit only, so quitting it
+yourself via the menu doesn't trigger an immediate respawn).
+
+#### If it's not running for some reason
+
+Double-click **`run-menubar.command`** in Finder (or run it from a shell). It
+restarts the LaunchAgent if one is installed, or starts `menubar.py` directly
+otherwise. Safe to run at any time, including while it's already up.
+
 ### Options
 
 | Flag | Default | Meaning |
