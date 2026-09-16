@@ -195,6 +195,24 @@ class StateTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["text"], "b")
 
+    def test_timeline_interleaves_transcript_and_answers(self) -> None:
+        state = LiveState()
+        state.add("transcript", text="hello there")
+        state.add("answer", kind="rolling", bullets=["point a"])
+        state.add("transcript", text="what is the plan?")
+        state.add("answer", kind="question", question="what is the plan?",
+                  bullets=["phase 1"], sources=["notes.md"])
+        md = state.timeline_markdown(title="Live conversation")
+        self.assertIn("Live conversation", md)
+        # Chronological: speech, its answer, next speech, its answer.
+        self.assertLess(md.index("hello there"), md.index("point a"))
+        self.assertLess(md.index("point a"), md.index("what is the plan?"))
+        self.assertIn("Talking points", md)
+        self.assertIn("notes.md", md)
+
+    def test_timeline_empty(self) -> None:
+        self.assertEqual(LiveState().timeline_markdown(), "")
+
 
 class ServerTests(unittest.TestCase):
     def test_health_and_state(self) -> None:

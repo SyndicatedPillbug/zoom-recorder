@@ -129,15 +129,27 @@ class LiveSession:
 
     def _persist(self) -> None:
         derived = self.outdir / "derived"
+        written = []
         try:
             derived.mkdir(parents=True, exist_ok=True)
             transcript = self.state.transcript_text()
             if transcript:
                 (derived / "live_transcript.txt").write_text(
                     transcript + "\n", encoding="utf-8")
+                written.append("live_transcript.txt")
             answers = self.state.answers_markdown()
             if answers:
                 (derived / "live_answers.md").write_text(answers, encoding="utf-8")
-            self.log("Live HUD: wrote derived/live_transcript.txt and derived/live_answers.md")
+                written.append("live_answers.md")
+            # Interleaved transcript + answers, so each answer sits next to the
+            # speech that prompted it.
+            title = "Live conversation — {} {}".format(
+                self.outdir.parent.name, self.outdir.name)
+            conversation = self.state.timeline_markdown(title=title)
+            if conversation:
+                (derived / "live_conversation.md").write_text(conversation, encoding="utf-8")
+                written.append("live_conversation.md")
+            if written:
+                self.log("Live HUD: wrote derived/{}".format(", ".join(written)))
         except OSError as exc:
             self.log("live HUD: could not persist outputs ({})".format(exc))

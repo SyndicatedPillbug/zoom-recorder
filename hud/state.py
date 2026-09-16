@@ -101,3 +101,39 @@ class LiveState:
                 lines.append("_Sources: {}_".format(", ".join(sources)))
             lines.append("")
         return "\n".join(lines).strip() + ("\n" if lines else "")
+
+    def timeline_markdown(self, title: str = "") -> str:
+        """Interleave transcript lines and answer blocks in chronological order.
+
+        This is the 'transcript + AI answers, relative to the conversation'
+        file -- each answer sits directly after the speech that prompted it.
+        """
+        with self._lock:
+            events = [e for e in self._events
+                      if e.get("type") in ("transcript", "answer")]
+        if not events:
+            return ""
+        lines: List[str] = []
+        if title:
+            lines.append("# {}".format(title))
+            lines.append("")
+        for e in events:
+            stamp = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
+            if e["type"] == "transcript":
+                text = str(e.get("text", "")).strip()
+                if text:
+                    lines.append("[{}] {}".format(stamp, text))
+                continue
+            question = e.get("question")
+            kind = e.get("kind", "answer")
+            heading = question if question else ("Talking points" if kind == "rolling" else "Answer")
+            lines.append("")
+            lines.append("[{}] **{}**".format(stamp, heading))
+            for bullet in e.get("bullets", []):
+                lines.append("- {}".format(bullet))
+            sources = e.get("sources") or []
+            if sources:
+                lines.append("")
+                lines.append("_Sources: {}_".format(", ".join(sources)))
+            lines.append("")
+        return "\n".join(lines).strip() + "\n"

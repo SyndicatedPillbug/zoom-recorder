@@ -175,8 +175,13 @@ right**, generated from both the conversation and a background database of
 ```
 
 The window is served from `127.0.0.1` (a random free port) and closes when the
-recording stops; the transcript and answers are also written to
-`derived/live_transcript.txt` and `derived/live_answers.md`.
+recording stops. Three files are written under `derived/`:
+
+| File | Contents |
+| --- | --- |
+| `live_transcript.txt` | The transcript alone (unchanged transcript behaviour) |
+| `live_conversation.md` | Transcript **and** answers interleaved in order, so each answer sits next to the speech that prompted it |
+| `live_answers.md` | Just the AI answers and talking points |
 
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
