@@ -81,7 +81,16 @@ class LiveState:
             events = [e for e in self._events if e.get("type") == "transcript"]
         if since_ts is not None:
             events = [e for e in events if e.get("ts", 0) >= since_ts]
-        return " ".join(str(e.get("text", "")).strip() for e in events).strip()
+        lines: List[str] = []
+        for e in events:
+            text = str(e.get("text", "")).strip()
+            if not text:
+                continue
+            stamp = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
+            speaker = e.get("speaker")
+            prefix = "{}: ".format(speaker) if speaker else ""
+            lines.append("[{}] {}{}".format(stamp, prefix, text))
+        return "\n".join(lines)
 
     def answers_markdown(self) -> str:
         with self._lock:
@@ -122,7 +131,9 @@ class LiveState:
             if e["type"] == "transcript":
                 text = str(e.get("text", "")).strip()
                 if text:
-                    lines.append("[{}] {}".format(stamp, text))
+                    speaker = e.get("speaker")
+                    prefix = "{}: ".format(speaker) if speaker else ""
+                    lines.append("[{}] {}{}".format(stamp, prefix, text))
                 continue
             question = e.get("question")
             kind = e.get("kind", "answer")

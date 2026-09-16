@@ -28,8 +28,8 @@ from hud.llm import LLMError, LLMResult  # noqa: E402
 from hud.menu_state import describe  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState  # noqa: E402
-from hud.stt import (Chunker, frame_rms_dbfs, overlap_suffix_prefix,  # noqa: E402
-                     pcm_to_wav, split_words)
+from hud.stt import (Chunker, LiveTranscriber, frame_rms_dbfs,  # noqa: E402
+                     overlap_suffix_prefix, pcm_to_wav, split_words)
 
 
 def tone(seconds: float, freq: float = 440.0, amp: int = 16000) -> bytes:
@@ -183,7 +183,9 @@ class StateTests(unittest.TestCase):
         snap = state.snapshot()
         self.assertEqual(len(snap["transcript"]), 2)
         self.assertEqual(len(snap["answers"]), 1)
-        self.assertEqual(state.transcript_text(), "hello world")
+        text = state.transcript_text()
+        self.assertIn("hello", text)
+        self.assertIn("world", text)
         self.assertIn("Talking points", state.answers_markdown())
 
     def test_since_and_latest(self) -> None:
@@ -212,6 +214,42 @@ class StateTests(unittest.TestCase):
 
     def test_timeline_empty(self) -> None:
         self.assertEqual(LiveState().timeline_markdown(), "")
+
+    def test_speaker_labels_in_outputs(self) -> None:
+        state = LiveState()
+        state.add("transcript", text="hello there", speaker="Dana")
+        state.add("transcript", text="glad to meet you", speaker="Client")
+        text = state.transcript_text()
+        self.assertIn("Dana: hello there", text)
+        self.assertIn("Client: glad to meet you", text)
+        timeline = state.timeline_markdown()
+        self.assertIn("Dana: hello there", timeline)
+
+
+class SourceTests(unittest.TestCase):
+    def _transcriber(self, cfg, mic, system):
+        return LiveTranscriber(LiveState(), lambda _m: None, cfg, mic, system)
+
+    def test_two_labelled_sources(self) -> None:
+        cfg = HudConfig(speakers_enabled=True, self_name="Dana", remote_name="Client")
+        sources = self._transcriber(cfg, "Mic", "System")._build_sources()
+        self.assertEqual([s.speaker for s in sources], ["Dana", "Client"])
+        # Separate taps, no mixing.
+        self.assertTrue(all("avfoundation" in s.cmd for s in sources))
+        self.assertTrue(all("amix" not in " ".join(s.cmd) for s in sources))
+
+    def test_mixed_when_labels_disabled(self) -> None:
+        cfg = HudConfig(speakers_enabled=False)
+        sources = self._transcriber(cfg, "Mic", "System")._build_sources()
+        self.assertEqual(len(sources), 1)
+        self.assertIsNone(sources[0].speaker)
+        self.assertIn("amix", " ".join(sources[0].cmd))
+
+    def test_mic_only_is_labelled(self) -> None:
+        cfg = HudConfig(speakers_enabled=True, self_name="Dana")
+        sources = self._transcriber(cfg, "Mic", None)._build_sources()
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].speaker, "Dana")
 
 
 class ServerTests(unittest.TestCase):

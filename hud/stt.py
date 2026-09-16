@@ -262,6 +262,22 @@ class LocalWhisperSTT:
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
+class _Source:
+    """One independent audio source (mic or system/loopback).
+
+    Each source gets its own ffmpeg tap, chunker and transcription thread, so
+    speech can be attributed to the channel it arrived on -- no diarization
+    model needed for the two-party case.
+    """
+
+    def __init__(self, speaker: Optional[str], cmd: List[str]) -> None:
+        self.speaker = speaker
+        self.cmd = cmd
+        self.proc: Optional[subprocess.Popen] = None
+        self.thread: Optional[threading.Thread] = None
+        self.tail: List[str] = []
+
+
 class LiveTranscriber:
     def __init__(self, state: LiveState, log: Callable[[str], None], cfg: HudConfig,
                  mic_name: Optional[str], system_name: Optional[str] = None,
@@ -273,30 +289,49 @@ class LiveTranscriber:
         self.system_name = system_name
         self.model_path = model_path
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._proc: Optional[subprocess.Popen] = None
+        self._sources: List[_Source] = []
         self._stt: object = None
-        self._tail: List[str] = []
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="hud-stt", daemon=True)
-        self._thread.start()
+        try:
+            self._stt = self._build_stt()
+        except Exception as exc:  # noqa: BLE001
+            self.log("live STT disabled: {}".format(exc))
+            self.state.set_status("recording", stt_error=str(exc))
+            return
+        try:
+            self._sources = self._build_sources()
+        except Exception as exc:  # noqa: BLE001
+            self.log("live tap disabled: {}".format(exc))
+            self.state.set_status("recording", tap_error=str(exc))
+            return
+
+        label = " + ".join(s.speaker or "mixed" for s in self._sources)
+        self.log("live STT running ({} backend, {:.0f}s chunks, sources: {})".format(
+            self.cfg.stt_backend, self.cfg.stt_chunk_seconds, label))
+        for source in self._sources:
+            source.thread = threading.Thread(
+                target=self._run_source, args=(source,),
+                name="hud-stt-{}".format(source.speaker or "mix"), daemon=True)
+            source.thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        proc = self._proc
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:  # noqa: BLE001
+        for source in self._sources:
+            proc = source.proc
+            if proc is not None and proc.poll() is None:
                 try:
-                    proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=5)
                 except Exception:  # noqa: BLE001
-                    pass
-        if self._thread is not None:
-            self._thread.join(timeout=8.0)
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+        for source in self._sources:
+            if source.thread is not None:
+                source.thread.join(timeout=8.0)
         closer = getattr(self._stt, "close", None)
         if callable(closer):
             try:
@@ -324,62 +359,64 @@ class LiveTranscriber:
             raise RuntimeError("STT provider '{}' has no speech endpoint".format(provider.name))
         return RemoteSTT(client, model, self.log)
 
-    def _tap_command(self) -> List[str]:
+    # -- sources -----------------------------------------------------------
+    def _device_cmd(self, name: str) -> List[str]:
+        return ["ffmpeg", "-hide_banner", "-nostdin", "-thread_queue_size", "1024",
+                "-f", "avfoundation", "-i", ":{}".format(name),
+                "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
+
+    def _mixed_cmd(self, mic: str, system: str) -> List[str]:
+        return ["ffmpeg", "-hide_banner", "-nostdin", "-thread_queue_size", "1024",
+                "-f", "avfoundation", "-i", ":{}".format(mic),
+                "-thread_queue_size", "1024",
+                "-f", "avfoundation", "-i", ":{}".format(system),
+                "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest[a]",
+                "-map", "[a]", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
+
+    def _file_cmd(self, path: str) -> List[str]:
+        return ["ffmpeg", "-hide_banner", "-nostdin", "-i", path,
+                "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
+
+    def _build_sources(self) -> List[_Source]:
         if self.cfg.audio_file:
-            return ["ffmpeg", "-hide_banner", "-nostdin", "-i", self.cfg.audio_file,
-                    "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
+            return [_Source(None, self._file_cmd(self.cfg.audio_file))]
         if not self.mic_name:
             raise RuntimeError("no microphone device selected for the live tap")
-        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-thread_queue_size", "1024",
-               "-f", "avfoundation", "-i", ":{}".format(self.mic_name)]
+        labelled = self.cfg.speakers_enabled
+        if self.system_name and labelled:
+            # Two independent channels -> accurate two-party attribution with
+            # no diarization model: mic is you, loopback is everyone else.
+            return [
+                _Source(self.cfg.self_name, self._device_cmd(self.mic_name)),
+                _Source(self.cfg.remote_name, self._device_cmd(self.system_name)),
+            ]
         if self.system_name:
-            cmd += ["-thread_queue_size", "1024",
-                    "-f", "avfoundation", "-i", ":{}".format(self.system_name),
-                    "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest[a]",
-                    "-map", "[a]"]
-        else:
-            cmd += ["-map", "0:a"]
-        cmd += ["-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
-        return cmd
+            return [_Source(None, self._mixed_cmd(self.mic_name, self.system_name))]
+        return [_Source(self.cfg.self_name if labelled else None,
+                        self._device_cmd(self.mic_name))]
 
-    # -- main loop ---------------------------------------------------------
-    def _run(self) -> None:
+    # -- per-source loop ---------------------------------------------------
+    def _run_source(self, source: _Source) -> None:
         try:
-            self._stt = self._build_stt()
-        except Exception as exc:  # noqa: BLE001
-            self.log("live STT disabled: {}".format(exc))
-            self.state.set_status("recording", stt_error=str(exc))
-            return
-        try:
-            cmd = self._tap_command()
-        except Exception as exc:  # noqa: BLE001
-            self.log("live tap disabled: {}".format(exc))
-            self.state.set_status("recording", tap_error=str(exc))
-            return
-
-        try:
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            source.proc = subprocess.Popen(
+                source.cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except OSError as exc:
-            self.log("live tap failed to start: {}".format(exc))
+            self.log("live tap failed to start ({}): {}".format(
+                source.speaker or "mixed", exc))
             self.state.set_status("recording", tap_error=str(exc))
             return
-
-        self.log("live STT running ({} backend, {:.0f}s chunks)".format(
-            self.cfg.stt_backend, self.cfg.stt_chunk_seconds))
         chunker = Chunker(self.cfg.stt_chunk_seconds, self.cfg.stt_min_speech_seconds)
-        assert self._proc.stdout is not None
+        assert source.proc.stdout is not None
         try:
-            for block in self._iter_blocks(self._proc.stdout):
+            for block in self._iter_blocks(source.proc.stdout):
                 for chunk in chunker.feed(block):
-                    self._transcribe_chunk(chunk)
+                    self._transcribe_chunk(chunk, source)
             tail = chunker.flush()
             if tail:
-                self._transcribe_chunk(tail)
+                self._transcribe_chunk(tail, source)
         except Exception as exc:  # noqa: BLE001
-            self.log("live transcription loop stopped: {}".format(exc))
-        finally:
-            self.state.set_status("recording")
+            self.log("live transcription loop stopped ({}): {}".format(
+                source.speaker or "mixed", exc))
 
     def _iter_blocks(self, stream, block_bytes: int = 6400) -> Iterator[bytes]:
         while not self._stop.is_set():
@@ -388,7 +425,7 @@ class LiveTranscriber:
                 return
             yield data
 
-    def _transcribe_chunk(self, chunk: bytes) -> None:
+    def _transcribe_chunk(self, chunk: bytes, source: "_Source") -> None:
         if self._stop.is_set():
             return
         started = time.time()
@@ -403,16 +440,17 @@ class LiveTranscriber:
             return
         if not text:
             return
-        delta = self._delta_text(text)
+        delta = self._delta_text(source, text)
         if delta:
             self.state.add("transcript", text=delta, source="live",
+                           speaker=source.speaker,
                            latency=round(time.time() - started, 2))
 
-    def _delta_text(self, text: str) -> str:
+    def _delta_text(self, source: "_Source", text: str) -> str:
         words = split_words(text)
         if not words:
             return ""
-        k = overlap_suffix_prefix(self._tail, words)
+        k = overlap_suffix_prefix(source.tail, words)
         new_words = words[k:]
-        self._tail = (self._tail + new_words)[-12:]
+        source.tail = (source.tail + new_words)[-12:]
         return " ".join(new_words)

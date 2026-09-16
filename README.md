@@ -183,6 +183,23 @@ recording stops. Three files are written under `derived/`:
 | `live_conversation.md` | Transcript **and** answers interleaved in order, so each answer sits next to the speech that prompted it |
 | `live_answers.md` | Just the AI answers and talking points |
 
+**Speaker labels (partial diarization).** Because the mic and the
+system/loopback are captured as *separate channels*, the HUD can attribute
+speech without any diarization model: the mic is labelled with your name and
+the loopback with the other party's. Set the names in the config or with
+`--self-name` / `--remote-name`:
+
+```bash
+./zoom_record.py --live --self-name "Dana" --remote-name "Client"
+```
+
+Each stream is transcribed independently and tagged, so the transcript reads
+`[10:14:02] Dana: ...` / `[10:14:09] Client: ...`. This is exact for two
+parties; multiple *remote* speakers all fall under the single loopback label
+(that case is what full diarization would be needed for). Multiple speakers
+means two STT streams, so audio usage roughly doubles. `--no-speaker-labels`
+mixes mic + system into one unlabelled stream as before.
+
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
 energy-gated, chopped into short chunks, and transcribed either by a remote
@@ -220,6 +237,7 @@ refreshes are dropped first so question answers keep working. Set `budget.tpm`
                "fallback": ["openrouter", "ollama"]},
   "kb":      {"dirs": ["~/notes"], "top_k": 5},
   "hud":     {"port": 0, "open_browser": true},
+  "speakers": {"enabled": true, "self_name": "You", "remote_name": "Others"},
   "api_keys": {"openrouter": "sk-or-..."}
 }
 ```
@@ -255,6 +273,9 @@ egress state. For a fully local setup, use `--stt-backend local` with an
 | `--kb-dir PATH` | none | Directory of `.md` files for context (repeatable) |
 | `--kb-top-k N` | 5 | Knowledge-base snippets per answer |
 | `--kb-reindex` | off | Rebuild the embedding index |
+| `--self-name NAME` | You | Label your microphone audio with this name in the transcript |
+| `--remote-name NAME` | Others | Label the system/loopback audio with this name |
+| `--no-speaker-labels` | off | Mix mic+system into one unlabelled stream |
 | `--live-audio-file PATH` | none | Feed a media file to the HUD instead of a live tap (testing) |
 
 ## How It Works

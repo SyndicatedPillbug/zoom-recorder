@@ -181,6 +181,11 @@ conversation and a background database of `.md` files. Opt-in via `--live`.
   viable on a free tier.
 - **KB is local.** Embeddings (`sentence-transformers`) are computed on-device
   and cached; only the handful of retrieved snippets join the prompt.
+- **Partial diarization via channels.** Mic and system/loopback are separate
+  captures, so each is transcribed independently and labelled (`--self-name` /
+  `--remote-name`, default "You" / "Others"). Exact for two parties with no
+  diarization model; multiple remote speakers share the loopback label.
+  `--no-speaker-labels` restores the single mixed stream.
 
 ## Consent / privacy note
 

@@ -808,6 +808,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="number of knowledge-base snippets per answer (default 5)")
     parser.add_argument("--kb-reindex", action="store_true",
                         help="rebuild the knowledge-base embedding index")
+    parser.add_argument("--self-name", default=None,
+                        help="name to label your microphone audio with (default 'You')")
+    parser.add_argument("--remote-name", default=None,
+                        help="name to label the system/loopback audio with (default 'Others')")
+    parser.add_argument("--no-speaker-labels", action="store_true",
+                        help="mix mic+system into one unlabelled stream")
     return parser.parse_args(argv)
 
 
@@ -849,6 +855,12 @@ def build_hud_config(args: argparse.Namespace):
         cfg.kb_top_k = args.kb_top_k
     if args.kb_reindex:
         cfg.kb_reindex = True
+    if args.self_name:
+        cfg.self_name = args.self_name
+    if args.remote_name:
+        cfg.remote_name = args.remote_name
+    if args.no_speaker_labels:
+        cfg.speakers_enabled = False
     return cfg
 
 

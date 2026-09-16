@@ -230,8 +230,11 @@ class AnswerEngine:
         for event in events:
             self._id_cursor = max(self._id_cursor, int(event.get("id", 0)))
             if event.get("type") == "transcript" and event.get("source") == "live":
-                self._buffer.append((float(event.get("ts", time.time())),
-                                     str(event.get("text", ""))))
+                text = str(event.get("text", ""))
+                speaker = event.get("speaker")
+                if speaker:
+                    text = "{}: {}".format(speaker, text)
+                self._buffer.append((float(event.get("ts", time.time())), text))
 
     def _trim_buffer(self) -> None:
         cutoff = time.time() - self.cfg.context_minutes * 60.0

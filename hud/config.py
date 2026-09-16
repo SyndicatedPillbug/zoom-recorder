@@ -113,6 +113,11 @@ class HudConfig:
     kb_reindex: bool = False
     kb_cache_dir: Optional[str] = None
 
+    # Speaker labelling (channel-based: mic vs system/loopback)
+    speakers_enabled: bool = True
+    self_name: str = "You"
+    remote_name: str = "Others"
+
     # HUD server
     port: int = 0
     open_browser: bool = True
@@ -200,6 +205,7 @@ def _defaults() -> Dict[str, Any]:
             "cache_dir": None,
         },
         "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1"},
+        "speakers": {"enabled": True, "self_name": "You", "remote_name": "Others"},
         "budget": {"tpm": 0, "tpd": 0},
         "api_keys": {},
     }
@@ -222,6 +228,7 @@ def load_config(path: Optional[Path] = None) -> HudConfig:
     answers = data.get("answers", {})
     kb = data.get("kb", {})
     hud = data.get("hud", {})
+    speakers = data.get("speakers", {})
     budget = data.get("budget", {})
 
     cfg = HudConfig(
@@ -246,6 +253,9 @@ def load_config(path: Optional[Path] = None) -> HudConfig:
         kb_top_k=int(kb.get("top_k") or 5),
         kb_reindex=bool(kb.get("reindex", False)),
         kb_cache_dir=kb.get("cache_dir"),
+        speakers_enabled=bool(speakers.get("enabled", True)),
+        self_name=str(speakers.get("self_name") or "You"),
+        remote_name=str(speakers.get("remote_name") or "Others"),
         port=int(hud.get("port") or 0),
         open_browser=bool(hud.get("open_browser", True)),
         host=str(hud.get("host") or "127.0.0.1"),
