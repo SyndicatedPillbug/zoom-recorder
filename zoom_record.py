@@ -815,17 +815,23 @@ def main(argv: List[str]) -> int:
         return code
 
     # Every recording gets its own folder: <basedir>/<day>/<HH-MM-SS>_<uid>/.
-    # The UID makes a same-second collision (already effectively impossible)
-    # a hard error instead of two recordings silently landing in one folder.
+    # A same-second collision is already effectively impossible; if it ever
+    # happens anyway, just draw a fresh UID rather than failing the recording.
     started = datetime.now()
     day_dir = basedir / started.strftime("%Y-%m-%d")
-    session_name = "{}_{}".format(started.strftime("%H-%M-%S"), uuid.uuid4().hex[:8])
-    outdir = day_dir / session_name
-    try:
-        outdir.mkdir(parents=True, exist_ok=False)
-    except FileExistsError:
-        print("ERROR: session folder {} already exists -- rerun to get a fresh "
-              "timestamp/UID.".format(outdir), file=sys.stderr)
+    outdir = None
+    for _ in range(5):
+        session_name = "{}_{}".format(started.strftime("%H-%M-%S"), uuid.uuid4().hex[:8])
+        candidate = day_dir / session_name
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        outdir = candidate
+        break
+    if outdir is None:
+        print("ERROR: could not find an unused session folder under {} after "
+              "several tries.".format(day_dir), file=sys.stderr)
         return 1
     workdir = Path(tempfile.mkdtemp(prefix="zoomrec_"))
     log = Log(outdir / "capture.log")
