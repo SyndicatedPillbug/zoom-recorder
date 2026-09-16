@@ -6,7 +6,11 @@ No background daemon watches for calls or auto-arms itself -- per the
 writes is exactly what an EDR (Falcon) is tuned to flag, and it's a consent
 risk if it ever records something it shouldn't. This app only exists, visibly,
 in the menu bar; the recorder subprocess only exists while you're actually
-recording, and the icon always shows which state you're in.
+recording, and the icon always shows which state you're in (🎙 idle,
+🔴 REC recording, 🧠 HUD recording with the live window up).
+
+The menu gives the live HUD its own distinct options: "Start with Live HUD"
+and "Open Live HUD…", separate from the plain "Start Recording" toggle.
 
 Usage:
     pip3 install --user rumps
@@ -23,12 +27,14 @@ from pathlib import Path
 
 import rumps
 
+from hud.menu_state import describe
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDER = SCRIPT_DIR / "zoom_record.py"
 PIDFILE = Path.home() / ".zoom_recorder.pid"
+HUD_URLFILE = Path.home() / ".zoom_recorder_hud.url"
 
 IDLE_TITLE = "🎙"
-RECORDING_TITLE = "🔴 REC"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -59,13 +65,24 @@ class RecorderApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(IDLE_TITLE, quit_button="Quit")
         self.toggle_item = rumps.MenuItem("Start Recording", callback=self.toggle)
-        self.menu = [self.toggle_item]
+        self.live_item = rumps.MenuItem("Start with Live HUD", callback=self.start_live)
+        self.open_hud_item = rumps.MenuItem("Open Live HUD…", callback=self.open_hud)
+        self.menu = [self.toggle_item, self.live_item, None, self.open_hud_item]
         self._sync_ui()
+
+    def _hud_active(self) -> bool:
+        # The HUD writes its URL file on start and removes it on stop, so its
+        # presence alongside a live recorder means the HUD is actually up.
+        return HUD_URLFILE.is_file() and _read_pidfile() is not None
 
     def _sync_ui(self) -> None:
         recording = _read_pidfile() is not None
-        self.title = RECORDING_TITLE if recording else IDLE_TITLE
-        self.toggle_item.title = "Stop Recording" if recording else "Start Recording"
+        state = describe(recording, self._hud_active())
+        self.title = state["icon"]
+        self.toggle_item.title = state["toggle_title"]
+        self.live_item.title = state["live_title"]
+        self.live_item.set_callback(self.start_live if state["live_enabled"] else None)
+        self.open_hud_item.set_callback(self.open_hud if state["open_enabled"] else None)
 
     def toggle(self, _sender) -> None:
         pid = _read_pidfile()
@@ -75,14 +92,32 @@ class RecorderApp(rumps.App):
             self._start()
         self._sync_ui()
 
-    def _start(self) -> None:
+    def start_live(self, _sender) -> None:
+        if _read_pidfile() is not None:
+            return
+        self._start(live=True)
+        self._sync_ui()
+
+    def open_hud(self, _sender) -> None:
+        if not HUD_URLFILE.is_file():
+            rumps.notification("zoom-recorder", "No HUD running",
+                               "Start a recording with the Live HUD first.")
+            return
+        url = HUD_URLFILE.read_text(encoding="utf-8").strip()
+        if url:
+            subprocess.Popen(["open", url])
+
+    def _start(self, live: bool = False) -> None:
         args = [sys.executable, str(RECORDER)]
         extra = os.environ.get("ZOOM_RECORDER_ARGS")
         if extra:
             args += extra.split()
+        if live and "--live" not in args:
+            args.append("--live")
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         PIDFILE.write_text(str(proc.pid))
-        rumps.notification("zoom-recorder", "Recording started", "")
+        rumps.notification("zoom-recorder", "Recording started",
+                           "Live HUD enabled" if live else "")
 
     def _stop(self, pid: int) -> None:
         try:

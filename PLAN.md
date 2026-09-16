@@ -152,3 +152,60 @@ right now" indicator you'd otherwise have to check a log for.
 
 Items 1–2 are the ones I'd actually implement first; everything else is
 valuable but not "prevents a repeat of today" critical.
+
+---
+
+# Phase 2: Live transcript + AI answer HUD
+
+Goal: a small two-column window during recording — live transcript on the left,
+generative bullet answers/talking points on the right, grounded in both the
+conversation and a background database of `.md` files. Opt-in via `--live`.
+
+## Design decisions
+
+- **Isolation above all.** The HUD is a separate ffmpeg tap plus separate
+  threads. It never touches the capture path, the originals, or verification.
+  If it fails to start (or crashes), recording proceeds exactly as before.
+  Implemented under `hud/`; `zoom_record.py` only calls `LiveSession.start()` /
+  `.stop()`.
+- **Local web UI, not a native window.** The recorder's main thread is already
+  owned by the monitor loop / rumps. A `127.0.0.1` HTTP + SSE page avoids any
+  GUI-thread contention and gives the two-column layout for free.
+- **Pluggable providers.** Groq is the default for both STT and answers
+  (fastest + cheapest, usable free tier). OpenRouter, OpenAI and Ollama are
+  wired in through the same OpenAI-compatible client; `local` STT uses
+  whisper.cpp. The HUD header always shows what is leaving the machine.
+- **Budget-aware answers.** Detected questions use the stronger model; rolling
+  talking points use the cheap, high-quota model and are dropped first when the
+  daily token budget runs low. This is what makes an aggressive (~35 s) cadence
+  viable on a free tier.
+- **KB is local.** Embeddings (`sentence-transformers`) are computed on-device
+  and cached; only the handful of retrieved snippets join the prompt.
+
+## Consent / privacy note
+
+This is the first feature that can send data off the machine. With a remote STT
+backend the **audio** leaves; with answers enabled the **transcript text** (and
+relevant snippets from the user's own `.md` files) is sent to the answer
+provider. Both are opt-in, both are surfaced live in the HUD, and
+`--live-no-answers` (or a local STT + Ollama combination) keeps everything
+on-device. The no-background-daemon decision from Phase 1 still holds: the HUD
+exists only while a recording is in progress.
+
+## Order of work
+
+1. `hud/` scaffolding: config, OpenAI-compatible client, event state, budget.
+2. HTTP/SSE server + two-column page.
+3. Isolated live tap + chunked STT.
+4. Local markdown knowledge base + embeddings.
+5. Answer engine (question detection, rolling points, provider fallback).
+6. Recorder/menu-bar integration + docs.
+7. Tests, plus a check that `--live` off is byte-identical to before.
+
+All of the above is implemented; see `hud/` and `tests/test_hud.py`.
+
+Menu bar: the HUD gets its own distinct options (`Start with Live HUD`,
+`Open Live HUD…`) rather than reusing the plain recording toggle, with a
+three-state icon (🎙 idle / 🔴 REC recording / 🧠 HUD recording + live window).
+The state logic is kept in `hud/menu_state.py` so it is testable without
+importing `rumps`.

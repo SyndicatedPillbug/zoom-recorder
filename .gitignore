@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets / provider config
+config.local.json
+.env
+.env.*
+
+# HUD caches
+.hud_index/

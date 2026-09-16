@@ -778,7 +778,78 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--list", action="store_true", help="list audio devices and exit")
     parser.add_argument("--self-test", action="store_true",
                         help="play a tone and verify the output->loopback capture path")
+
+    # -- live HUD (opt-in; recording is unchanged when these are not used) ---
+    parser.add_argument("--live", action="store_true",
+                        help="open the live transcript + AI answer HUD during recording")
+    parser.add_argument("--hud-port", type=int, default=None,
+                        help="port for the local HUD (default: random free port)")
+    parser.add_argument("--no-hud-browser", action="store_true",
+                        help="do not auto-open the HUD in a browser")
+    parser.add_argument("--live-no-answers", action="store_true",
+                        help="live transcript only; never call an answer provider")
+    parser.add_argument("--live-audio-file", default=None,
+                        help="feed a media file to the HUD instead of a live tap (testing)")
+    parser.add_argument("--stt-backend", default=None,
+                        help="live STT backend: groq | openai | local")
+    parser.add_argument("--stt-model", default=None, help="override the STT model")
+    parser.add_argument("--stt-chunk-seconds", type=float, default=None,
+                        help="live STT chunk length in seconds (default 14)")
+    parser.add_argument("--answer-backend", default=None,
+                        help="answer provider: groq | openrouter | openai | ollama")
+    parser.add_argument("--answer-model", default=None, help="override the question answer model")
+    parser.add_argument("--answer-rolling-model", default=None,
+                        help="override the rolling talking-points model")
+    parser.add_argument("--answer-interval", type=float, default=None,
+                        help="seconds between rolling talking-point refreshes (default 35)")
+    parser.add_argument("--kb-dir", action="append", default=None,
+                        help="directory of .md files for context (repeatable)")
+    parser.add_argument("--kb-top-k", type=int, default=None,
+                        help="number of knowledge-base snippets per answer (default 5)")
+    parser.add_argument("--kb-reindex", action="store_true",
+                        help="rebuild the knowledge-base embedding index")
     return parser.parse_args(argv)
+
+
+def build_hud_config(args: argparse.Namespace):
+    """Load HUD settings from disk (if any) and apply CLI overrides.
+
+    Imported lazily so the recorder keeps working with no HUD dependencies
+    installed and unchanged behaviour when --live is not passed.
+    """
+    from hud.config import load_config
+
+    cfg = load_config()
+    cfg.enabled = True
+    if args.hud_port is not None:
+        cfg.port = args.hud_port
+    if args.no_hud_browser:
+        cfg.open_browser = False
+    if args.live_no_answers:
+        cfg.answers_enabled = False
+    if args.live_audio_file:
+        cfg.audio_file = args.live_audio_file
+    if args.stt_backend:
+        cfg.stt_backend = args.stt_backend
+    if args.stt_model:
+        cfg.stt_model = args.stt_model
+    if args.stt_chunk_seconds is not None:
+        cfg.stt_chunk_seconds = args.stt_chunk_seconds
+    if args.answer_backend:
+        cfg.answers_backend = args.answer_backend
+    if args.answer_model:
+        cfg.chat_model = args.answer_model
+    if args.answer_rolling_model:
+        cfg.rolling_model = args.answer_rolling_model
+    if args.answer_interval is not None:
+        cfg.answer_interval = args.answer_interval
+    if args.kb_dir:
+        cfg.kb_dirs = args.kb_dir
+    if args.kb_top_k is not None:
+        cfg.kb_top_k = args.kb_top_k
+    if args.kb_reindex:
+        cfg.kb_reindex = True
+    return cfg
 
 
 def main(argv: List[str]) -> int:
@@ -893,6 +964,23 @@ def main(argv: List[str]) -> int:
     rec.start(mic.device, system.device if system else None)
     log.info("Recording. Press Ctrl+C to stop and merge.")
 
+    live = None
+    if args.live:
+        try:
+            from hud.session import LiveSession
+
+            hud_cfg = build_hud_config(args)
+            live = LiveSession(
+                hud_cfg, outdir, log.info,
+                mic.device.name,
+                system.device.name if system else None,
+                cfg.model,
+            )
+            live.start()
+        except Exception as exc:  # noqa: BLE001
+            log.warn("Live HUD unavailable ({}); recording continues normally.".format(exc))
+            live = None
+
     try:
         monitor(cfg, rec, mic_cands, system_cands, stop, log)
     except Exception as exc:  # noqa: BLE001
@@ -900,6 +988,11 @@ def main(argv: List[str]) -> int:
     finally:
         log.info("Stopping recording...")
         rec.stop()
+        if live is not None:
+            try:
+                live.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.warn("Live HUD shutdown error: {}".format(exc))
 
         mic_segments = rec.segments_mic()
         sys_segments = rec.segments_sys()

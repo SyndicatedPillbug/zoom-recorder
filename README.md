@@ -21,6 +21,26 @@ curl -L -o ~/.cache/whisper-cpp/ggml-base.en.bin \
 pip3 install --user rumps
 ```
 
+### Optional: live HUD
+
+The live transcript + AI answer window (`--live`) needs an API key for one
+provider. The defaults use [Groq](https://console.groq.com) (fast and cheap,
+with a usable free tier):
+
+```bash
+export GROQ_API_KEY=...        # or put it in ~/.config/zoom-recorder/config.json
+```
+
+To ground answers in your own notes, install the embedding stack in a virtual
+environment (this pulls in `torch`, so keep it out of the system Python):
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install sentence-transformers
+```
+
+Without it the HUD still runs, just with no knowledge-base grounding.
+
 ## Usage
 
 ```bash
@@ -99,11 +119,21 @@ for the transcription step.
 ### Menu-bar activation (`menubar.py`)
 
 One-keystroke-equivalent start/stop with no background daemon: the menu-bar
-icon (🎙 idle / 🔴 REC active) only spawns the recorder subprocess while
-you're actually recording, so there's never a persistent, silent
-mic-access process for an EDR to flag or that could record something by
-accident. Click "Stop Recording" to send the same clean-shutdown signal
-Ctrl+C would.
+icon only spawns the recorder subprocess while you're actually recording, so
+there's never a persistent, silent mic-access process for an EDR to flag or
+that could record something by accident. The icon shows three states —
+🎙 idle, 🔴 REC recording, 🧠 HUD recording with the live window up — and the
+menu gives the HUD its own options, separate from the plain recording toggle:
+
+```
+Start Recording        ↔ Stop Recording
+Start with Live HUD    → Live HUD active ✓   (disabled while recording)
+Open Live HUD…                                (enabled only while the HUD runs)
+Quit
+```
+
+Click "Stop Recording" to send the same clean-shutdown signal Ctrl+C would;
+**Open Live HUD…** re-opens the window in the browser.
 
 **Note:** the repo must live outside `~/Documents`, `~/Desktop`, and
 `~/Downloads`. Those are TCC-protected on macOS, and a process spawned by
@@ -130,6 +160,71 @@ Double-click **`run-menubar.command`** in Finder (or run it from a shell). It
 restarts the LaunchAgent if one is installed, or starts `menubar.py` directly
 otherwise. Safe to run at any time, including while it's already up.
 
+### Live transcript + AI answer HUD (`--live`)
+
+`--live` opens a small local two-column window in your browser: **live
+transcript on the left**, **bullet-pointed answers and talking points on the
+right**, generated from both the conversation and a background database of
+`.md` files:
+
+```bash
+./zoom_record.py --live                          # Groq STT + Groq answers
+./zoom_record.py --live --kb-dir ~/notes         # ground answers in your notes
+./zoom_record.py --live --live-no-answers        # offline transcript only
+./zoom_record.py --live --answer-backend openrouter   # use OpenRouter instead
+```
+
+The window is served from `127.0.0.1` (a random free port) and closes when the
+recording stops; the transcript and answers are also written to
+`derived/live_transcript.txt` and `derived/live_answers.md`.
+
+**How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
+loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
+energy-gated, chopped into short chunks, and transcribed either by a remote
+OpenAI-compatible endpoint or locally with whisper.cpp. Answers are generated
+on two triggers: immediately when a question is detected, and every ~35 s as
+rolling talking points. Nothing in the HUD can affect the recording — if it
+fails to start, recording proceeds normally.
+
+**Providers.** All are OpenAI-compatible, so the same client serves each of
+them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
+`--stt-backend` flags:
+
+| Provider | STT | Answers | Notes |
+| --- | --- | --- | --- |
+| `groq` (default) | ✅ `whisper-large-v3-turbo` | ✅ `gpt-oss-120b` / `gpt-oss-20b` | Fastest/cheapest; token- and audio-second-limited, not context-limited |
+| `openrouter` | — | ✅ | Use GPT-4o/Claude/Gemini; LLM routing only, no STT |
+| `openai` | ✅ `whisper-1` | ✅ | One key for both |
+| `ollama` | — | ✅ | Fully local; pair with `--stt-backend local` |
+| `local` | ✅ whisper.cpp | — | Private; needs `--model` pointing at a ggml file |
+
+Rolling talking points use the lighter model (`openai/gpt-oss-20b` on Groq)
+while detected questions use the stronger one (`openai/gpt-oss-120b`). The
+budget governor trusts the provider's own rate-limit headers, so it adapts to
+whatever plan you're on; if a daily token cap exists and runs low, rolling
+refreshes are dropped first so question answers keep working. Set `budget.tpm`
+/ `budget.tpd` in the config to impose limits below the provider's.
+
+**Configuration.** Defaults can be set in `~/.config/zoom-recorder/config.json`
+(keep it `chmod 600`); environment variables always win:
+
+```json
+{
+  "stt":     {"backend": "groq", "chunk_seconds": 14},
+  "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
+               "fallback": ["openrouter", "ollama"]},
+  "kb":      {"dirs": ["~/notes"], "top_k": 5},
+  "hud":     {"port": 0, "open_browser": true},
+  "api_keys": {"openrouter": "sk-or-..."}
+}
+```
+
+**Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
+with answers enabled the **transcript text** (plus relevant snippets from your
+`.md` files) is sent to the answer provider. The HUD header always shows the
+egress state. For a fully local setup, use `--stt-backend local` with an
+`ollama` answer backend.
+
 ### Options
 
 | Flag | Default | Meaning |
@@ -144,6 +239,18 @@ otherwise. Safe to run at any time, including while it's already up.
 | `--silence-db N` | -60 | `max_volume` below this counts as silence |
 | `--no-transcribe` | off | Skip transcription |
 | `--model PATH` | base.en | Whisper model to use |
+| `--live` | off | Open the live transcript + AI answer HUD |
+| `--live-no-answers` | off | Live transcript only; never call an answer provider |
+| `--hud-port N` | random | Port for the local HUD |
+| `--no-hud-browser` | off | Do not auto-open the HUD in a browser |
+| `--stt-backend X` | groq | Live STT backend: `groq` \| `openai` \| `local` |
+| `--stt-chunk-seconds N` | 14 | Live STT chunk length |
+| `--answer-backend X` | groq | Answer provider: `groq` \| `openrouter` \| `openai` \| `ollama` |
+| `--answer-interval N` | 35 | Seconds between rolling talking-point refreshes |
+| `--kb-dir PATH` | none | Directory of `.md` files for context (repeatable) |
+| `--kb-top-k N` | 5 | Knowledge-base snippets per answer |
+| `--kb-reindex` | off | Rebuild the embedding index |
+| `--live-audio-file PATH` | none | Feed a media file to the HUD instead of a live tap (testing) |
 
 ## How It Works
 
