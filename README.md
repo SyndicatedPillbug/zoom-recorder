@@ -49,6 +49,7 @@ Without it the HUD still runs, just with no knowledge-base grounding.
 ./zoom_record.py --list       # list audio inputs/outputs and exit
 ./zoom_record.py --self-test  # play a tone and verify the capture path
 ./menubar.py                  # menu-bar toggle: click to start/stop
+./settings.py                 # open the settings GUI (providers, KB, speakers, keys)
 ```
 
 Press **Ctrl+C** (or click "Stop Recording" in the menu bar) to stop. Mic and
@@ -129,6 +130,7 @@ menu gives the HUD its own options, separate from the plain recording toggle:
 Start Recording        ↔ Stop Recording
 Start with Live HUD    → Live HUD active ✓   (disabled while recording)
 Open Live HUD…                                (enabled only while the HUD runs)
+Settings…                                     (config GUI)
 Quit
 ```
 
@@ -228,9 +230,7 @@ refreshes are dropped first so question answers keep working. Set `budget.tpm`
 / `budget.tpd` in the config to impose limits below the provider's.
 
 **Configuration.** Defaults can be set in `~/.config/zoom-recorder/config.json`
-(keep it `chmod 600`); environment variables always win:
-
-```json
+(keep it `chmod 600`); environment variables always win:```json
 {
   "stt":     {"backend": "groq", "chunk_seconds": 14},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
@@ -247,6 +247,25 @@ with answers enabled the **transcript text** (plus relevant snippets from your
 `.md` files) is sent to the answer provider. The HUD header always shows the
 egress state. For a fully local setup, use `--stt-backend local` with an
 `ollama` answer backend.
+
+### Settings GUI
+
+Everything above is editable in a simple local form instead of hand-editing
+JSON — open it from the menu bar (**Settings…**) or run it directly:
+
+```bash
+./settings.py                 # opens a localhost page
+./settings.py --no-browser    # just start it (prints the URL)
+./settings.py --timeout 0     # never auto-close
+```
+
+The page covers STT, answers, knowledge base, speakers, HUD/budget and API
+keys, with live model dropdowns (from each provider's `/models`), a **Test**
+button per provider, and a native folder picker for KB directories. It binds
+loopback only, requires a random one-time token, never displays stored API keys
+(shows `configured ✓` / `not set`), writes the file atomically with a `.bak`
+backup, and shuts down when idle — there's no persistent server. Changes apply
+to the **next** recording, since the HUD reads config at session start.
 
 ### Options
 

@@ -119,6 +119,36 @@ class LLMClient:
         except urllib.error.URLError as exc:
             raise LLMError("network error for {}: {}".format(url, exc.reason)) from exc
 
+    # -- models ------------------------------------------------------------
+    def _get_json(self, path: str, timeout: Optional[float] = None) -> Any:
+        url = "{}{}".format(self.base_url, path)
+        req = urllib.request.Request(
+            url, headers=self._headers("application/json"), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                pass
+            raise LLMError("GET {} -> HTTP {}".format(url, exc.code),
+                           status=exc.code, body=body) from exc
+        except urllib.error.URLError as exc:
+            raise LLMError("network error for {}: {}".format(url, exc.reason)) from exc
+
+    def models(self, timeout: Optional[float] = None) -> List[str]:
+        """Return the provider's model ids (used by the settings GUI)."""
+        obj = self._get_json("/models", timeout)
+        data = obj.get("data") if isinstance(obj, dict) else obj
+        ids: List[str] = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("id"):
+                    ids.append(str(item["id"]))
+        return ids
+
     # -- chat --------------------------------------------------------------
     def chat(self, messages: List[Dict[str, str]], model: str,
              max_tokens: int = 400, temperature: float = 0.2,

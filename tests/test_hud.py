@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from hud.answers import (AnswerEngine, detect_question, estimate_tokens,  # noqa: E402
                          parse_bullets)
 from hud.budget import BudgetGovernor  # noqa: E402
-from hud.config import HudConfig, load_config  # noqa: E402
+from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
+                        load_config, save_config)
 from hud.kb import chunk_markdown  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
 from hud.menu_state import describe  # noqa: E402
@@ -173,6 +174,48 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg.resolve_chat_model())
         self.assertTrue(cfg.resolve_rolling_model())
 
+    def test_round_trip(self) -> None:
+        cfg = HudConfig(
+            speakers_enabled=True, self_name="Dana", remote_name="Client",
+            answers_backend="openrouter", answers_fallback=["groq", "ollama"],
+            kb_dirs=["/a", "/b"], kb_top_k=7, budget_tpm=100, budget_tpd=200,
+            port=1234, open_browser=False, answer_interval=20.0,
+            chat_model="m1", rolling_model="m2", answers_enabled=False)
+        again = config_from_dict(config_to_dict(cfg))
+        for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
+                     "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
+                     "open_browser", "answer_interval", "chat_model", "rolling_model",
+                     "answers_enabled"):
+            self.assertEqual(getattr(cfg, attr), getattr(again, attr), attr)
+
+    def test_save_preserves_unknown_keys_and_backs_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"custom": {"keep": 1}, "api_keys": {"groq": "OLD"}}))
+            save_config(HudConfig(self_name="Dana", api_keys={"groq": "NEW"}), path)
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["custom"], {"keep": 1})
+            self.assertEqual(saved["speakers"]["self_name"], "Dana")
+            self.assertEqual(saved["api_keys"]["groq"], "NEW")
+            self.assertTrue((Path(tmp) / "config.json.bak").is_file())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_save_uses_explicit_api_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"api_keys": {"groq": "KEEP", "openrouter": "DROP"}}))
+            save_config(HudConfig(self_name="Dana"), path,
+                        api_keys={"groq": "KEEP", "openrouter": ""})
+            keys = json.loads(path.read_text())["api_keys"]
+            self.assertEqual(keys["groq"], "KEEP")
+            self.assertEqual(keys["openrouter"], "")
+
+    def test_load_missing_returns_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(Path(tmp) / "nope.json")
+            self.assertEqual(cfg.self_name, "You")
+            self.assertEqual(cfg.answers_backend, "groq")
+
 
 class StateTests(unittest.TestCase):
     def test_events_and_snapshot(self) -> None:
@@ -250,6 +293,72 @@ class SourceTests(unittest.TestCase):
         sources = self._transcriber(cfg, "Mic", None)._build_sources()
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0].speaker, "Dana")
+
+
+class SettingsServerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from hud.settings import SettingsApp
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "config.json"
+        self.app = SettingsApp(port=0, config_path=self.path, open_browser=False,
+                               idle_timeout=0, markers=False, log=lambda _m: None)
+        self.port = self.app.start()
+        self.base = "http://127.0.0.1:{}".format(self.port)
+
+    def tearDown(self) -> None:
+        self.app.stop()
+        self.tmp.cleanup()
+
+    def _call(self, path, body=None, token=True):
+        import urllib.error
+        import urllib.request
+
+        q = "&" if "?" in path else "?"
+        url = self.base + path + (q + "token=" + self.app.token if token else "")
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method="POST" if body is not None else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, {}
+
+    def test_config_masks_keys(self) -> None:
+        status, data = self._call("/api/config")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["config"].get("api_keys"), {})
+        self.assertIn("groq", data["api_keys_set"])
+
+    def test_token_required(self) -> None:
+        status, _ = self._call("/api/config", token=False)
+        self.assertEqual(status, 403)
+
+    def test_save_and_reload(self) -> None:
+        _, data = self._call("/api/config")
+        cfg = data["config"]
+        cfg["speakers"]["self_name"] = "Dana"
+        cfg["answers"]["backend"] = "openrouter"
+        status, res = self._call("/api/config", body={
+            "config": cfg, "api_key_new": {"groq": "gsk_TEST"}})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"])
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["speakers"]["self_name"], "Dana")
+        self.assertEqual(saved["answers"]["backend"], "openrouter")
+        self.assertEqual(saved["api_keys"]["groq"], "gsk_TEST")
+        # Reloading reports the key as set, still without leaking it.
+        _, data2 = self._call("/api/config")
+        self.assertTrue(data2["api_keys_set"]["groq"])
+        self.assertNotIn("gsk_TEST", json.dumps(data2))
+
+    def test_blank_key_field_keeps_existing(self) -> None:
+        self._call("/api/config", body={"config": {"speakers": {"self_name": "A"}},
+                                        "api_key_new": {"groq": "KEEP"}})
+        # A later save with no key updates must not clear it.
+        self._call("/api/config", body={"config": {"speakers": {"self_name": "B"}}})
+        self.assertEqual(json.loads(self.path.read_text())["api_keys"]["groq"], "KEEP")
 
 
 class ServerTests(unittest.TestCase):

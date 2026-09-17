@@ -23,6 +23,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import rumps
@@ -31,8 +33,11 @@ from hud.menu_state import describe
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDER = SCRIPT_DIR / "zoom_record.py"
+SETTINGS = SCRIPT_DIR / "settings.py"
 PIDFILE = Path.home() / ".zoom_recorder.pid"
 HUD_URLFILE = Path.home() / ".zoom_recorder_hud.url"
+SETTINGS_PIDFILE = Path.home() / ".zoom_recorder_settings.pid"
+SETTINGS_URLFILE = Path.home() / ".zoom_recorder_settings.url"
 
 IDLE_TITLE = "🎙"
 
@@ -47,16 +52,16 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _read_pidfile() -> "int | None":
-    if not PIDFILE.is_file():
+def _read_pidfile(path: Path = PIDFILE) -> "int | None":
+    if not path.is_file():
         return None
     try:
-        pid = int(PIDFILE.read_text().strip())
+        pid = int(path.read_text().strip())
     except ValueError:
-        PIDFILE.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
         return None
     if not _pid_alive(pid):
-        PIDFILE.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
         return None
     return pid
 
@@ -67,7 +72,9 @@ class RecorderApp(rumps.App):
         self.toggle_item = rumps.MenuItem("Start Recording", callback=self.toggle)
         self.live_item = rumps.MenuItem("Start with Live HUD", callback=self.start_live)
         self.open_hud_item = rumps.MenuItem("Open Live HUD…", callback=self.open_hud)
-        self.menu = [self.toggle_item, self.live_item, None, self.open_hud_item]
+        self.settings_item = rumps.MenuItem("Settings…", callback=self.open_settings)
+        self.menu = [self.toggle_item, self.live_item, None,
+                     self.open_hud_item, self.settings_item]
         self._sync_ui()
 
     def _hud_active(self) -> bool:
@@ -106,6 +113,27 @@ class RecorderApp(rumps.App):
         url = HUD_URLFILE.read_text(encoding="utf-8").strip()
         if url:
             subprocess.Popen(["open", url])
+
+    def open_settings(self, _sender) -> None:
+        if _read_pidfile(SETTINGS_PIDFILE) is None:
+            try:
+                subprocess.Popen([sys.executable, str(SETTINGS)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                rumps.notification("zoom-recorder", "Settings failed to start", str(exc))
+                return
+        threading.Thread(target=self._open_settings_when_ready, daemon=True).start()
+
+    def _open_settings_when_ready(self) -> None:
+        for _ in range(50):
+            if SETTINGS_URLFILE.is_file():
+                url = SETTINGS_URLFILE.read_text(encoding="utf-8").strip()
+                if url:
+                    subprocess.Popen(["open", url])
+                    return
+            time.sleep(0.1)
+        rumps.notification("zoom-recorder", "Settings",
+                           "Settings window did not start; run ./settings.py")
 
     def _start(self, live: bool = False) -> None:
         args = [sys.executable, str(RECORDER)]

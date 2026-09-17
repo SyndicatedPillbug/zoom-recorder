@@ -214,3 +214,9 @@ Menu bar: the HUD gets its own distinct options (`Start with Live HUD`,
 three-state icon (🎙 idle / 🔴 REC recording / 🧠 HUD recording + live window).
 The state logic is kept in `hud/menu_state.py` so it is testable without
 importing `rumps`.
+
+Settings GUI: `hud/settings.py` + `hud/static/settings.html` serve a loopback
+form (launched via `./settings.py` or the menu bar) that edits the config with
+live model dropdowns, connection tests, and a KB folder picker. It uses a
+one-time token, never exposes stored keys, writes atomically with a backup and
+idle-shuts-down, so it fits the no-persistent-daemon constraint.

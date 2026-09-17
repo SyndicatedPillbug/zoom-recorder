@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -211,6 +212,155 @@ def _defaults() -> Dict[str, Any]:
     }
 
 
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_str_list(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value if str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [p.strip() for p in value.replace(os.pathsep, ",").split(",") if p.strip()]
+    return []
+
+
+def config_from_dict(data: Dict[str, Any]) -> HudConfig:
+    """Build a HudConfig from a (already default-merged) nested dict."""
+    stt = data.get("stt") or {}
+    answers = data.get("answers") or {}
+    kb = data.get("kb") or {}
+    hud = data.get("hud") or {}
+    speakers = data.get("speakers") or {}
+    budget = data.get("budget") or {}
+
+    return HudConfig(
+        stt_backend=str(stt.get("backend") or "groq"),
+        stt_model=stt.get("model") or None,
+        stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 14.0),
+        stt_min_speech_seconds=_as_float(stt.get("min_speech_seconds"), 0.6),
+        stt_whisper_bin=str(stt.get("whisper_bin") or "whisper-server"),
+        answers_enabled=bool(answers.get("enabled", True)),
+        answers_backend=str(answers.get("backend") or "groq"),
+        answers_fallback=_as_str_list(answers.get("fallback")),
+        chat_model=answers.get("chat_model") or None,
+        rolling_model=answers.get("rolling_model") or None,
+        answer_interval=_as_float(answers.get("interval"), 35.0),
+        rolling_enabled=bool(answers.get("rolling_enabled", True)),
+        answer_max_tokens=_as_int(answers.get("max_tokens"), 600),
+        context_minutes=_as_float(answers.get("context_minutes"), 3.0),
+        question_cooldown=_as_float(answers.get("question_cooldown"), 6.0),
+        kb_enabled=bool(kb.get("enabled", True)),
+        kb_dirs=_as_str_list(kb.get("dirs")),
+        kb_model=str(kb.get("model") or "all-MiniLM-L6-v2"),
+        kb_top_k=_as_int(kb.get("top_k"), 5),
+        kb_reindex=bool(kb.get("reindex", False)),
+        kb_cache_dir=kb.get("cache_dir") or None,
+        speakers_enabled=bool(speakers.get("enabled", True)),
+        self_name=str(speakers.get("self_name") or "You"),
+        remote_name=str(speakers.get("remote_name") or "Others"),
+        port=_as_int(hud.get("port"), 0),
+        open_browser=bool(hud.get("open_browser", True)),
+        host=str(hud.get("host") or "127.0.0.1"),
+        budget_tpm=_as_int(budget.get("tpm"), 0),
+        budget_tpd=_as_int(budget.get("tpd"), 0),
+        api_keys={str(k): str(v) for k, v in (data.get("api_keys") or {}).items()},
+    )
+
+
+def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
+    """Inverse of :func:`config_from_dict`; used by the settings GUI."""
+    out = _defaults()
+    out["stt"].update({
+        "backend": cfg.stt_backend,
+        "model": cfg.stt_model,
+        "chunk_seconds": cfg.stt_chunk_seconds,
+        "min_speech_seconds": cfg.stt_min_speech_seconds,
+        "whisper_bin": cfg.stt_whisper_bin,
+    })
+    out["answers"].update({
+        "enabled": cfg.answers_enabled,
+        "backend": cfg.answers_backend,
+        "fallback": list(cfg.answers_fallback),
+        "chat_model": cfg.chat_model,
+        "rolling_model": cfg.rolling_model,
+        "interval": cfg.answer_interval,
+        "rolling_enabled": cfg.rolling_enabled,
+        "max_tokens": cfg.answer_max_tokens,
+        "context_minutes": cfg.context_minutes,
+        "question_cooldown": cfg.question_cooldown,
+    })
+    out["kb"].update({
+        "enabled": cfg.kb_enabled,
+        "dirs": list(cfg.kb_dirs),
+        "model": cfg.kb_model,
+        "top_k": cfg.kb_top_k,
+        "reindex": cfg.kb_reindex,
+        "cache_dir": cfg.kb_cache_dir,
+    })
+    out["speakers"].update({
+        "enabled": cfg.speakers_enabled,
+        "self_name": cfg.self_name,
+        "remote_name": cfg.remote_name,
+    })
+    out["hud"].update({
+        "port": cfg.port,
+        "open_browser": cfg.open_browser,
+        "host": cfg.host,
+    })
+    out["budget"].update({"tpm": cfg.budget_tpm, "tpd": cfg.budget_tpd})
+    out["api_keys"] = dict(cfg.api_keys) if include_keys else {}
+    return out
+
+
+def save_config(cfg: HudConfig, path: Optional[Path] = None,
+                api_keys: Optional[Dict[str, str]] = None) -> Path:
+    """Write the config safely.
+
+    * values are deep-merged onto the existing file so unknown keys survive;
+    * the previous file is backed up as ``config.json.bak``;
+    * the write is atomic (temp file + ``os.replace``) and ``chmod 600``.
+
+    Pass ``api_keys`` to control the stored keys explicitly (the GUI uses this
+    so a blank form field never clears an existing key).
+    """
+    cfg_path = Path(path) if path else CONFIG_PATH
+    existing: Dict[str, Any] = {}
+    if cfg_path.is_file():
+        try:
+            loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            existing = {}
+
+    managed = config_to_dict(cfg, include_keys=False)
+    managed["api_keys"] = ({str(k): str(v) for k, v in api_keys.items()}
+                           if api_keys is not None else dict(cfg.api_keys))
+    merged = _deep_merge(existing, managed)
+
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    if cfg_path.is_file():
+        try:
+            shutil.copy2(str(cfg_path), str(cfg_path.parent / (cfg_path.name + ".bak")))
+        except OSError:
+            pass
+    tmp = cfg_path.parent / (cfg_path.name + ".tmp")
+    tmp.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    os.chmod(str(tmp), 0o600)
+    os.replace(str(tmp), str(cfg_path))
+    return cfg_path
+
+
 def load_config(path: Optional[Path] = None) -> HudConfig:
     cfg_path = Path(path) if path else CONFIG_PATH
     data = _defaults()
@@ -224,45 +374,7 @@ def load_config(path: Optional[Path] = None) -> HudConfig:
             # defaults and let the caller log it.
             data = _defaults()
 
-    stt = data.get("stt", {})
-    answers = data.get("answers", {})
-    kb = data.get("kb", {})
-    hud = data.get("hud", {})
-    speakers = data.get("speakers", {})
-    budget = data.get("budget", {})
-
-    cfg = HudConfig(
-        stt_backend=str(stt.get("backend") or "groq"),
-        stt_model=stt.get("model"),
-        stt_chunk_seconds=float(stt.get("chunk_seconds") or 14.0),
-        stt_min_speech_seconds=float(stt.get("min_speech_seconds") or 0.6),
-        stt_whisper_bin=str(stt.get("whisper_bin") or "whisper-server"),
-        answers_enabled=bool(answers.get("enabled", True)),
-        answers_backend=str(answers.get("backend") or "groq"),
-        answers_fallback=[str(x) for x in (answers.get("fallback") or [])],
-        chat_model=answers.get("chat_model"),
-        rolling_model=answers.get("rolling_model"),
-        answer_interval=float(answers.get("interval") or 35.0),
-        rolling_enabled=bool(answers.get("rolling_enabled", True)),
-        answer_max_tokens=int(answers.get("max_tokens") or 400),
-        context_minutes=float(answers.get("context_minutes") or 3.0),
-        question_cooldown=float(answers.get("question_cooldown") or 6.0),
-        kb_enabled=bool(kb.get("enabled", True)),
-        kb_dirs=[str(x) for x in (kb.get("dirs") or [])],
-        kb_model=str(kb.get("model") or "all-MiniLM-L6-v2"),
-        kb_top_k=int(kb.get("top_k") or 5),
-        kb_reindex=bool(kb.get("reindex", False)),
-        kb_cache_dir=kb.get("cache_dir"),
-        speakers_enabled=bool(speakers.get("enabled", True)),
-        self_name=str(speakers.get("self_name") or "You"),
-        remote_name=str(speakers.get("remote_name") or "Others"),
-        port=int(hud.get("port") or 0),
-        open_browser=bool(hud.get("open_browser", True)),
-        host=str(hud.get("host") or "127.0.0.1"),
-        budget_tpm=int(budget.get("tpm") or 0),
-        budget_tpd=int(budget.get("tpd") or 0),
-        api_keys={str(k): str(v) for k, v in (data.get("api_keys") or {}).items()},
-    )
+    cfg = config_from_dict(data)
 
     # Environment overrides for convenience.
     env_backend = os.environ.get("ZOOM_HUD_ANSWER_BACKEND")
