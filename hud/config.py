@@ -91,10 +91,21 @@ class HudConfig:
     stt_backend: str = "groq"          # groq | openai | local
     stt_model: Optional[str] = None    # None => provider default
     stt_chunk_seconds: float = 10.0    # Groq bills a 10s minimum per request
-    stt_min_speech_seconds: float = 0.6
+    stt_min_speech_seconds: float = 0.8
     stt_whisper_bin: str = "whisper-server"
     stt_glossary: List[str] = field(default_factory=list)
     stt_queue_chunks: int = 4          # bounded per-source STT queue (drop-oldest)
+    # Voice-activity detection / anti-hallucination
+    stt_vad_backend: str = "auto"      # auto | energy | webrtcvad
+    stt_adaptive_vad: bool = True
+    stt_silence_db: float = -50.0
+    stt_vad_margin_db: float = 8.0
+    stt_verbose_stt: bool = True       # request segment confidences (verbose_json)
+    stt_no_speech_prob_max: float = 0.6
+    stt_avg_logprob_min: float = -1.0
+    stt_compression_ratio_max: float = 2.4
+    stt_hallucination_filter: bool = True
+    stt_context_prompt: bool = True    # seed Whisper with previous transcript
 
     # Answers
     answers_enabled: bool = True
@@ -203,10 +214,20 @@ def _defaults() -> Dict[str, Any]:
             "backend": "groq",
             "model": None,
             "chunk_seconds": 10.0,
-            "min_speech_seconds": 0.6,
+            "min_speech_seconds": 0.8,
             "whisper_bin": "whisper-server",
             "glossary": [],
             "queue_chunks": 4,
+            "vad_backend": "auto",
+            "adaptive_vad": True,
+            "silence_db": -50.0,
+            "vad_margin_db": 8.0,
+            "verbose_stt": True,
+            "no_speech_prob_max": 0.6,
+            "avg_logprob_min": -1.0,
+            "compression_ratio_max": 2.4,
+            "hallucination_filter": True,
+            "context_prompt": True,
         },
         "answers": {
             "enabled": True,
@@ -286,10 +307,20 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_backend=str(stt.get("backend") or "groq"),
         stt_model=stt.get("model") or None,
         stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 10.0),
-        stt_min_speech_seconds=_as_float(stt.get("min_speech_seconds"), 0.6),
+        stt_min_speech_seconds=_as_float(stt.get("min_speech_seconds"), 0.8),
         stt_whisper_bin=str(stt.get("whisper_bin") or "whisper-server"),
         stt_glossary=_as_str_list(stt.get("glossary")),
         stt_queue_chunks=_as_int(stt.get("queue_chunks"), 4),
+        stt_vad_backend=str(stt.get("vad_backend") or "auto"),
+        stt_adaptive_vad=bool(stt.get("adaptive_vad", True)),
+        stt_silence_db=_as_float(stt.get("silence_db"), -50.0),
+        stt_vad_margin_db=_as_float(stt.get("vad_margin_db"), 8.0),
+        stt_verbose_stt=bool(stt.get("verbose_stt", True)),
+        stt_no_speech_prob_max=_as_float(stt.get("no_speech_prob_max"), 0.6),
+        stt_avg_logprob_min=_as_float(stt.get("avg_logprob_min"), -1.0),
+        stt_compression_ratio_max=_as_float(stt.get("compression_ratio_max"), 2.4),
+        stt_hallucination_filter=bool(stt.get("hallucination_filter", True)),
+        stt_context_prompt=bool(stt.get("context_prompt", True)),
         answers_enabled=bool(answers.get("enabled", True)),
         answers_backend=str(answers.get("backend") or "groq"),
         answers_fallback=_as_str_list(answers.get("fallback")),
@@ -346,6 +377,16 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "whisper_bin": cfg.stt_whisper_bin,
         "glossary": list(cfg.stt_glossary),
         "queue_chunks": cfg.stt_queue_chunks,
+        "vad_backend": cfg.stt_vad_backend,
+        "adaptive_vad": cfg.stt_adaptive_vad,
+        "silence_db": cfg.stt_silence_db,
+        "vad_margin_db": cfg.stt_vad_margin_db,
+        "verbose_stt": cfg.stt_verbose_stt,
+        "no_speech_prob_max": cfg.stt_no_speech_prob_max,
+        "avg_logprob_min": cfg.stt_avg_logprob_min,
+        "compression_ratio_max": cfg.stt_compression_ratio_max,
+        "hallucination_filter": cfg.stt_hallucination_filter,
+        "context_prompt": cfg.stt_context_prompt,
     })
     out["answers"].update({
         "enabled": cfg.answers_enabled,

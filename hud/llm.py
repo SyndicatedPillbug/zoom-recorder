@@ -36,6 +36,7 @@ class LLMResult:
     model: str = ""
     usage: Dict[str, Any] = field(default_factory=dict)
     headers: Dict[str, str] = field(default_factory=dict)
+    data: Dict[str, Any] = field(default_factory=dict)
 
 
 def _lower_headers(headers: Any) -> Dict[str, str]:
@@ -256,8 +257,9 @@ class LLMClient:
     # -- speech-to-text ----------------------------------------------------
     def transcribe(self, wav_bytes: bytes, model: str, filename: str = "chunk.wav",
                    language: Optional[str] = None, prompt: Optional[str] = None,
+                   response_format: str = "json",
                    timeout: Optional[float] = None) -> LLMResult:
-        fields: Dict[str, str] = {"model": model, "response_format": "json"}
+        fields: Dict[str, str] = {"model": model, "response_format": response_format}
         if language:
             fields["language"] = language
         if prompt:
@@ -267,8 +269,9 @@ class LLMClient:
             [("file", filename, "audio/wav", wav_bytes)],
         )
         obj, headers = self._request("/audio/transcriptions", body, content_type, timeout)
-        text = (obj.get("text") or "").strip() if isinstance(obj, dict) else ""
-        return LLMResult(text=text, model=model, headers=headers)
+        data = obj if isinstance(obj, dict) else {}
+        text = (data.get("text") or "").strip()
+        return LLMResult(text=text, model=model, headers=headers, data=data)
 
 
 def backoff_delay(attempt: int, retry_after: Optional[float] = None) -> float:

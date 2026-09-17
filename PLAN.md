@@ -315,5 +315,35 @@ from a single sentence. Fixes:
   not invent specific numbers/names/integrations.
 - All exposed in the settings GUI and covered by `TalkingPointGroundingTests`.
 
+## Phase 2.4: silence / noise hallucination fix
+
+Real-use feedback: after the mic test the last transcript entries were silence
+and an air conditioner, yet Whisper emitted repetitive filler ("we can see that
+we can see that…"). Causes: a fixed peak-energy gate let steady hum through as
+"speech", the remote call requested no segment confidences, the transcript fed
+the hallucination back as the next Whisper prompt, and there was no text-level
+filter. Fixes:
+
+- **`hud/vad.py`**: per-source adaptive noise floor with a short ambient
+  calibration (steady spread → hum becomes the floor; wide spread → speech is
+  already happening, keep the floor low). `webrtcvad` is used when importable,
+  else the stdlib energy VAD (`stt.vad_backend`, `stt.vad_margin_db`,
+  `stt.silence_db`, `stt.adaptive_vad`).
+- **Chunker** now classifies frames through the VAD and carries a per-chunk
+  margin so marginal chunks can be judged more strictly.
+- **Segment confidence gating**: remote STT requests `verbose_json` and drops
+  segments over `stt.no_speech_prob_max` / under `stt.avg_logprob_min` / over
+  `stt.compression_ratio_max`, falling back to plain `json` if a provider
+  rejects the format.
+- **Text hallucination filter** (`looks_hallucinated`): canned silence phrases,
+  bare interjections on marginal chunks, and repetition loops (low unique-word
+  ratio, or a 3-gram repeated ≥3×).
+- **Prompt hygiene**: only accepted text updates the context tail, and the
+  prompt is trimmed back to the last sentence boundary; `stt.context_prompt`
+  disables it entirely.
+- Covered by `VADTests` / `HallucinationTests`, including a hum-vs-speech
+  Chunker integration test.
+
+
 
 

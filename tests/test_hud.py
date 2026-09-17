@@ -34,7 +34,9 @@ from hud.menu_state import describe  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
 from hud.stt import (Chunker, LiveTranscriber, _Source, frame_rms_dbfs,  # noqa: E402
-                     fuzzy_overlap, overlap_suffix_prefix, pcm_to_wav, split_words)
+                     fuzzy_overlap, looks_hallucinated, overlap_suffix_prefix,
+                     pcm_to_wav, split_words)
+from hud.vad import EnergyVAD, NoiseFloor, build_vad, frame_level_dbfs  # noqa: E402
 
 
 def tone(seconds: float, freq: float = 440.0, amp: int = 16000) -> bytes:
@@ -119,19 +121,27 @@ class SttPipelineTests(unittest.TestCase):
         tr._enqueue(src, b"first")
         tr._enqueue(src, b"second")
         self.assertEqual(src.dropped, 1)
-        _ts, chunk = src.queue.get_nowait()
+        _ts, chunk, _margin = src.queue.get_nowait()
         self.assertEqual(chunk, b"second")
 
     def test_prompt_uses_glossary_and_context(self) -> None:
         tr = self._transcriber(HudConfig(stt_glossary=["Acme", "Q3"]))
         src = _Source("You", [])
-        src.context_tail = "we shipped the beta"
+        src.context_tail = "we shipped the beta."
         prompt = tr._prompt_for(src)
         self.assertIsNotNone(prompt)
         assert prompt is not None
         self.assertIn("Acme", prompt)
         self.assertIn("Q3", prompt)
         self.assertIn("beta", prompt)
+
+    def test_prompt_trims_to_sentence_boundary(self) -> None:
+        tr = self._transcriber(HudConfig())
+        src = _Source("You", [])
+        src.context_tail = "hello world. and then some"
+        self.assertEqual(tr._prompt_for(src), "hello world.")
+        src.context_tail = "no terminator in here"
+        self.assertIsNone(tr._prompt_for(src))
 
     def test_worker_transcribes_with_prompt(self) -> None:
         tr = self._transcriber(HudConfig(stt_glossary=["Acme"]))
@@ -154,6 +164,85 @@ class SttPipelineTests(unittest.TestCase):
         events = tr.state.snapshot()["transcript"]
         self.assertEqual(events[0]["text"], "hello Acme world")
         self.assertIn("Acme", seen["prompt"])
+
+
+class VADTests(unittest.TestCase):
+    def test_frame_level_dbfs(self) -> None:
+        self.assertLess(frame_level_dbfs(b"\x00\x00" * 100), -100)
+        self.assertGreater(frame_level_dbfs(tone(0.1)), -20)
+
+    def test_noise_floor_absorbs_steady_noise(self) -> None:
+        nf = NoiseFloor(initial_db=-45.0)
+        for _ in range(50):
+            nf.update(-44.0, margin_db=8.0)
+        self.assertGreater(nf.noise_db, -45.0)
+        self.assertLessEqual(nf.noise_db, -25.0)
+
+    def test_energy_vad_rejects_hum_accepts_speech(self) -> None:
+        vad = EnergyVAD(absolute_db=-50.0, margin_db=8.0, calibration_frames=5)
+        hum = tone(0.1, freq=120.0, amp=1200)      # steady, well above -50 dBFS
+        speech = tone(0.1, freq=300.0, amp=12000)  # clearly louder
+        for _ in range(5):
+            vad.is_speech(hum)
+        self.assertFalse(vad.is_speech(hum))
+        self.assertTrue(vad.is_speech(speech))
+
+    def test_build_vad_forced_energy(self) -> None:
+        vad = build_vad(HudConfig(stt_vad_backend="energy"), lambda _m: None)
+        self.assertEqual(vad.label, "energy")
+
+    def test_build_vad_auto_always_returns_a_vad(self) -> None:
+        vad = build_vad(HudConfig(stt_vad_backend="auto"), lambda _m: None)
+        self.assertIn(vad.label, ("energy", "webrtcvad"))
+
+    def test_chunker_with_vad_ignores_steady_hum(self) -> None:
+        vad = EnergyVAD(absolute_db=-50.0, margin_db=8.0, calibration_frames=5)
+        chunker = Chunker(chunk_seconds=1.0, min_speech_seconds=0.2,
+                          silence_flush_seconds=0.4, vad=vad)
+        hum = tone(1.0, freq=120.0, amp=1200)
+        self.assertEqual(chunker.feed(hum * 2), [])  # 2s of steady hum
+        self.assertTrue(chunker.feed(tone(1.2, freq=300.0, amp=12000)))
+
+
+class HallucinationTests(unittest.TestCase):
+    def test_repetitive_loop_dropped(self) -> None:
+        text = ("we can see that we can see that there are some people who "
+                "we can see that there are some people who have a lot of people")
+        self.assertTrue(looks_hallucinated(text))
+
+    def test_known_silence_phrases_dropped(self) -> None:
+        self.assertTrue(looks_hallucinated("Thank you."))
+        self.assertTrue(looks_hallucinated("Thanks for watching!"))
+        self.assertTrue(looks_hallucinated("Subtitles by M. Smith"))
+
+    def test_normal_sentence_kept(self) -> None:
+        self.assertFalse(looks_hallucinated(
+            "The quoted lines are from Shakespeare's play Hamlet."))
+
+    def test_bare_interjection_only_when_marginal(self) -> None:
+        self.assertTrue(looks_hallucinated("you", marginal=True))
+        self.assertFalse(looks_hallucinated("you", marginal=False))
+
+    def test_low_confidence_segments_dropped(self) -> None:
+        self.assertTrue(looks_hallucinated(
+            "Some plausible words here now", no_speech_prob=0.9))
+        self.assertTrue(looks_hallucinated(
+            "Some plausible words here now", compression_ratio=3.0))
+
+    def test_verbose_segments_filtered(self) -> None:
+        from hud.llm import LLMResult
+        from hud.stt import RemoteSTT
+
+        stt = RemoteSTT(client=None, model="m", log=lambda _m: None)
+        result = LLMResult(text="x", data={"segments": [
+            {"text": "This is real speech.", "no_speech_prob": 0.1, "avg_logprob": -0.2},
+            {"text": "we can see that we can see", "no_speech_prob": 0.9,
+             "compression_ratio": 3.0},
+        ]})
+        out = stt._from_verbose(result)
+        self.assertIn("This is real speech", out.text)
+        self.assertNotIn("we can see", out.text)
+        self.assertGreater(out.no_speech_prob or 0, 0)
 
 
 class TextTests(unittest.TestCase):

@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Voice-activity detection for the live tap.
+
+Steady broadband noise (air conditioning, fan hum) sits well above a fixed
+peak threshold, so an absolute gate happily transcribes it -- and Whisper then
+hallucinates repetitive filler on that non-speech audio. Instead we track a
+per-source adaptive noise floor and only treat energy clearly above it as
+speech.
+
+``webrtcvad`` is used for a real VAD when installed; otherwise the stdlib
+energy detector is used, so nothing new is required.
+"""
+
+from __future__ import annotations
+
+import math
+import struct
+from typing import Callable, List
+
+SAMPLE_RATE = 16000
+SAMPLE_WIDTH = 2
+
+
+def frame_level_dbfs(pcm: bytes) -> float:
+    """RMS level in dBFS for a small PCM block (0 dB == full scale).
+
+    RMS is used rather than peak so a single transient sample can't pass a
+    steady hum off as speech.
+    """
+    count = len(pcm) // SAMPLE_WIDTH
+    if count <= 0:
+        return -120.0
+    samples = struct.unpack("<{}h".format(count), pcm[: count * SAMPLE_WIDTH])
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    rms = math.sqrt(total / count)
+    if rms <= 0:
+        return -120.0
+    return 20.0 * math.log10(rms / 32768.0)
+
+
+class NoiseFloor:
+    """Adaptive ambient level in dBFS.
+
+    Falls quickly toward quiet frames and rises slowly, so a steady hum becomes
+    the floor while speech (a clear, sustained boost above it) stays speech.
+    """
+
+    def __init__(self, initial_db: float = -60.0, rise_db_per_frame: float = 0.3,
+                 floor_db: float = -80.0, ceiling_db: float = -25.0) -> None:
+        self.noise_db = max(floor_db, min(ceiling_db, initial_db))
+        self.rise_db_per_frame = rise_db_per_frame
+        self.floor_db = floor_db
+        self.ceiling_db = ceiling_db
+
+    def update(self, level_db: float, margin_db: float) -> float:
+        if level_db < self.noise_db:
+            self.noise_db = level_db
+        elif level_db < self.noise_db + margin_db:
+            # Close enough to the floor to be ambient: let it creep up so a
+            # newly-started hum is eventually absorbed.
+            self.noise_db += self.rise_db_per_frame
+        self.noise_db = max(self.floor_db, min(self.ceiling_db, self.noise_db))
+        return self.noise_db
+
+
+class EnergyVAD:
+    """Adaptive energy gate with a short startup calibration."""
+
+    label = "energy"
+
+    def __init__(self, absolute_db: float = -50.0, margin_db: float = 8.0,
+                 adaptive: bool = True, calibration_frames: int = 15) -> None:
+        self.absolute_db = absolute_db
+        self.margin_db = margin_db
+        self.adaptive = adaptive
+        self.calibration_frames = max(0, calibration_frames)
+        self._noise = NoiseFloor(initial_db=absolute_db)
+        self._calibrated = not adaptive or self.calibration_frames == 0
+        self._calibration: List[float] = []
+        self.last_margin_db = 0.0
+
+    def threshold_db(self) -> float:
+        if not self.adaptive:
+            return self.absolute_db
+        return max(self.absolute_db, self._noise.noise_db + self.margin_db)
+
+    def is_speech(self, frame: bytes) -> bool:
+        level = frame_level_dbfs(frame)
+        if not self._calibrated:
+            # Ignore the first fraction of a second entirely: assume it is
+            # ambient. A steady spread means a hum (take the loudest as the
+            # floor); a wide spread means speech was already happening (keep
+            # the floor low so it isn't swallowed).
+            self._calibration.append(level)
+            self.last_margin_db = 0.0
+            if len(self._calibration) >= self.calibration_frames:
+                spread = max(self._calibration) - min(self._calibration)
+                if spread <= self.margin_db:
+                    self._noise.noise_db = max(self._calibration)
+                else:
+                    self._noise.noise_db = min(self._calibration)
+                self._calibrated = True
+            return False
+
+        threshold = self.threshold_db()
+        speech = level > threshold
+        self.last_margin_db = level - threshold
+        self._noise.update(level, self.margin_db)
+        return speech
+
+
+class WebRTCVAD:
+    """Real VAD via the optional ``webrtcvad`` package (20 ms sub-frames)."""
+
+    label = "webrtcvad"
+
+    def __init__(self, aggressiveness: int = 2) -> None:
+        import webrtcvad  # lazy, optional
+
+        self._vad = webrtcvad.Vad(aggressiveness)
+        self.frame_ms = 20
+        self.frame_bytes = int(SAMPLE_RATE * SAMPLE_WIDTH * self.frame_ms / 1000)
+        self.last_margin_db = 0.0
+
+    def is_speech(self, frame: bytes) -> bool:
+        if len(frame) < self.frame_bytes:
+            return False
+        votes = 0
+        total = 0
+        for start in range(0, len(frame) - self.frame_bytes + 1, self.frame_bytes):
+            total += 1
+            try:
+                if self._vad.is_speech(frame[start:start + self.frame_bytes], SAMPLE_RATE):
+                    votes += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return total > 0 and votes * 2 >= total
+
+
+def build_vad(cfg, log: Callable[[str], None]):
+    """Return a VAD according to ``stt.vad_backend`` (default: auto)."""
+    backend = (getattr(cfg, "stt_vad_backend", "auto") or "auto").lower()
+    if backend in ("auto", "webrtcvad"):
+        try:
+            vad = WebRTCVAD()
+            log("live STT: speech detection using webrtcvad")
+            return vad
+        except Exception as exc:  # noqa: BLE001
+            if backend == "webrtcvad":
+                log("live STT: webrtcvad unavailable ({}); using energy VAD".format(exc))
+    return EnergyVAD(
+        absolute_db=float(getattr(cfg, "stt_silence_db", -50.0)),
+        margin_db=float(getattr(cfg, "stt_vad_margin_db", 8.0)),
+        adaptive=bool(getattr(cfg, "stt_adaptive_vad", True)),
+    )

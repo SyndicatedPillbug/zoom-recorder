@@ -16,6 +16,7 @@ import difflib
 import io
 import math
 import queue
+import re
 import shutil
 import struct
 import subprocess
@@ -23,16 +24,86 @@ import tempfile
 import threading
 import time
 import wave
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional
 
 from .config import HudConfig, LOCAL_STT_BACKENDS
 from .llm import LLMClient, LLMError
 from .state import LiveState
+from .vad import build_vad
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2  # int16
 CHANNELS = 1
+
+# Whisper is known to emit these on silence/noise. Bare interjections are only
+# treated as hallucination when the chunk was marginal (see looks_hallucinated).
+HALLUCINATION_PHRASES = re.compile(
+    r"^\s*(?:thanks? for watching.*|thank you[.!]?|thanks[.!]?|"
+    r"please (?:like|subscribe).*|"
+    r"subtitles? by.*|amara\.org.*|transcription by.*|"
+    r"♪+.*|\.+)\s*$",
+    re.I,
+)
+BARE_INTERJECTIONS = {"you", "thank you", "thanks", "bye", "okay", "ok", "yeah", "hmm", "uh"}
+
+
+@dataclass
+class STTResult:
+    """Transcription text plus optional segment-confidence signals."""
+
+    text: str
+    avg_logprob: Optional[float] = None
+    no_speech_prob: Optional[float] = None
+    compression_ratio: Optional[float] = None
+
+
+def looks_hallucinated(text: str, marginal: bool = False,
+                       avg_logprob: Optional[float] = None,
+                       no_speech_prob: Optional[float] = None,
+                       compression_ratio: Optional[float] = None,
+                       no_speech_prob_max: float = 0.6,
+                       avg_logprob_min: float = -1.0,
+                       compression_ratio_max: float = 2.4) -> bool:
+    """Heuristic filter for Whisper's non-speech output.
+
+    Catches known silence phrases, repetitive loops, and low-confidence
+    segments -- especially on chunks whose energy was only marginally above the
+    noise floor.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if HALLUCINATION_PHRASES.match(t):
+        return True
+    if no_speech_prob is not None and no_speech_prob > no_speech_prob_max:
+        return True
+    if compression_ratio is not None and compression_ratio > compression_ratio_max:
+        return True
+
+    words = re.findall(r"[a-z0-9']+", t.lower())
+    if len(words) >= 6:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.5:
+            return True
+    if len(words) >= 9:
+        grams = [tuple(words[i:i + 3]) for i in range(len(words) - 2)]
+        if grams:
+            top = Counter(grams).most_common(1)[0][1]
+            # A 3-gram repeated three or more times in one short chunk is a
+            # classic Whisper loop, not natural speech.
+            if top >= 3:
+                return True
+
+    if marginal:
+        if avg_logprob is not None and avg_logprob < avg_logprob_min:
+            return True
+        if len(words) <= 2 and t.lower().strip(".,!? ") in BARE_INTERJECTIONS:
+            return True
+    return False
+
 
 
 # --------------------------------------------------------------------------
@@ -119,17 +190,28 @@ class Chunker:
     def __init__(self, chunk_seconds: float, min_speech_seconds: float = 0.6,
                  silence_flush_seconds: float = 1.4, silence_db: float = -50.0,
                  frame_ms: int = 100, phrase_silence_seconds: float = 0.6,
-                 phrase_min_speech_seconds: float = 6.0) -> None:
+                 phrase_min_speech_seconds: float = 6.0, vad=None) -> None:
         self.chunk_bytes = int(chunk_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.min_speech_bytes = int(min_speech_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.silence_flush_bytes = int(silence_flush_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.phrase_silence_bytes = int(phrase_silence_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.phrase_min_bytes = int(phrase_min_speech_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.silence_db = silence_db
+        self.vad = vad
         self.frame_bytes = int(frame_ms / 1000.0 * SAMPLE_RATE * SAMPLE_WIDTH)
+        self.last_margin_db = 0.0
         self._buf = bytearray()
         self._speech_bytes = 0
         self._silence_run = 0
+
+    def _is_speech(self, frame: bytes) -> bool:
+        if self.vad is not None:
+            speech = bool(self.vad.is_speech(frame))
+            self.last_margin_db = float(getattr(self.vad, "last_margin_db", 0.0))
+            return speech
+        level = frame_rms_dbfs(frame)
+        self.last_margin_db = level - self.silence_db
+        return level > self.silence_db
 
     def feed(self, pcm: bytes) -> List[bytes]:
         out: List[bytes] = []
@@ -138,7 +220,7 @@ class Chunker:
         while len(self._buf) >= self.frame_bytes:
             frame = bytes(self._buf[: self.frame_bytes])
             del self._buf[: self.frame_bytes]
-            if frame_rms_dbfs(frame) > self.silence_db:
+            if self._is_speech(frame):
                 self._speech_bytes += len(frame)
                 self._silence_run = 0
                 self._pending = getattr(self, "_pending", bytearray())
@@ -188,16 +270,82 @@ class Chunker:
 # STT backends
 # --------------------------------------------------------------------------
 class RemoteSTT:
-    def __init__(self, client: LLMClient, model: str, log: Callable[[str], None]) -> None:
+    def __init__(self, client: LLMClient, model: str, log: Callable[[str], None],
+                 verbose: bool = True, no_speech_prob_max: float = 0.6,
+                 avg_logprob_min: float = -1.0,
+                 compression_ratio_max: float = 2.4) -> None:
         self.client = client
         self.model = model
         self.log = log
+        self.verbose = verbose
+        self.no_speech_prob_max = no_speech_prob_max
+        self.avg_logprob_min = avg_logprob_min
+        self.compression_ratio_max = compression_ratio_max
+        self._verbose_supported = verbose
 
-    def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> str:
+    def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> STTResult:
         wav = pcm_to_wav(pcm)
-        result = self.client.transcribe(wav, self.model, filename="chunk.wav",
-                                        prompt=prompt)
-        return result.text
+        if self._verbose_supported:
+            try:
+                result = self.client.transcribe(
+                    wav, self.model, filename="chunk.wav", prompt=prompt,
+                    response_format="verbose_json")
+                return self._from_verbose(result)
+            except LLMError as exc:
+                if exc.status != 400:
+                    raise
+                # Some OpenAI-compatible providers reject verbose_json.
+                self._verbose_supported = False
+                self.log("STT: verbose_json unsupported; falling back to json")
+        result = self.client.transcribe(wav, self.model, filename="chunk.wav", prompt=prompt)
+        return STTResult(text=result.text)
+
+    def _segment_bad(self, seg: dict) -> bool:
+        def num(key):
+            try:
+                return float(seg.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        no_speech = num("no_speech_prob")
+        if no_speech is not None and no_speech > self.no_speech_prob_max:
+            return True
+        logprob = num("avg_logprob")
+        if logprob is not None and logprob < self.avg_logprob_min:
+            return True
+        ratio = num("compression_ratio")
+        if ratio is not None and ratio > self.compression_ratio_max:
+            return True
+        return False
+
+    def _from_verbose(self, result) -> STTResult:
+        segments = (result.data or {}).get("segments") or []
+        if not segments:
+            return STTResult(text=result.text)
+        kept: List[str] = []
+        logprobs: List[float] = []
+        no_speech: List[float] = []
+        ratios: List[float] = []
+        for seg in segments:
+            if not isinstance(seg, dict) or self._segment_bad(seg):
+                continue
+            text = str(seg.get("text") or "").strip()
+            if not text:
+                continue
+            kept.append(text)
+            for value, bucket in ((seg.get("avg_logprob"), logprobs),
+                                  (seg.get("no_speech_prob"), no_speech),
+                                  (seg.get("compression_ratio"), ratios)):
+                try:
+                    bucket.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+        return STTResult(
+            text=" ".join(kept).strip(),
+            avg_logprob=(sum(logprobs) / len(logprobs)) if logprobs else None,
+            no_speech_prob=max(no_speech) if no_speech else None,
+            compression_ratio=max(ratios) if ratios else None,
+        )
 
 
 class LocalWhisperSTT:
@@ -251,14 +399,14 @@ class LocalWhisperSTT:
                 time.sleep(0.15)
         self.log("local STT: whisper-server on port {}".format(port))
 
-    def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> str:
+    def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> STTResult:
         wav = pcm_to_wav(pcm)
         if self._server is not None and self._port is not None:
             try:
-                return self._server_transcribe(wav, prompt)
+                return STTResult(text=self._server_transcribe(wav, prompt))
             except Exception as exc:  # noqa: BLE001
                 self.log("local STT: server request failed ({}); using whisper-cli".format(exc))
-        return self._cli_transcribe(wav, prompt)
+        return STTResult(text=self._cli_transcribe(wav, prompt))
 
     def _server_transcribe(self, wav: bytes, prompt: Optional[str] = None) -> str:
         from .llm import _encode_multipart  # reuse encoder
@@ -437,7 +585,11 @@ class LiveTranscriber:
         model = self.cfg.resolve_stt_model()
         if not model:
             raise RuntimeError("STT provider '{}' has no speech endpoint".format(provider.name))
-        return RemoteSTT(client, model, self.log)
+        return RemoteSTT(
+            client, model, self.log, verbose=self.cfg.stt_verbose_stt,
+            no_speech_prob_max=self.cfg.stt_no_speech_prob_max,
+            avg_logprob_min=self.cfg.stt_avg_logprob_min,
+            compression_ratio_max=self.cfg.stt_compression_ratio_max)
 
     # -- sources -----------------------------------------------------------
     def _device_cmd(self, name: str) -> List[str]:
@@ -485,15 +637,16 @@ class LiveTranscriber:
                 source.speaker or "mixed", exc))
             self.state.set_status("recording", tap_error=str(exc))
             return
-        chunker = Chunker(self.cfg.stt_chunk_seconds, self.cfg.stt_min_speech_seconds)
+        chunker = Chunker(self.cfg.stt_chunk_seconds, self.cfg.stt_min_speech_seconds,
+                          vad=build_vad(self.cfg, self.log))
         assert source.proc.stdout is not None
         try:
             for block in self._iter_blocks(source.proc.stdout):
                 for chunk in chunker.feed(block):
-                    self._enqueue(source, chunk)
+                    self._enqueue(source, chunk, chunker.last_margin_db)
             tail = chunker.flush()
             if tail:
-                self._enqueue(source, tail)
+                self._enqueue(source, tail, chunker.last_margin_db)
         except Exception as exc:  # noqa: BLE001
             self.log("live transcription loop stopped ({}): {}".format(
                 source.speaker or "mixed", exc))
@@ -505,10 +658,10 @@ class LiveTranscriber:
                 return
             yield data
 
-    def _enqueue(self, source: _Source, chunk: bytes) -> None:
+    def _enqueue(self, source: _Source, chunk: bytes, margin_db: float = 0.0) -> None:
         if self._stop.is_set():
             return
-        item = (time.time(), chunk)
+        item = (time.time(), chunk, margin_db)
         try:
             source.queue.put_nowait(item)
         except queue.Full:
@@ -540,30 +693,44 @@ class LiveTranscriber:
                 continue
             if item is None:
                 break
-            captured_at, chunk = item
-            self._transcribe_chunk(chunk, source, captured_at)
+            captured_at, chunk, margin_db = item
+            self._transcribe_chunk(chunk, source, captured_at, margin_db)
 
     def _prompt_for(self, source: _Source) -> Optional[str]:
+        if not self.cfg.stt_context_prompt:
+            return None
         parts: List[str] = []
         if self._glossary:
             parts.append(", ".join(self._glossary))
-        if source.context_tail:
-            parts.append(source.context_tail)
+        context = source.context_tail
+        if context:
+            # End on a sentence boundary: an incomplete prompt encourages
+            # Whisper to "continue" it (a common hallucination trigger).
+            match = None
+            for match in re.finditer(r"[.!?]", context):
+                pass
+            if match is not None:
+                context = context[: match.end()]
+            else:
+                context = ""
+        if context:
+            parts.append(context)
         prompt = " ".join(parts).strip()
         # Whisper prompts are short; keep well inside the token budget.
         return prompt[-600:] if prompt else None
 
     def _transcribe_chunk(self, chunk: bytes, source: "_Source",
-                          captured_at: Optional[float] = None) -> None:
+                          captured_at: Optional[float] = None,
+                          margin_db: float = 0.0) -> None:
         if self._stop.is_set():
             return
         started = time.time()
         prompt = self._prompt_for(source)
         try:
             try:
-                text = self._stt.transcribe(chunk, prompt=prompt)  # type: ignore[attr-defined]
+                out = self._stt.transcribe(chunk, prompt=prompt)  # type: ignore[attr-defined]
             except TypeError:
-                text = self._stt.transcribe(chunk)  # type: ignore[attr-defined]
+                out = self._stt.transcribe(chunk)  # type: ignore[attr-defined]
         except LLMError as exc:
             self.log("STT error: {}".format(exc))
             self.state.add("status", status="recording", stt_error=str(exc))
@@ -571,7 +738,18 @@ class LiveTranscriber:
         except Exception as exc:  # noqa: BLE001
             self.log("STT failure: {}".format(exc))
             return
+        result = out if isinstance(out, STTResult) else STTResult(text=str(out or ""))
+        text = result.text.strip()
         if not text:
+            return
+        if self.cfg.stt_hallucination_filter and looks_hallucinated(
+                text, marginal=margin_db < self.cfg.stt_vad_margin_db,
+                avg_logprob=result.avg_logprob, no_speech_prob=result.no_speech_prob,
+                compression_ratio=result.compression_ratio,
+                no_speech_prob_max=self.cfg.stt_no_speech_prob_max,
+                avg_logprob_min=self.cfg.stt_avg_logprob_min,
+                compression_ratio_max=self.cfg.stt_compression_ratio_max):
+            self.log("live STT: dropped likely hallucination ({!r}...)".format(text[:40]))
             return
         source.context_tail = (source.context_tail + " " + text).strip()[-200:]
         source.transcribed += 1

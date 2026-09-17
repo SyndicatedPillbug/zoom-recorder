@@ -73,6 +73,17 @@
       <input type="number" step="1" min="5" id="stt.chunk_seconds" /></div></div>
     <div class="row"><label>Glossary</label><div class="ctl">
       <input type="text" id="stt.glossary" placeholder="Acme, Q3, names… (comma separated)" /></div></div>
+    <div class="row"><label>Speech detection</label><div class="ctl">
+      <select id="stt.vad_backend">
+        <option value="auto">auto (webrtcvad if installed)</option>
+        <option value="energy">energy (adaptive level)</option>
+        <option value="webrtcvad">webrtcvad only</option>
+      </select></div></div>
+    <div class="row"><label>VAD margin (dB)</label><div class="ctl">
+      <input type="number" step="1" id="stt.vad_margin_db" />
+      <span class="hint">speech must exceed the noise floor by this</span></div></div>
+    <div class="row"><label>Filter hallucinations</label><div class="ctl">
+      <input type="checkbox" id="stt.hallucination_filter" /></div></div>
   </section>
 
   <section>
@@ -252,6 +263,9 @@
     setVal('stt.backend', c.stt.backend); setVal('stt.model', c.stt.model);
     setVal('stt.chunk_seconds', c.stt.chunk_seconds);
     setVal('stt.glossary', (c.stt.glossary || []).join(', '));
+    setVal('stt.vad_backend', c.stt.vad_backend);
+    setVal('stt.vad_margin_db', c.stt.vad_margin_db);
+    setVal('stt.hallucination_filter', c.stt.hallucination_filter);
     setVal('answers.enabled', c.answers.enabled); setVal('answers.backend', c.answers.backend);
     setVal('answers.fallback', (c.answers.fallback || []).join(', '));
     setVal('answers.chat_model', c.answers.chat_model); setVal('answers.rolling_model', c.answers.rolling_model);
@@ -279,7 +293,10 @@
     return {
       stt: { backend: $('stt.backend').value, model: $('stt.model').value || null,
              chunk_seconds: num('stt.chunk_seconds'),
-             glossary: $('stt.glossary').value.split(',').map(s => s.trim()).filter(Boolean) },
+             glossary: $('stt.glossary').value.split(',').map(s => s.trim()).filter(Boolean),
+             vad_backend: $('stt.vad_backend').value,
+             vad_margin_db: Number($('stt.vad_margin_db').value || 8),
+             hallucination_filter: $('stt.hallucination_filter').checked },
       answers: { enabled: $('answers.enabled').checked, backend: $('answers.backend').value,
                  fallback: $('answers.fallback').value.split(',').map(s => s.trim()).filter(Boolean),
                  chat_model: $('answers.chat_model').value || null,

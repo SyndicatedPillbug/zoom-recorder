@@ -221,12 +221,17 @@ mixes mic + system into one unlabelled stream as before.
 
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
-energy-gated, chopped into phrase-sized chunks, and queued to per-source STT
-workers (so a slow network call never makes the tap fall behind; if it does,
-the lag is shown and stale audio is dropped to stay live). The transcript is
-either transcribed by a remote OpenAI-compatible endpoint or locally with
-whisper.cpp, seeded with a short context prompt plus a configurable glossary of
-names/acronyms (`stt.glossary`). The HUD then runs two independent streams:
+detected by a **voice-activity gate** — an adaptive noise floor per source, or
+`webrtcvad` when it is installed — so steady room noise (air conditioning, fan
+hum) is never sent to be transcribed, and chunks are queued to per-source STT
+workers (a slow call never makes the tap fall behind; if it does, the lag is
+shown and stale audio is dropped to stay live). The transcript is either
+transcribed by a remote OpenAI-compatible endpoint or locally with whisper.cpp,
+seeded with a short, sentence-aligned context prompt plus a configurable
+glossary (`stt.glossary`). Whisper's known non-speech output is filtered twice:
+at the segment level (using `verbose_json` `no_speech_prob` / `avg_logprob` /
+`compression_ratio`) and with a text filter that drops repetition loops and
+canned silence phrases. The HUD then runs two independent streams:
 **questions** are detected across the recent conversation (not just the newest
 chunk) and answered with the stronger model, giving it the surrounding turns,
 the earlier Q&A, and your notes so follow-ups like *"what about the other one?"*
@@ -238,6 +243,13 @@ each one, that quote is verified locally, and anything unsupported is dropped.
 A minimum amount of new speech is required before a refresh fires, so sparse or
 noisy audio produces **no** points rather than invented ones. Nothing in the HUD
 can affect the recording — if it fails to start, recording proceeds normally.
+
+**Voice activity (optional).** Speech is detected with an adaptive noise-floor
+gate by default, which rejects steady hum without any dependency. Installing
+`webrtcvad` (`pip install webrtcvad`) switches to a real VAD automatically
+(`stt.vad_backend: "auto"`); set it to `"energy"` to force the stdlib gate or
+`"webrtcvad"` to require the package. `stt.hallucination_filter` and the
+confidence thresholds control the non-speech text filter.
 
 **Providers.** All are OpenAI-compatible, so the same client serves each of
 them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
@@ -266,7 +278,8 @@ in the config to impose limits below the provider's.
 **Configuration.** Defaults can be set in `~/.config/zoom-recorder/config.json`
 (keep it `chmod 600`); environment variables always win:```json
 {
-  "stt":     {"backend": "groq", "chunk_seconds": 10, "glossary": ["Acme", "Q3"]},
+  "stt":     {"backend": "groq", "chunk_seconds": 10, "glossary": ["Acme", "Q3"],
+               "vad_backend": "auto", "hallucination_filter": true},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
                "context_minutes": 5, "question_rewrite": true,
                "answer_self_questions": false, "summary_enabled": true,
