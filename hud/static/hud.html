@@ -97,6 +97,10 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; }
   .dot.on { background: var(--accent-2); }
   .err { color: var(--danger); font-size: 12px; }
+  .warnbar {
+    padding: 8px 16px; background: #241f10; color: var(--warn);
+    border-bottom: 1px solid #4a3d1f; font-size: 12px; flex: 0 0 auto;
+  }
   button.mini {
     font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text); cursor: pointer;
@@ -123,11 +127,13 @@
   <span class="pill egress" id="egress" title="Only transcript text leaves this Mac when answers are enabled.">answers: unknown</span>
   <span class="pill" id="lag" title="How far the live transcription is behind the audio">lag —</span>
   <span class="pill" id="level" title="Current input level vs the speech threshold (dBFS)">lvl —</span>
+  <span class="pill" id="devices" title="Microphone / system audio source">mic — · sys —</span>
   <div class="spacer"></div>
   <button class="mini" id="pauseBtn" title="Pause AI answers (transcript keeps running)">Pause answers</button>
   <span class="pill" id="budgetLabel">budget —</span>
   <div class="budget" title="Daily token budget used"><span id="budgetBar"></span></div>
 </header>
+<div class="warnbar" id="warnbar" hidden></div>
 <main>
   <section>
     <div class="col-head">Live transcript</div>
@@ -157,6 +163,8 @@
   const egressEl = document.getElementById('egress');
   const lagEl = document.getElementById('lag');
   const levelEl = document.getElementById('level');
+  const devicesEl = document.getElementById('devices');
+  const warnbarEl = document.getElementById('warnbar');
   const dotEl = document.getElementById('dot');
   const budgetBar = document.getElementById('budgetBar');
   const budgetLabel = document.getElementById('budgetLabel');
@@ -299,6 +307,19 @@
       const thr = meta.stt_vad_threshold_db;
       levelEl.textContent = 'lvl ' + lvl.toFixed(0) + (thr !== undefined ? '/' + Number(thr).toFixed(0) : '') + ' dB';
       levelEl.style.color = (thr !== undefined && lvl > Number(thr)) ? 'var(--accent-2)' : 'var(--muted)';
+    }
+    if (meta.mic_device !== undefined || meta.system_device !== undefined) {
+      devicesEl.textContent = 'mic: ' + (meta.mic_device || '?') + ' · sys: ' + (meta.system_device || 'none');
+      devicesEl.style.color = meta.system_audio_warning ? 'var(--warn)' : 'var(--muted)';
+    }
+    if (meta.system_audio_warning !== undefined) {
+      if (meta.system_audio_warning) {
+        warnbarEl.hidden = false;
+        warnbarEl.textContent = meta.system_audio_warning;
+      } else {
+        warnbarEl.hidden = true;
+        warnbarEl.textContent = '';
+      }
     }
     if (meta.answers_paused !== undefined) setPaused(meta.answers_paused);
     const b = ev.budget || {};

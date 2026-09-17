@@ -512,7 +512,28 @@ class LiveTranscriber:
             self.log("live tap disabled: {}".format(exc))
             self.state.set_status("recording", tap_error=str(exc))
             return
+        self._start_sources()
 
+    def update_devices(self, mic_name: Optional[str], system_name: Optional[str]) -> None:
+        """Follow a recorder device switch without restarting the whole HUD."""
+        if (mic_name, system_name) == (self.mic_name, self.system_name):
+            return
+        self.log("live HUD: devices changed (mic='{}', system='{}')".format(
+            mic_name or "?", system_name or "none"))
+        self._stop_sources(self._sources)
+        self._sources = []
+        self.mic_name = mic_name
+        self.system_name = system_name
+        if self._stop.is_set() or self._stt is None:
+            return
+        try:
+            self._sources = self._build_sources()
+        except Exception as exc:  # noqa: BLE001
+            self.log("live HUD: could not rebuild sources ({})".format(exc))
+            return
+        self._start_sources()
+
+    def _start_sources(self) -> None:
         label = " + ".join(s.speaker or "mixed" for s in self._sources)
         self.log("live STT running ({} backend, {:.0f}s chunks, {} queue, sources: {})".format(
             self.cfg.stt_backend, self.cfg.stt_chunk_seconds,
@@ -530,9 +551,8 @@ class LiveTranscriber:
                 name="hud-stt-{}".format(source.speaker or "mix"), daemon=True)
             source.thread.start()
 
-    def stop(self) -> None:
-        self._stop.set()
-        for source in self._sources:
+    def _stop_sources(self, sources: List["_Source"]) -> None:
+        for source in sources:
             proc = source.proc
             if proc is not None and proc.poll() is None:
                 try:
@@ -543,10 +563,10 @@ class LiveTranscriber:
                         proc.kill()
                     except Exception:  # noqa: BLE001
                         pass
-        for source in self._sources:
+        for source in sources:
             if source.thread is not None:
                 source.thread.join(timeout=8.0)
-        for source in self._sources:
+        for source in sources:
             try:
                 source.queue.put_nowait(None)
             except queue.Full:
@@ -558,9 +578,13 @@ class LiveTranscriber:
                     source.queue.put_nowait(None)
                 except queue.Full:
                     pass
-        for source in self._sources:
+        for source in sources:
             if source.worker is not None:
                 source.worker.join(timeout=8.0)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._stop_sources(self._sources)
         closer = getattr(self._stt, "close", None)
         if callable(closer):
             try:

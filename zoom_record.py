@@ -49,6 +49,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+try:
+    from hud.devices import load_topology, system_advice
+except Exception:  # noqa: BLE001 - recorder must run even without the HUD package
+    load_topology = None  # type: ignore[assignment]
+
+    def system_advice(topo=None) -> str:  # type: ignore[misc]
+        return ""
+
 DEFAULT_MODEL = "~/.cache/whisper-cpp/ggml-base.en.bin"
 FLOOR_DB = -91.0
 LOW_COVERAGE_PCT = 50.0
@@ -70,11 +78,13 @@ MIC_PRIORITY = [
 ]
 
 SYSTEM_PRIORITY = [
-    (re.compile(r"zoom\s*audio\s*device", re.I), 100),
-    (re.compile(r"blackhole", re.I), 90),
-    (re.compile(r"loopback", re.I), 80),
-    (re.compile(r"soundflower", re.I), 70),
-    (re.compile(r"aggregate|multi-?output", re.I), 60),
+    (re.compile(r"blackhole|black\s*hole", re.I), 100),
+    (re.compile(r"loopback", re.I), 90),
+    (re.compile(r"soundflower", re.I), 80),
+    (re.compile(r"aggregate|multi-?output", re.I), 70),
+    # ZoomAudioDevice only carries Zoom's own shared audio, not the default
+    # output, so it is a poor general-purpose system source.
+    (re.compile(r"zoom\s*audio\s*device", re.I), 20),
 ]
 
 DEVICE_RE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
@@ -240,18 +250,31 @@ def system_priority(name: str) -> int:
     return 0
 
 
-def build_mic_candidates(inputs: List[Device]) -> List[Candidate]:
+def build_mic_candidates(inputs: List[Device], topo=None) -> List[Candidate]:
     candidates = []
     for dev in inputs:
-        if LOOPBACK_RE.search(dev.name):
+        if topo is not None and topo.devices:
+            if not topo.looks_like_mic(dev.name):
+                continue
+        elif LOOPBACK_RE.search(dev.name):
             continue
         candidates.append(Candidate(dev, mic_priority(dev.name)))
-    candidates.sort(key=lambda c: (-c.priority, c.device.index))
+    # Prefer the system's default input over the static quality ranking.
+    default_input = getattr(topo, "default_input", None) if topo is not None else None
+    candidates.sort(key=lambda c: (c.device.name != default_input,
+                                   -c.priority, c.device.index))
     return candidates
 
 
-def build_system_candidates(inputs: List[Device]) -> List[Candidate]:
-    candidates = [Candidate(d, system_priority(d.name)) for d in inputs if LOOPBACK_RE.search(d.name)]
+def build_system_candidates(inputs: List[Device], topo=None) -> List[Candidate]:
+    candidates = []
+    for dev in inputs:
+        if topo is not None and topo.devices:
+            is_loop = topo.looks_like_loopback(dev.name)
+        else:
+            is_loop = bool(LOOPBACK_RE.search(dev.name))
+        if is_loop:
+            candidates.append(Candidate(dev, system_priority(dev.name)))
     candidates.sort(key=lambda c: (-c.priority, c.device.index))
     return candidates
 
@@ -264,7 +287,7 @@ def find_device(inputs: List[Device], name: str) -> Optional[Device]:
 
 
 def choose_mic(cfg: Config, candidates: List[Candidate], log: Log,
-               exclude: Optional[str] = None) -> Optional[Candidate]:
+               exclude: Optional[str] = None, topo=None) -> Optional[Candidate]:
     if cfg.mic_override:
         dev = find_device([c.device for c in candidates], cfg.mic_override)
         if dev is None:
@@ -295,7 +318,10 @@ def choose_mic(cfg: Config, candidates: List[Candidate], log: Log,
         detail = fmt_db(p.max_db) if p and p.ok else "unavailable ({})".format(p.error if p else "not probed")
         log.info("  - {:<32} priority={:<3} level={}".format(cand.device.name, cand.priority, detail))
 
-    usable.sort(key=lambda c: (not has_signal(c.probe, cfg.silence_db), -c.priority, c.device.index))
+    default_input = getattr(topo, "default_input", None) if topo is not None else None
+    usable.sort(key=lambda c: (not has_signal(c.probe, cfg.silence_db),
+                               c.device.name != default_input,
+                               -c.priority, c.device.index))
     return usable[0]
 
 
@@ -310,16 +336,38 @@ def choose_system(cfg: Config, candidates: List[Candidate], log: Log,
         if dev is None:
             log.warn("Requested system device '{}' not found.".format(cfg.system_override))
             return None
-        return Candidate(dev, system_priority(dev.name))
+        cand = Candidate(dev, system_priority(dev.name),
+                         probe_level(dev, cfg.probe_seconds))
+        if not has_signal(cand.probe, cfg.silence_db):
+            log.warn("Requested system device '{}' opened but has no signal yet.".format(dev.name))
+        return cand
 
-    for cand in candidates:
-        if exclude and cand.device.name == exclude:
-            continue
+    usable = [c for c in candidates if not (exclude and c.device.name == exclude)]
+    if not usable:
+        _warn_system(log, None)
+        return None
+    for cand in usable:
         if cand.probe is None:
             cand.probe = probe_level(cand.device, cfg.probe_seconds)
-        if cand.probe.ok:
-            return cand
-    return None
+
+    # Prefer a loopback that is actually carrying audio, but never discard a
+    # good one just because the call is quiet at startup.
+    with_signal = [c for c in usable if has_signal(c.probe, cfg.silence_db)]
+    chosen = with_signal[0] if with_signal else usable[0]
+    if not with_signal:
+        log.warn("System input '{}' opened but is currently silent; will keep monitoring.".format(
+            chosen.device.name))
+    _warn_system(log, chosen)
+    return chosen
+
+
+def _warn_system(log: Log, chosen: Optional[Candidate]) -> None:
+    if chosen is not None and system_priority(chosen.device.name) <= 20:
+        log.warn("'{}' only carries Zoom's own shared audio, not general system output.".format(
+            chosen.device.name))
+    advice = system_advice()
+    if advice:
+        log.warn(advice)
 
 
 class Recorder:
@@ -336,6 +384,7 @@ class Recorder:
         self.sessions: List[Path] = []
         self._session = 0
         self._stderr_fh = None
+        self.on_restart = None  # optional callback fired after a (re)start
 
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -378,6 +427,11 @@ class Recorder:
         if system is not None:
             src += " + {} (separate tracks)".format(system.name)
         self.log.info("Recording session {} -> {}".format(self._session, src))
+        if self.on_restart is not None:
+            try:
+                self.on_restart()
+            except Exception:  # noqa: BLE001
+                pass
 
     def stop(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -453,11 +507,41 @@ def hunt_mic(cfg: Config, candidates: List[Candidate], active: Optional[str], lo
     return best[3] if best else None
 
 
-def monitor(cfg: Config, rec: Recorder, mic_cands: List[Candidate],
-            system_cands: List[Candidate], stop: threading.Event, log: Log) -> None:
+def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
+            mic_cands: List[Candidate], system_cands: List[Candidate],
+            stop: threading.Event, log: Log) -> None:
     silent = 0
     last_cycle = time.monotonic()
+    last_route: Optional[Tuple[Optional[str], Optional[str]]] = None
     while not stop.wait(cfg.chunk_seconds):
+        # Track the default input/output: headphones or a Bluetooth switch
+        # change the routing mid-call, and the system loopback can drop out.
+        if load_topology is not None:
+            topo = load_topology()
+            route = (topo.default_input, topo.default_output)
+            if last_route is not None and route != last_route:
+                log.warn("Audio route changed: input='{}' output='{}'".format(
+                    route[0] or "?", route[1] or "?"))
+                mic_cands = build_mic_candidates(inputs, topo) or mic_cands
+                system_cands = build_system_candidates(inputs, topo) or system_cands
+                if cfg.use_system and route[1] != last_route[1]:
+                    new_sys = choose_system(cfg, system_cands, log)
+                    cur = rec.system.device.name if rec.system else None
+                    if new_sys is not None and new_sys.device.name != cur:
+                        log.warn("Switching system input: '{}' -> '{}'".format(
+                            cur or "(none)", new_sys.device.name))
+                        rec.start(rec.mic.device, new_sys.device)
+                    elif new_sys is None and cur is not None:
+                        log.warn("No loopback in the new output path; recording microphone only.")
+                        rec.start(rec.mic.device, None)
+                if route[0] != last_route[0]:
+                    new_mic = choose_mic(cfg, mic_cands, log, topo=topo)
+                    if new_mic is not None and new_mic.device.name != rec.mic.device.name:
+                        log.warn("Switching mic: '{}' -> '{}'".format(
+                            rec.mic.device.name, new_mic.device.name))
+                        rec.start(new_mic.device, rec.system.device if rec.system else None)
+            last_route = route
+
         if not rec.is_alive():
             log.error("Recorder exited unexpectedly; restarting.")
             new_mic = choose_mic(cfg, mic_cands, log)
@@ -711,8 +795,10 @@ def self_test(probe_seconds_arg: float, system_cands: List[Candidate], outputs: 
     log.info("Self-test: outputs = {}".format(
         ", ".join(o.name for o in outputs) if outputs else "(none reported by ffmpeg)"))
     if not system_cands:
-        log.warn("No loopback/system input found. Zoom audio will not be captured.")
-        log.warn("Install a loopback device (BlackHole) or run Zoom so ZoomAudioDevice appears.")
+        log.warn("No loopback/system input found. System audio will not be captured.")
+        advice = system_advice()
+        if advice:
+            log.warn(advice)
         return 1
     probe_seconds = max(1.5, probe_seconds_arg)
     total = probe_seconds * len(system_cands) + 2.0
@@ -778,6 +864,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--list", action="store_true", help="list audio devices and exit")
     parser.add_argument("--self-test", action="store_true",
                         help="play a tone and verify the output->loopback capture path")
+    parser.add_argument("--check-routing", action="store_true",
+                        help="verify system-audio routing reaches a loopback, then exit")
 
     # -- live HUD (opt-in; recording is unchanged when these are not used) ---
     parser.add_argument("--live", action="store_true",
@@ -886,24 +974,44 @@ def main(argv: List[str]) -> int:
         return 1
 
     inputs, outputs = list_devices()
+    topo = load_topology(force=True) if load_topology is not None else None
 
     if args.list:
+        def _annotate(name: str) -> str:
+            dev = topo.device(name) if topo is not None else None
+            tags = []
+            if dev is not None and dev.is_loopback:
+                tags.append("loopback")
+            if dev is not None and dev.default_input:
+                tags.append("default input")
+            if dev is not None and dev.default_output:
+                tags.append("default output")
+            if topo is not None and not topo.devices and LOOPBACK_RE.search(name):
+                tags.append("loopback")
+            return "  ({})".format(", ".join(tags)) if tags else ""
+
         print("Audio inputs:")
         for d in inputs:
-            print("  [{}] {}{}".format(d.index, d.name, "  (loopback)" if LOOPBACK_RE.search(d.name) else ""))
+            print("  [{}] {}{}".format(d.index, d.name, _annotate(d.name)))
         print("Audio outputs:")
         for d in outputs:
-            print("  [{}] {}".format(d.index, d.name))
+            print("  [{}] {}{}".format(d.index, d.name, _annotate(d.name)))
+        if topo is not None:
+            print("Default input:  {}".format(topo.default_input or "(unknown)"))
+            print("Default output: {}".format(topo.default_output or "(unknown)"))
+        advice = system_advice(topo)
+        if advice:
+            print("System audio:   {}".format(advice))
         return 0
 
     minutes = args.minutes_opt if args.minutes_opt is not None else args.minutes
     segment_seconds = int((minutes if minutes else 5) * 60)
     basedir = Path(os.path.expanduser(args.basedir))
 
-    mic_cands = build_mic_candidates(inputs)
-    system_cands = build_system_candidates(inputs)
+    mic_cands = build_mic_candidates(inputs, topo)
+    system_cands = build_system_candidates(inputs, topo)
 
-    if args.self_test:
+    if args.self_test or args.check_routing:
         # No recording happens, so no dated/session folder is created for it --
         # just log to the console.
         code = self_test(args.probe_seconds, system_cands, outputs, Log(None))
@@ -957,7 +1065,7 @@ def main(argv: List[str]) -> int:
         log.close()
         return 1
 
-    mic = choose_mic(cfg, mic_cands, log)
+    mic = choose_mic(cfg, mic_cands, log, topo=topo)
     if mic is None:
         log.error("Could not select a usable microphone.")
         log.close()
@@ -967,8 +1075,10 @@ def main(argv: List[str]) -> int:
     if cfg.use_system:
         system = choose_system(cfg, system_cands, log)
         if system is None:
-            log.warn("No system/loopback input found; recording microphone only.")
-            log.warn("Start Zoom or install BlackHole to capture meeting audio.")
+            log.warn("No usable system/loopback input; recording microphone only.")
+            advice = system_advice(topo)
+            if advice:
+                log.warn(advice)
 
     log.info("Selected mic: {} (priority {}, level {})".format(
         mic.device.name, mic.priority,
@@ -1001,12 +1111,15 @@ def main(argv: List[str]) -> int:
                 cfg.model,
             )
             live.start()
+            rec.on_restart = lambda: live.update_devices(
+                rec.mic.device.name if rec.mic else None,
+                rec.system.device.name if rec.system else None)
         except Exception as exc:  # noqa: BLE001
             log.warn("Live HUD unavailable ({}); recording continues normally.".format(exc))
             live = None
 
     try:
-        monitor(cfg, rec, mic_cands, system_cands, stop, log)
+        monitor(cfg, rec, inputs, mic_cands, system_cands, stop, log)
     except Exception as exc:  # noqa: BLE001
         log.error("Monitor loop crashed: {}".format(exc))
     finally:

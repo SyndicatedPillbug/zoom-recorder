@@ -65,6 +65,7 @@ class LiveSession:
                               answers_enabled=self.cfg.answers_enabled,
                               stt_backend=self.cfg.stt_backend)
         self.state.set_budget(self.budget.snapshot())
+        self._publish_devices()
 
         try:
             self.stt = LiveTranscriber(self.state, self.log, self.cfg,
@@ -151,6 +152,38 @@ class LiveSession:
         if self.answers is not None:
             self.answers.pause(paused)
         self.state.set_meta(answers_paused=paused)
+
+    def update_devices(self, mic_name: Optional[str], system_name: Optional[str]) -> None:
+        """Follow a recorder device switch (headphones, failover, route change)."""
+        if (mic_name, system_name) == (self.mic_name, self.system_name):
+            return
+        self.mic_name = mic_name
+        self.system_name = system_name
+        if self.stt is not None:
+            try:
+                self.stt.update_devices(mic_name, system_name)
+            except Exception as exc:  # noqa: BLE001
+                self.log("live HUD: device update failed ({})".format(exc))
+        self._publish_devices()
+
+    def _publish_devices(self) -> None:
+        warning = ""
+        if not self.system_name:
+            warning = ("No system/loopback input selected; recording microphone only, so "
+                       "the other party will not be captured.")
+        else:
+            try:
+                from .devices import system_advice, system_priority
+                warning = system_advice() or ""
+                if not warning and system_priority(self.system_name) <= 20:
+                    warning = ("'{}' only carries Zoom's own audio, not general system "
+                               "output; the other party may not be captured. Install "
+                               "BlackHole and use a Multi-Output Device.").format(self.system_name)
+            except Exception:  # noqa: BLE001
+                warning = ""
+        self.state.set_meta(mic_device=self.mic_name or "",
+                            system_device=self.system_name or "",
+                            system_audio_warning=warning)
 
     def _open_browser(self) -> None:
         time.sleep(0.4)

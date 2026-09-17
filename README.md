@@ -262,6 +262,28 @@ isn't appearing, that pill tells you why:
   (segment confidence gating) or `stt.hallucination_filter` to isolate the text
   filter, and check the log for `dropped likely hallucination` lines.
 
+**Capturing the other party's audio (macOS).** macOS cannot capture arbitrary
+system audio out of the box. You need a **loopback** device that mirrors your
+output, and it must actually be in the output path:
+
+1. Install BlackHole: `brew install blackhole-2ch`.
+2. Open **Audio MIDI Setup → + → Create Multi-Output Device**, tick **both** your
+   headphones/speakers **and** `BlackHole 2ch`.
+3. Select that Multi-Output Device as the system output (and in Zoom).
+
+System audio is then mirrored into BlackHole and captured automatically; the
+HUD shows `mic: … · sys: BlackHole 2ch`. Note that `ZoomAudioDevice` is **not**
+a general loopback — it only carries audio Zoom itself shares, so it is ranked
+last and flagged.
+
+`./zoom_record.py --list` prints every device with its transport, the current
+defaults, and exactly what to fix; `./zoom_record.py --check-routing` plays a
+tone and verifies that it reaches a loopback. If system audio can't be
+captured, the app records the microphone only and the HUD shows a warning
+banner rather than mislabelling room audio as the remote party. Plugging in
+headphones or switching to Bluetooth changes the route mid-call; the recorder
+re-detects it and re-resolves the source, and the HUD follows along.
+
 **Providers.** All are OpenAI-compatible, so the same client serves each of
 them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
 `--stt-backend` flags:

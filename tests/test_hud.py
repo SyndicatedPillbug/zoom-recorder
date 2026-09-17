@@ -1196,6 +1196,118 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(list(derived.glob("*.tmp")), [])
 
 
+class DevicesTests(unittest.TestCase):
+    def _topology(self, items, default_input=None, default_output=None):
+        from hud import devices
+
+        topo = devices.Topology(default_input=default_input, default_output=default_output)
+        topo.devices = [devices.AudioDevice(**d) for d in items]
+        for dev in topo.devices:
+            if dev.default_input:
+                topo.default_input = topo.default_input or dev.name
+            if dev.default_output:
+                topo.default_output = topo.default_output or dev.name
+        return topo
+
+    def test_classification(self) -> None:
+        topo = self._topology([
+            {"name": "MacBook Air Microphone", "transport": "coreaudio_device_type_builtin",
+             "input_channels": 1, "default_input": True},
+            {"name": "BlackHole 2ch", "transport": "coreaudio_device_type_virtual",
+             "input_channels": 2, "output_channels": 2},
+            {"name": "ZoomAudioDevice", "transport": "coreaudio_device_type_virtual",
+             "input_channels": 2, "output_channels": 2},
+            {"name": "External Headphones", "transport": "coreaudio_device_type_builtin",
+             "output_channels": 2, "default_output": True},
+        ])
+        self.assertTrue(topo.device("MacBook Air Microphone").is_mic)
+        self.assertFalse(topo.device("BlackHole 2ch").is_mic)
+        self.assertTrue(topo.device("BlackHole 2ch").is_loopback)
+        self.assertTrue(topo.device("ZoomAudioDevice").is_loopback)
+        self.assertEqual([d.name for d in topo.mics()], ["MacBook Air Microphone"])
+
+    def test_output_path_detection(self) -> None:
+        with_loopback_out = self._topology([
+            {"name": "BlackHole 2ch", "transport": "virtual", "input_channels": 2,
+             "output_channels": 2, "default_output": True},
+        ])
+        self.assertTrue(with_loopback_out.system_in_output_path)
+        headphones_out = self._topology([
+            {"name": "BlackHole 2ch", "transport": "virtual", "input_channels": 2},
+            {"name": "External Headphones", "transport": "builtin",
+             "output_channels": 2, "default_output": True},
+        ])
+        self.assertFalse(headphones_out.system_in_output_path)
+
+    def test_read_system_profiler_fixture(self) -> None:
+        from hud import devices
+
+        payload = {"SPAudioDataType": [{"_items": [
+            {"_name": "BlackHole 2ch", "coreaudio_device_transport": "coreaudio_device_type_virtual",
+             "coreaudio_device_input": 2, "coreaudio_device_output": 2},
+            {"_name": "MacBook Air Microphone",
+             "coreaudio_device_transport": "coreaudio_device_type_builtin",
+             "coreaudio_device_input": 1,
+             "coreaudio_default_audio_input_device": "spaudio_yes"},
+            {"_name": "External Headphones",
+             "coreaudio_device_transport": "coreaudio_device_type_builtin",
+             "coreaudio_device_output": 2,
+             "coreaudio_default_audio_output_device": "spaudio_yes"},
+        ]}]}
+
+        class _Proc:
+            stdout = json.dumps(payload)
+
+        with mock.patch("hud.devices.subprocess.run", return_value=_Proc()):
+            topo = devices.read_system_profiler()
+        self.assertEqual(topo.default_input, "MacBook Air Microphone")
+        self.assertEqual(topo.default_output, "External Headphones")
+        self.assertTrue(topo.device("BlackHole 2ch").is_loopback)
+
+    def test_advice_when_only_zoom_loopback(self) -> None:
+        from hud import devices
+
+        topo = self._topology([
+            {"name": "ZoomAudioDevice", "transport": "virtual", "input_channels": 2,
+             "output_channels": 2},
+        ])
+        self.assertIn("BlackHole", devices.system_advice(topo))
+
+    def test_advice_when_loopback_not_in_output_path(self) -> None:
+        from hud import devices
+
+        topo = self._topology([
+            {"name": "BlackHole 2ch", "transport": "virtual", "input_channels": 2},
+            {"name": "External Headphones", "transport": "builtin",
+             "output_channels": 2, "default_output": True},
+        ])
+        self.assertIn("Multi-Output", devices.system_advice(topo))
+
+    def test_priorities_prefer_blackhole_over_zoom(self) -> None:
+        from hud import devices
+
+        self.assertGreater(devices.system_priority("BlackHole 2ch"),
+                           devices.system_priority("ZoomAudioDevice"))
+
+    def test_update_devices_updates_names(self) -> None:
+        tr = LiveTranscriber(LiveState(), lambda _m: None, HudConfig(), "MicA", "SysA")
+        tr._stt = None
+        tr._sources = []
+        tr.update_devices("MicB", "SysB")
+        self.assertEqual(tr.mic_name, "MicB")
+        self.assertEqual(tr.system_name, "SysB")
+        tr.update_devices("MicB", "SysB")  # no-op must not raise
+
+    def test_publish_devices_warns_without_system(self) -> None:
+        from hud.session import LiveSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = LiveSession(HudConfig(), Path(tmp), lambda _m: None, "Mic", None)
+            session._publish_devices()
+            self.assertIn("microphone only",
+                          session.state.meta["system_audio_warning"])
+
+
 class WavTests(unittest.TestCase):
     def test_pcm_to_wav_roundtrip(self) -> None:
         import io

@@ -347,3 +347,31 @@ filter. Fixes:
 
 
 
+
+## Phase 2.5: source detection / macOS audio routing
+
+Real-use feedback: with headphones connected, the HUD read YouTube/room audio
+as the user and missed the remote party. Root cause: macOS system audio is only
+capturable through a loopback that mirrors the default output, and the previous
+logic ranked `ZoomAudioDevice` first (it only carries Zoom's own shared audio)
+and accepted any loopback that merely *opened*, even a silent one.
+
+- **`hud/devices.py`**: parse `system_profiler SPAudioDataType -json` (stdlib)
+  for transport, channels, and the **default input/output** flags; classify
+  each device as real mic / loopback / aggregate; expose `system_advice()`.
+- **Selection**: BlackHole → Loopback app → Soundflower → Multi-Output →
+  `ZoomAudioDevice` (demoted). Mics prefer the system default and exclude
+  virtual devices via topology, not just names.
+- **Honest system capture**: a silent loopback is still selected for monitoring
+  but the recorder logs why it may be wrong, and records mic-only when there is
+  no usable loopback instead of pretending.
+- **Route changes**: `monitor()` re-reads the default input/output and
+  re-resolves the mic/system when headphones or Bluetooth change the route.
+- **HUD follows the recorder**: `Recorder.on_restart` → `LiveSession.update_devices`
+  → `LiveTranscriber.update_devices` restarts only the changed STT source. The
+  HUD header shows `mic … · sys …` and a warning banner when the other party
+  cannot be captured.
+- **Diagnostics**: `--list` annotates transport/defaults and prints the fix;
+  new `--check-routing` plays a tone and verifies it reaches a loopback.
+- Covered by `DevicesTests` (classification, output-path detection, advice,
+  system_profiler parsing, HUD device updates).
