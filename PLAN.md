@@ -1,5 +1,11 @@
 # Hardening plan (post-incident)
 
+> **Status (2026-09-17):** all phases below are implemented, committed, and
+> annotated-tagged — `v1.0-core`, `v1.1-hud`, `v1.2-settings`, `v1.3-grounding`,
+> `v1.4-stt-hallucination`, `v1.5-routing`. 108 unit tests pass
+> (`python3 -m unittest discover -s tests`). This file is the design history and
+> rationale; [`README.md`](README.md) is the user-facing reference.
+
 Context: on 2026-09-16, a well-intentioned but reckless move (running a third-party
 audio "enhancer" with its output directory pointed at the *same* folder as the
 source file) silently zeroed out the only copy of a 32-minute recording. No
@@ -24,8 +30,7 @@ Decisions already made (per Odin, 2026-09-16):
 
 ## Where the current code already stands
 
-The in-progress `zoom_record.py` rewrite (not yet committed) already covers a
-surprising amount of this well:
+The `zoom_record.py` rewrite already covers a surprising amount of this well:
 
 - Segment-based recording (crash only costs the current segment).
 - Automatic mic selection, ranked by quality, preferring whichever device is
@@ -325,8 +330,9 @@ the hallucination back as the next Whisper prompt, and there was no text-level
 filter. Fixes:
 
 - **`hud/vad.py`**: per-source adaptive noise floor with a short ambient
-  calibration (steady spread → hum becomes the floor; wide spread → speech is
-  already happening, keep the floor low). `webrtcvad` is used when importable,
+  calibration that uses the **quietest** startup frame as the floor (so it can
+  never calibrate above the talker) and **peak** rather than RMS level (so
+  quiet call/loopback audio still passes). `webrtcvad` is used when importable,
   else the stdlib energy VAD (`stt.vad_backend`, `stt.vad_margin_db`,
   `stt.silence_db`, `stt.adaptive_vad`).
 - **Chunker** now classifies frames through the VAD and carries a per-chunk
@@ -344,10 +350,6 @@ filter. Fixes:
 - Covered by `VADTests` / `HallucinationTests`, including a hum-vs-speech
   Chunker integration test.
 
-
-
-
-
 ## Phase 2.5: source detection / macOS audio routing
 
 Real-use feedback: with headphones connected, the HUD read YouTube/room audio
@@ -362,9 +364,11 @@ and accepted any loopback that merely *opened*, even a silent one.
 - **Selection**: BlackHole → Loopback app → Soundflower → Multi-Output →
   `ZoomAudioDevice` (demoted). Mics prefer the system default and exclude
   virtual devices via topology, not just names.
-- **Honest system capture**: a silent loopback is still selected for monitoring
-  but the recorder logs why it may be wrong, and records mic-only when there is
-  no usable loopback instead of pretending.
+- **Honest system capture**: a currently-silent loopback is still selected (so
+  audio that starts a moment later isn't missed) but it is logged/flagged; if
+  there is no loopback in the output path at all, the recorder records
+  mic-only, prints the exact fix, and the HUD shows a warning banner rather
+  than mislabelling room audio as the remote party.
 - **Route changes**: `monitor()` re-reads the default input/output and
   re-resolves the mic/system when headphones or Bluetooth change the route.
 - **HUD follows the recorder**: `Recorder.on_restart` → `LiveSession.update_devices`

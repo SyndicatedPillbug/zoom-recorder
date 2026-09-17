@@ -64,8 +64,8 @@ def looks_hallucinated(text: str, marginal: bool = False,
                        avg_logprob: Optional[float] = None,
                        no_speech_prob: Optional[float] = None,
                        compression_ratio: Optional[float] = None,
-                       no_speech_prob_max: float = 0.6,
-                       avg_logprob_min: float = -1.0,
+                       no_speech_prob_max: float = 0.75,
+                       avg_logprob_min: float = -1.5,
                        compression_ratio_max: float = 2.4) -> bool:
     """Heuristic filter for Whisper's non-speech output.
 
@@ -187,7 +187,7 @@ class Chunker:
     dropped so we never pay to transcribe dead air.
     """
 
-    def __init__(self, chunk_seconds: float, min_speech_seconds: float = 0.6,
+    def __init__(self, chunk_seconds: float, min_speech_seconds: float = 0.8,
                  silence_flush_seconds: float = 1.4, silence_db: float = -50.0,
                  frame_ms: int = 100, phrase_silence_seconds: float = 0.6,
                  phrase_min_speech_seconds: float = 6.0, vad=None) -> None:
@@ -271,8 +271,8 @@ class Chunker:
 # --------------------------------------------------------------------------
 class RemoteSTT:
     def __init__(self, client: LLMClient, model: str, log: Callable[[str], None],
-                 verbose: bool = True, no_speech_prob_max: float = 0.6,
-                 avg_logprob_min: float = -1.0,
+                 verbose: bool = True, no_speech_prob_max: float = 0.75,
+                 avg_logprob_min: float = -1.5,
                  compression_ratio_max: float = 2.4) -> None:
         self.client = client
         self.model = model

@@ -5,9 +5,11 @@ selection, continuous capture verification, dynamic failover, and transcription.
 
 ## Requirements
 
-- macOS with Zoom installed
+- macOS
 - Homebrew
 - Python 3 (the system `python3` is fine)
+- Optional: Zoom, if you want its `ZoomAudioDevice`; a general loopback
+  (BlackHole) is recommended for capturing system audio.
 
 ## Setup
 
@@ -19,6 +21,10 @@ curl -L -o ~/.cache/whisper-cpp/ggml-base.en.bin \
 
 # optional: menu-bar start/stop toggle
 pip3 install --user rumps
+
+# optional: capture the other party's audio (see "Capturing the other party's
+# audio" below -- you also need a Multi-Output Device)
+brew install blackhole-2ch
 ```
 
 ### Optional: live HUD
@@ -50,10 +56,11 @@ Without any backend the HUD still runs, just with no knowledge-base grounding.
 ```bash
 ./zoom-record.sh              # 5-min segments, devices chosen automatically
 ./zoom-record.sh 10           # 10-min segments
-./zoom_record.py --list       # list audio inputs/outputs and exit
-./zoom_record.py --self-test  # play a tone and verify the capture path
-./menubar.py                  # menu-bar toggle: click to start/stop
-./settings.py                 # open the settings GUI (providers, KB, speakers, keys)
+./zoom_record.py --list          # list audio devices + defaults + routing advice
+./zoom_record.py --self-test     # play a tone and verify the capture path
+./zoom_record.py --check-routing # verify system audio reaches a loopback
+./menubar.py                     # menu-bar toggle: click to start/stop
+./settings.py                    # open the settings GUI (providers, KB, speakers, keys)
 ```
 
 Press **Ctrl+C** (or click "Stop Recording" in the menu bar) to stop. Mic and
@@ -200,7 +207,10 @@ recording stops. These files are written under `derived/` (flushed every
 The window itself is interactive: type a question in the **Ask** box at the
 bottom of the Q&A pane, click a talking point's **pin** to keep it at the top,
 and **copy** on any point or answer. **Pause answers** stops AI generation while
-the transcript keeps running, and the header shows a live STT **lag** indicator.
+the transcript keeps running. The header shows a live STT **lag** indicator, the
+input **level vs the speech threshold**, and the **mic/system devices** in use,
+with a warning banner when the other party's audio can't be captured (see
+*Capturing the other party's audio* below).
 
 **Speaker labels (partial diarization).** Because the mic and the
 system/loopback are captured as *separate channels*, the HUD can attribute
@@ -279,10 +289,10 @@ last and flagged.
 `./zoom_record.py --list` prints every device with its transport, the current
 defaults, and exactly what to fix; `./zoom_record.py --check-routing` plays a
 tone and verifies that it reaches a loopback. If system audio can't be
-captured, the app records the microphone only and the HUD shows a warning
-banner rather than mislabelling room audio as the remote party. Plugging in
-headphones or switching to Bluetooth changes the route mid-call; the recorder
-re-detects it and re-resolves the source, and the HUD follows along.
+captured, the HUD shows a warning banner and flags the devices pill, so room
+audio isn't mistaken for the remote party. Plugging in headphones or switching
+to Bluetooth changes the route mid-call; the recorder re-detects it and
+re-resolves the source, and the HUD follows along.
 
 **Providers.** All are OpenAI-compatible, so the same client serves each of
 them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
@@ -309,14 +319,17 @@ dropped first so question answers keep working. Set `budget.tpm` / `budget.tpd`
 in the config to impose limits below the provider's.
 
 **Configuration.** Defaults can be set in `~/.config/zoom-recorder/config.json`
-(keep it `chmod 600`); environment variables always win:```json
+(keep it `chmod 600`); environment variables always win:
+
+```json
 {
   "stt":     {"backend": "groq", "chunk_seconds": 10, "glossary": ["Acme", "Q3"],
-               "vad_backend": "auto", "hallucination_filter": true},
+               "vad_backend": "auto", "vad_margin_db": 6, "hallucination_filter": true},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
                "context_minutes": 5, "question_rewrite": true,
                "answer_self_questions": false, "summary_enabled": true,
                "talking_points_grounded": true, "talking_points_max": 3,
+               "talking_points_min_new_words": 60,
                "fallback": ["openrouter", "ollama"]},
   "kb":      {"dirs": ["~/notes"], "top_k": 5, "embed_backend": "auto"},
   "hud":     {"port": 0, "open_browser": true, "persist_seconds": 20},
@@ -374,6 +387,9 @@ to the **next** recording, since the HUD reads config at session start.
 | `--mic NAME` | auto | Force a microphone by name (env `MIC_AUDIO_DEVICE`) |
 | `--system NAME` | auto | Force the system/loopback input (env `ZOOM_AUDIO_DEVICE`) |
 | `--no-system` | off | Record the microphone only |
+| `--list` | — | List audio devices (transport, defaults, loopback advice), then exit |
+| `--self-test` | off | Play a tone and verify the output→loopback capture path |
+| `--check-routing` | off | Verify system audio reaches a loopback, then exit |
 | `--chunk-seconds N` | 5 | How often the active mic is tested |
 | `--fail-threshold N` | 3 | Consecutive silent checks before cycling inputs |
 | `--cycle-seconds N` | 60 | How often every inactive input is tested |
@@ -403,19 +419,33 @@ to the **next** recording, since the HUD reads config at session start.
 ## How It Works
 
 - Audio devices are matched by **name**, not positional index (avfoundation's
-  index order changes with what's connected and whether Zoom is outputting audio).
-- The **best mic is selected automatically**: every candidate is probed with
-  ffmpeg's `volumedetect`, and the pick prefers a device that is actually
-  delivering signal, then falls back to a quality ranking
-  (wired external > built-in > Bluetooth). A system/loopback device
-  (`ZoomAudioDevice`, BlackHole, Loopback, …) is selected for meeting audio.
-- Microphone and system audio are mixed and written as crash-safe segments.
+  index order changes with what's connected and whether Zoom is outputting
+  audio), and the device **topology** is read from `system_profiler` so the app
+  knows the current default input/output and each device's transport.
+- The **best mic is selected automatically**: virtual/loopback devices are
+  excluded, the system default input is preferred, and every candidate is
+  probed with ffmpeg's `volumedetect` — the pick prefers a device that is
+  actually delivering signal, then falls back to a quality ranking
+  (wired external > built-in > Bluetooth).
+- The **system source is a real loopback** (BlackHole, the Loopback app,
+  Soundflower, or a Multi-Output Device), preferred over `ZoomAudioDevice`,
+  which only carries audio Zoom itself shares. If there is no loopback at all,
+  the recorder records microphone-only and prints the exact fix; if a loopback
+  exists but isn't in the output path (or is silent), it's flagged rather than
+  silently trusted.
+- Microphone and system audio are **never mixed at capture**: they are written
+  as **two separate mono tracks** (crash-safe segments), so a later
+  enhancement/leveling pass can be applied per-source. The only mixdown is a
+  disposable `derived/recording_mixed.wav` for transcription.
 - **Every `--chunk-seconds` the active mic is tested.** A dead capture reads about
   `-91 dB`, so `--silence-db` cleanly separates a dead input from a live one.
 - After `--fail-threshold` consecutive silent checks, the recorder **cycles
   through every other candidate**, probes them, and switches to the best one
   that produces signal. The current capture keeps running throughout, so
   natural meeting silence never drops audio.
+- When the **default input/output changes mid-call** (headphones, Bluetooth),
+  the recorder re-reads the topology and re-resolves the affected source; the
+  live HUD follows the switch and restarts only that STT source.
 - Every `--cycle-seconds` all inactive inputs are tested and their levels logged.
 - Every run writes `capture.log` next to the recording, documenting the devices
   selected, every probe level, and every failover.
@@ -425,14 +455,19 @@ to the **next** recording, since the HUD reads config at session start.
 - **Recording is silent** — the recorder now detects this itself and will fail
   over to another input. Check `capture.log` to see which devices were probed
   and why a switch did or did not happen.
-- **No system/meeting audio** — no loopback device was found. Start Zoom so
-  `ZoomAudioDevice` appears, or install
-  [BlackHole](https://github.com/ExistentialAudio/BlackHole) and route Zoom's
-  output through it.
-- **"ERROR: ZoomAudioDevice not found"** — pass `--system NAME` to choose a
-  different device, or run `./zoom_record.py --list` to see what is available.
-- **Is Zoom's output actually capturable?** — run `./zoom_record.py --self-test`;
-  it plays a short tone and checks whether a loopback input records it.
+- **The other party isn't in the transcript, or YouTube was labelled as you** —
+  macOS system audio needs a loopback in the output path. Run
+  `./zoom_record.py --list` (prints the default output and the exact fix) and
+  `./zoom_record.py --check-routing` (plays a tone and verifies capture). The
+  usual fix: install [BlackHole](https://github.com/ExistentialAudio/BlackHole)
+  and add it to a Multi-Output Device — see
+  *Capturing the other party's audio (macOS)* above. `ZoomAudioDevice` alone is
+  not enough; it only carries audio Zoom itself shares.
+- **Wrong device selected** — pass `--mic NAME` / `--system NAME` (or set
+  `MIC_AUDIO_DEVICE` / `ZOOM_AUDIO_DEVICE`); `--list` shows exact names.
+- **Is the capture path actually working?** — run `./zoom_record.py --self-test`
+  (or `--check-routing`); it plays a short tone and checks whether a loopback
+  input records it.
 
 ### Menu-bar icon hidden by the notch
 
@@ -468,3 +503,18 @@ The settings GUI (`./settings.py`, or **Settings…** in the menu bar) edits
 `~/.config/zoom-recorder/config.json` (chmod `600`). The full set of keys is
 shown under **Configuration** in the HUD section above; the GUI covers all of
 them and never displays stored API keys.
+
+## Version history
+
+Annotated tags mark each milestone (`git tag -n` for the full messages):
+
+| Tag | Highlights |
+| --- | --- |
+| `v1.0-core` | Robust mic + system recorder: verification, manifest, post-hoc transcription |
+| `v1.1-hud` | Live transcript + AI answer HUD (`--live`), local KB, derived outputs |
+| `v1.2-settings` | Settings GUI, channel-based speaker labels, menu-bar docs |
+| `v1.3-grounding` | Transcript-grounded talking points, faster STT/answers, HUD controls (ask/pause/copy/pin), end-of-call summary |
+| `v1.4-stt-hallucination` | Adaptive VAD, `verbose_json` segment confidence gating, text hallucination filter, prompt hygiene |
+| `v1.5-routing` | macOS audio topology, BlackHole-first loopback selection, route re-detection, HUD device status, `--list`/`--check-routing` |
+
+Running the tests: `python3 -m unittest discover -s tests`.
