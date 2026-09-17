@@ -368,6 +368,9 @@ def _warn_system(log: Log, chosen: Optional[Candidate]) -> None:
     advice = system_advice()
     if advice:
         log.warn(advice)
+        if "Multi-Output" in advice or "Install BlackHole" in advice:
+            log.warn("Fix it automatically: ./zoom_record.py --fix-routing "
+                     "(or use the menu-bar app: Fix Audio Routing).")
 
 
 class Recorder:
@@ -799,6 +802,7 @@ def self_test(probe_seconds_arg: float, system_cands: List[Candidate], outputs: 
         advice = system_advice()
         if advice:
             log.warn(advice)
+            log.warn("Fix it automatically: ./zoom_record.py --fix-routing.")
         return 1
     probe_seconds = max(1.5, probe_seconds_arg)
     total = probe_seconds * len(system_cands) + 2.0
@@ -866,6 +870,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="play a tone and verify the output->loopback capture path")
     parser.add_argument("--check-routing", action="store_true",
                         help="verify system-audio routing reaches a loopback, then exit")
+    parser.add_argument("--fix-routing", action="store_true",
+                        help="create the Multi-Output Device (loopback + real output) "
+                             "and select it as the default output, then exit")
+    parser.add_argument("--fix-output", default=None, metavar="NAME",
+                        help="with --fix-routing: which real output device to include")
 
     # -- live HUD (opt-in; recording is unchanged when these are not used) ---
     parser.add_argument("--live", action="store_true",
@@ -964,8 +973,24 @@ def build_hud_config(args: argparse.Namespace):
     return cfg
 
 
+def run_routing_fix(args: argparse.Namespace) -> int:
+    try:
+        from hud.routing_fix import fix_routing
+    except Exception as exc:  # noqa: BLE001
+        print("ERROR: routing fix unavailable: {}".format(exc), file=sys.stderr)
+        return 1
+    topo = load_topology(force=True) if load_topology is not None else None
+    result = fix_routing(topo, physical_output=args.fix_output)
+    print(result.message)
+    if result.ok and result.changed:
+        print("Verify the capture path: ./zoom_record.py --self-test")
+    return 0 if result.ok else 1
+
+
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+    if args.fix_routing:
+        return run_routing_fix(args)
     if not shutil.which("ffmpeg"):
         print("ERROR: ffmpeg not found. Install it: brew install ffmpeg", file=sys.stderr)
         return 1
@@ -1002,6 +1027,7 @@ def main(argv: List[str]) -> int:
         advice = system_advice(topo)
         if advice:
             print("System audio:   {}".format(advice))
+            print("                Fix automatically: ./zoom_record.py --fix-routing")
         return 0
 
     minutes = args.minutes_opt if args.minutes_opt is not None else args.minutes

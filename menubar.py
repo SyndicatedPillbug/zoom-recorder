@@ -73,8 +73,9 @@ class RecorderApp(rumps.App):
         self.live_item = rumps.MenuItem("Start with Live HUD", callback=self.start_live)
         self.open_hud_item = rumps.MenuItem("Open Live HUD…", callback=self.open_hud)
         self.settings_item = rumps.MenuItem("Settings…", callback=self.open_settings)
+        self.fix_routing_item = rumps.MenuItem("Fix Audio Routing…", callback=self.fix_routing)
         self.menu = [self.toggle_item, self.live_item, None,
-                     self.open_hud_item, self.settings_item]
+                     self.open_hud_item, self.settings_item, self.fix_routing_item]
         self._sync_ui()
 
     def _hud_active(self) -> bool:
@@ -113,6 +114,29 @@ class RecorderApp(rumps.App):
         url = HUD_URLFILE.read_text(encoding="utf-8").strip()
         if url:
             subprocess.Popen(["open", url])
+
+    def fix_routing(self, _sender) -> None:
+        # Runs the routing fixer as a subprocess (never the app process);
+        # it creates the Multi-Output Device and switches the default output.
+        self.fix_routing_item.title = "Fixing Audio Routing…"
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "hud.routing_fix"],
+                cwd=str(SCRIPT_DIR), capture_output=True, text=True, timeout=90)
+            out = (proc.stdout or "") + (proc.stderr or "")
+        except Exception as exc:
+            out = str(exc)
+        self.fix_routing_item.title = "Fix Audio Routing…"
+        lines = [ln for ln in out.splitlines()
+                 if ln.strip() and not ln.startswith("RESULT: ")]
+        detail = "Fix unavailable; run ./zoom_record.py --fix-routing in Terminal."
+        if "RESULT: OK" in out:
+            detail = lines[0] if lines else detail
+        elif "RESULT: MANUAL" in out:
+            detail = ("Could not set it up automatically. Audio MIDI Setup opened; "
+                      "follow the click-by-click steps (README: audio routing).")
+            subprocess.Popen(["open", "-a", "Audio MIDI Setup"])
+        rumps.notification("zoom-recorder", "Audio routing", detail)
 
     def open_settings(self, _sender) -> None:
         if _read_pidfile(SETTINGS_PIDFILE) is None:

@@ -277,9 +277,18 @@ system audio out of the box. You need a **loopback** device that mirrors your
 output, and it must actually be in the output path:
 
 1. Install BlackHole: `brew install blackhole-2ch`.
-2. Open **Audio MIDI Setup → + → Create Multi-Output Device**, tick **both** your
-   headphones/speakers **and** `BlackHole 2ch`.
-3. Select that Multi-Output Device as the system output (and in Zoom).
+2. Then let the app do the rest: `./zoom_record.py --fix-routing` creates the
+   Multi-Output Device (BlackHole 2ch + your real output) **and** selects it as
+   the default output — no clicking in Audio MIDI Setup. The menu-bar app has a
+   `Fix Audio Routing…` item that does the same thing. Use
+   `--fix-output "MacBook Air Speakers"` to pick which real output to pair;
+   re-run after switching headphones/speakers to rebuild the device.
+3. If macOS refuses the automated fix (or BlackHole is missing), the tool
+   prints a click-by-click walkthrough: **Audio MIDI Setup → + → Create
+   Multi-Output Device**, tick **both** your headphones/speakers **and**
+   `BlackHole 2ch`, tick "Drift Correction" on BlackHole, make your real output
+   the master, then select the Multi-Output Device as the system output (and in
+   Zoom).
 
 System audio is then mirrored into BlackHole and captured automatically; the
 HUD shows `mic: … · sys: BlackHole 2ch`. Note that `ZoomAudioDevice` is **not**
@@ -390,6 +399,8 @@ to the **next** recording, since the HUD reads config at session start.
 | `--list` | — | List audio devices (transport, defaults, loopback advice), then exit |
 | `--self-test` | off | Play a tone and verify the output→loopback capture path |
 | `--check-routing` | off | Verify system audio reaches a loopback, then exit |
+| `--fix-routing` | off | Create the Multi-Output Device and select it as default output, then exit |
+| `--fix-output NAME` | auto | With `--fix-routing`: which real output device to pair |
 | `--chunk-seconds N` | 5 | How often the active mic is tested |
 | `--fail-threshold N` | 3 | Consecutive silent checks before cycling inputs |
 | `--cycle-seconds N` | 60 | How often every inactive input is tested |
@@ -516,5 +527,6 @@ Annotated tags mark each milestone (`git tag -n` for the full messages):
 | `v1.3-grounding` | Transcript-grounded talking points, faster STT/answers, HUD controls (ask/pause/copy/pin), end-of-call summary |
 | `v1.4-stt-hallucination` | Adaptive VAD, `verbose_json` segment confidence gating, text hallucination filter, prompt hygiene |
 | `v1.5-routing` | macOS audio topology, BlackHole-first loopback selection, route re-detection, HUD device status, `--list`/`--check-routing` |
+| `v1.6-routing-fix` | One-command automated routing fix (`--fix-routing`, menu-bar item), bare-BlackHole misroute advice, click-by-click fallback |
 
 Running the tests: `python3 -m unittest discover -s tests`.

@@ -377,5 +377,15 @@ and accepted any loopback that merely *opened*, even a silent one.
   cannot be captured.
 - **Diagnostics**: `--list` annotates transport/defaults and prints the fix;
   new `--check-routing` plays a tone and verifies it reaches a loopback.
+- **Automated routing fix (`v1.6-routing-fix`)**: creating the Multi-Output
+  Device and switching the default output are both public CoreAudio APIs, so
+  `hud/routing_fix.py` does it directly via ctypes
+  (`AudioHardwareCreateAggregateDevice` with `stacked=1`, then
+  `kAudioHardwarePropertyDefaultOutputDevice`) — no sudo, no GUI scripting.
+  `--fix-routing` runs it (and re-runs with `--fix-output NAME` to re-track
+  headphones/speakers); the menu-bar app gets a `Fix Audio Routing…` item.
+  It also detects the inverse misroute (a bare loopback as default output, so
+  audio is captured but inaudible) and, when macOS refuses, falls back to a
+  click-by-click Audio MIDI Setup walkthrough.
 - Covered by `DevicesTests` (classification, output-path detection, advice,
-  system_profiler parsing, HUD device updates).
+  system_profiler parsing, HUD device updates) and `RoutingFixTests`.

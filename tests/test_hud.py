@@ -1320,5 +1320,86 @@ class WavTests(unittest.TestCase):
             self.assertEqual(wf.getsampwidth(), 2)
 
 
+class RoutingFixTests(unittest.TestCase):
+    def _topology(self, items):
+        from hud import devices
+
+        topo = devices.Topology()
+        topo.devices = [devices.AudioDevice(**d) for d in items]
+        for dev in topo.devices:
+            if dev.default_input:
+                topo.default_input = dev.name
+            if dev.default_output:
+                topo.default_output = dev.name
+        return topo
+
+    def _broken_topo(self) -> None:
+        return self._topology([
+            {"name": "BlackHole 2ch", "transport": "coreaudio_device_type_virtual",
+             "input_channels": 2, "output_channels": 2},
+            {"name": "External Headphones", "transport": "coreaudio_device_type_builtin",
+             "output_channels": 2, "default_output": True},
+            {"name": "MacBook Air Speakers", "transport": "coreaudio_device_type_builtin",
+             "output_channels": 2},
+        ])
+
+    def test_needs_fix_when_real_output_is_default(self) -> None:
+        from hud.routing_fix import MULTI_OUTPUT_NAME, needs_fix
+
+        topo = self._broken_topo()
+        self.assertTrue(needs_fix(topo))
+
+        topo2 = self._topology([
+            {"name": MULTI_OUTPUT_NAME, "transport": "coreaudio_device_type_aggregate",
+             "input_channels": 2, "output_channels": 2, "default_output": True},
+        ])
+        self.assertFalse(needs_fix(topo2))
+
+    def test_choose_physical_output_prefers_headphones(self) -> None:
+        from hud.routing_fix import choose_physical_output
+
+        topo = self._broken_topo()
+        # Default output is the headphones; but if the misroute is a plain
+        # loopback device, the ranked choice still finds a real output.
+        self.assertEqual(choose_physical_output(topo).name, "External Headphones")
+
+    def test_choose_physical_output_override(self) -> None:
+        from hud.routing_fix import choose_physical_output
+
+        topo = self._broken_topo()
+        self.assertEqual(choose_physical_output(topo, "MacBook Air Speakers").name,
+                         "MacBook Air Speakers")
+        self.assertIsNone(choose_physical_output(topo, "Nonexistent Device"))
+
+    def test_choose_physical_output_prefers_real_default(self) -> None:
+        from hud.routing_fix import choose_physical_output
+
+        topo = self._broken_topo()
+        # Headphones are the default output; they must win the ranked choice.
+        self.assertEqual(choose_physical_output(topo).name, "External Headphones")
+
+    def test_fix_routing_requires_loopback(self) -> None:
+        from hud import routing_fix
+
+        topo = self._topology([
+            {"name": "ZoomAudioDevice", "transport": "virtual",
+             "input_channels": 2, "output_channels": 2},
+        ])
+        result = routing_fix.fix_routing(topo)
+        self.assertFalse(result.ok)
+        self.assertIn("brew install blackhole-2ch", result.message)
+        self.assertIn("Click-by-click", result.message)
+
+    def test_walkthrough_steps(self) -> None:
+        from hud.routing_fix import walkthrough
+
+        text = walkthrough("BlackHole 2ch", "External Headphones", "zoom-recorder Multi-Output")
+        for step in ["Audio MIDI Setup", "Create Multi-Output Device",
+                     "Drift Correction", "self-test"]:
+            self.assertIn(step, text)
+        self.assertIn("BlackHole 2ch", text)
+        self.assertIn("External Headphones", text)
+
+
 if __name__ == "__main__":
     unittest.main()

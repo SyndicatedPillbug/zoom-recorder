@@ -202,4 +202,12 @@ def system_advice(topo: Optional[Topology] = None) -> str:
         return ("System audio is not routed to a loopback. Create a Multi-Output "
                 "Device that includes '{}' plus your speakers/headphones, then set "
                 "it as the default output.".format(good[0]))
+    out = topo.device(topo.default_output)
+    if out is not None and out.is_virtual and not out.is_aggregate:
+        # The inverse misroute: a bare loopback is the default output, so
+        # audio reaches the recorder but never the user's ears.
+        return ("The default output is '{}' by itself, so system audio is captured "
+                "but you hear nothing. Create a Multi-Output Device that includes "
+                "'{}' plus your speakers/headphones and select that as the default "
+                "output.".format(out.name, good[0]))
     return ""
