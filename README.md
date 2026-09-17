@@ -123,7 +123,7 @@ One-keystroke-equivalent start/stop with no background daemon: the menu-bar
 icon only spawns the recorder subprocess while you're actually recording, so
 there's never a persistent, silent mic-access process for an EDR to flag or
 that could record something by accident. The icon shows three states —
-🎙 idle, 🔴 REC recording, 🧠 HUD recording with the live window up — and the
+🎙 idle, 🔴 recording, 🧠 recording with the live window up — and the
 menu gives the HUD its own options, separate from the plain recording toggle:
 
 ```
@@ -136,6 +136,12 @@ Quit
 
 Click "Stop Recording" to send the same clean-shutdown signal Ctrl+C would;
 **Open Live HUD…** re-opens the window in the browser.
+
+The status icon is intentionally a **single glyph** (🎙 / 🔴 / 🧠) to keep it
+narrow. On MacBooks with a notch, macOS hides menu-bar items that don't fit,
+and status items overflow leftward under the notch — see
+[Menu-bar icon hidden by the notch](#menu-bar-icon-hidden-by-the-notch) if the
+icon disappears.
 
 **Note:** the repo must live outside `~/Documents`, `~/Desktop`, and
 `~/Downloads`. Those are TCC-protected on macOS, and a process spawned by
@@ -330,3 +336,38 @@ to the **next** recording, since the HUD reads config at session start.
   different device, or run `./zoom_record.py --list` to see what is available.
 - **Is Zoom's output actually capturable?** — run `./zoom_record.py --self-test`;
   it plays a short tone and checks whether a loopback input records it.
+
+### Menu-bar icon hidden by the notch
+
+On MacBooks with a notch, macOS **hides menu-bar items that don't fit** —
+status items overflow leftward into the notch, so the 🎙 can be pushed out of
+view even though the app is running. Fixes, in order of effort:
+
+1. **Reposition it** — hold **Command** and drag the 🎙 icon toward the right
+   end of the menu bar (past other icons). If you can't grab it because it's
+   fully hidden, use Ice below.
+2. **Use a menu-bar manager (recommended)** — install
+   [Ice](https://icemenubar.app) (free, open-source):
+
+   ```bash
+   brew install --cask jordanbaird-ice
+   ```
+
+   Launch it and grant **Accessibility** permission (System Settings → Privacy
+   & Security → Accessibility). Then open **Ice → Settings → Menu Bar Layout**,
+   find our item (owner **Python**, microphone glyph) and drag it into the
+   visible section; drag anything you don't need into the Hidden section to
+   free space. Ice shows *all* items there, including ones hidden under the
+   notch, so it's the reliable fix.
+3. **Bypass the menu bar** — `./settings.py` always opens the settings GUI from
+   a terminal, regardless of menu-bar state.
+
+Note: Ice adds its own status icon; if the bar is very full, hide that too
+(Ice → Settings → General → "Show Ice icon") and use the hotkey instead.
+
+### Where the HUD settings live
+
+The settings GUI (`./settings.py`, or **Settings…** in the menu bar) edits
+`~/.config/zoom-recorder/config.json` (chmod `600`). The full set of keys is
+shown under **Configuration** in the HUD section above; the GUI covers all of
+them and never displays stored API keys.

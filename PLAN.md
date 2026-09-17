@@ -211,9 +211,11 @@ All of the above is implemented; see `hud/` and `tests/test_hud.py`.
 
 Menu bar: the HUD gets its own distinct options (`Start with Live HUD`,
 `Open Live HUD…`) rather than reusing the plain recording toggle, with a
-three-state icon (🎙 idle / 🔴 REC recording / 🧠 HUD recording + live window).
+three-state icon (🎙 idle / 🔴 recording / 🧠 recording + live window).
 The state logic is kept in `hud/menu_state.py` so it is testable without
-importing `rumps`.
+importing `rumps`. The icon is deliberately a single glyph: on notched Macs
+macOS hides menu-bar items that don't fit, so the README documents the
+Command-drag and Ice (menu-bar manager) remedies.
 
 Settings GUI: `hud/settings.py` + `hud/static/settings.html` serve a loopback
 form (launched via `./settings.py` or the menu bar) that edits the config with

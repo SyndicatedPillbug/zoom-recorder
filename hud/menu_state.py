@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import Any, Dict
 
 ICON_IDLE = "🎙"
-ICON_RECORDING = "🔴 REC"
-ICON_HUD = "🧠 HUD"
+ICON_RECORDING = "🔴"
+ICON_HUD = "🧠"
 
 
 def describe(recording: bool, hud_active: bool) -> Dict[str, Any]:

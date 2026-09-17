@@ -7,7 +7,7 @@ writes is exactly what an EDR (Falcon) is tuned to flag, and it's a consent
 risk if it ever records something it shouldn't. This app only exists, visibly,
 in the menu bar; the recorder subprocess only exists while you're actually
 recording, and the icon always shows which state you're in (🎙 idle,
-🔴 REC recording, 🧠 HUD recording with the live window up).
+🔴 recording, 🧠 HUD recording with the live window up).
 
 The menu gives the live HUD its own distinct options: "Start with Live HUD"
 and "Open Live HUD…", separate from the plain "Start Recording" toggle.
@@ -163,4 +163,9 @@ class RecorderApp(rumps.App):
 
 
 if __name__ == "__main__":
-    RecorderApp().run()
+    app = RecorderApp()
+    print("zoom-recorder menubar started (pid {}); menu: {}".format(
+        os.getpid(),
+        " | ".join([app.toggle_item.title, app.live_item.title,
+                    app.open_hud_item.title, app.settings_item.title])), flush=True)
+    app.run()
