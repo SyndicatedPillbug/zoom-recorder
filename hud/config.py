@@ -99,10 +99,11 @@ class HudConfig:
     stt_vad_backend: str = "auto"      # auto | energy | webrtcvad
     stt_adaptive_vad: bool = True
     stt_silence_db: float = -50.0
-    stt_vad_margin_db: float = 8.0
+    stt_vad_margin_db: float = 6.0
+    stt_vad_aggressiveness: int = 1    # webrtcvad 0 (lenient) .. 3 (strict)
     stt_verbose_stt: bool = True       # request segment confidences (verbose_json)
-    stt_no_speech_prob_max: float = 0.6
-    stt_avg_logprob_min: float = -1.0
+    stt_no_speech_prob_max: float = 0.75
+    stt_avg_logprob_min: float = -1.5
     stt_compression_ratio_max: float = 2.4
     stt_hallucination_filter: bool = True
     stt_context_prompt: bool = True    # seed Whisper with previous transcript
@@ -221,10 +222,11 @@ def _defaults() -> Dict[str, Any]:
             "vad_backend": "auto",
             "adaptive_vad": True,
             "silence_db": -50.0,
-            "vad_margin_db": 8.0,
+            "vad_margin_db": 6.0,
+            "vad_aggressiveness": 1,
             "verbose_stt": True,
-            "no_speech_prob_max": 0.6,
-            "avg_logprob_min": -1.0,
+            "no_speech_prob_max": 0.75,
+            "avg_logprob_min": -1.5,
             "compression_ratio_max": 2.4,
             "hallucination_filter": True,
             "context_prompt": True,
@@ -314,10 +316,11 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_vad_backend=str(stt.get("vad_backend") or "auto"),
         stt_adaptive_vad=bool(stt.get("adaptive_vad", True)),
         stt_silence_db=_as_float(stt.get("silence_db"), -50.0),
-        stt_vad_margin_db=_as_float(stt.get("vad_margin_db"), 8.0),
+        stt_vad_margin_db=_as_float(stt.get("vad_margin_db"), 6.0),
+        stt_vad_aggressiveness=_as_int(stt.get("vad_aggressiveness"), 1),
         stt_verbose_stt=bool(stt.get("verbose_stt", True)),
-        stt_no_speech_prob_max=_as_float(stt.get("no_speech_prob_max"), 0.6),
-        stt_avg_logprob_min=_as_float(stt.get("avg_logprob_min"), -1.0),
+        stt_no_speech_prob_max=_as_float(stt.get("no_speech_prob_max"), 0.75),
+        stt_avg_logprob_min=_as_float(stt.get("avg_logprob_min"), -1.5),
         stt_compression_ratio_max=_as_float(stt.get("compression_ratio_max"), 2.4),
         stt_hallucination_filter=bool(stt.get("hallucination_filter", True)),
         stt_context_prompt=bool(stt.get("context_prompt", True)),
@@ -381,6 +384,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "adaptive_vad": cfg.stt_adaptive_vad,
         "silence_db": cfg.stt_silence_db,
         "vad_margin_db": cfg.stt_vad_margin_db,
+        "vad_aggressiveness": cfg.stt_vad_aggressiveness,
         "verbose_stt": cfg.stt_verbose_stt,
         "no_speech_prob_max": cfg.stt_no_speech_prob_max,
         "avg_logprob_min": cfg.stt_avg_logprob_min,

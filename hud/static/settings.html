@@ -82,6 +82,9 @@
     <div class="row"><label>VAD margin (dB)</label><div class="ctl">
       <input type="number" step="1" id="stt.vad_margin_db" />
       <span class="hint">speech must exceed the noise floor by this</span></div></div>
+    <div class="row"><label>webrtcvad strictness</label><div class="ctl">
+      <input type="number" step="1" min="0" max="3" id="stt.vad_aggressiveness" />
+      <span class="hint">0 lenient … 3 strict</span></div></div>
     <div class="row"><label>Filter hallucinations</label><div class="ctl">
       <input type="checkbox" id="stt.hallucination_filter" /></div></div>
   </section>
@@ -265,6 +268,7 @@
     setVal('stt.glossary', (c.stt.glossary || []).join(', '));
     setVal('stt.vad_backend', c.stt.vad_backend);
     setVal('stt.vad_margin_db', c.stt.vad_margin_db);
+    setVal('stt.vad_aggressiveness', c.stt.vad_aggressiveness);
     setVal('stt.hallucination_filter', c.stt.hallucination_filter);
     setVal('answers.enabled', c.answers.enabled); setVal('answers.backend', c.answers.backend);
     setVal('answers.fallback', (c.answers.fallback || []).join(', '));
@@ -295,7 +299,8 @@
              chunk_seconds: num('stt.chunk_seconds'),
              glossary: $('stt.glossary').value.split(',').map(s => s.trim()).filter(Boolean),
              vad_backend: $('stt.vad_backend').value,
-             vad_margin_db: Number($('stt.vad_margin_db').value || 8),
+             vad_margin_db: Number($('stt.vad_margin_db').value || 6),
+             vad_aggressiveness: num('stt.vad_aggressiveness'),
              hallucination_filter: $('stt.hallucination_filter').checked },
       answers: { enabled: $('answers.enabled').checked, backend: $('answers.backend').value,
                  fallback: $('answers.fallback').value.split(',').map(s => s.trim()).filter(Boolean),

@@ -203,6 +203,19 @@ class VADTests(unittest.TestCase):
         self.assertEqual(chunker.feed(hum * 2), [])  # 2s of steady hum
         self.assertTrue(chunker.feed(tone(1.2, freq=300.0, amp=12000)))
 
+    def test_energy_vad_non_adaptive_matches_old_gate(self) -> None:
+        vad = EnergyVAD(absolute_db=-50.0, adaptive=False)
+        self.assertFalse(vad.is_speech(tone(0.1, freq=300.0, amp=50)))
+        self.assertTrue(vad.is_speech(tone(0.1, freq=300.0, amp=2000)))
+
+    def test_energy_vad_captures_quiet_speech(self) -> None:
+        vad = EnergyVAD(absolute_db=-50.0, margin_db=6.0, calibration_frames=3)
+        quiet = b"\x00\x00" * 800
+        for _ in range(3):
+            vad.is_speech(quiet)
+        self.assertFalse(vad.is_speech(quiet))
+        self.assertTrue(vad.is_speech(tone(0.1, freq=300.0, amp=2000)))
+
 
 class HallucinationTests(unittest.TestCase):
     def test_repetitive_loop_dropped(self) -> None:

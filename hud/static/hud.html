@@ -122,6 +122,7 @@
   <span class="pill" id="status">connecting…</span>
   <span class="pill egress" id="egress" title="Only transcript text leaves this Mac when answers are enabled.">answers: unknown</span>
   <span class="pill" id="lag" title="How far the live transcription is behind the audio">lag —</span>
+  <span class="pill" id="level" title="Current input level vs the speech threshold (dBFS)">lvl —</span>
   <div class="spacer"></div>
   <button class="mini" id="pauseBtn" title="Pause AI answers (transcript keeps running)">Pause answers</button>
   <span class="pill" id="budgetLabel">budget —</span>
@@ -155,6 +156,7 @@
   const statusEl = document.getElementById('status');
   const egressEl = document.getElementById('egress');
   const lagEl = document.getElementById('lag');
+  const levelEl = document.getElementById('level');
   const dotEl = document.getElementById('dot');
   const budgetBar = document.getElementById('budgetBar');
   const budgetLabel = document.getElementById('budgetLabel');
@@ -291,6 +293,12 @@
     }
     if (meta.stt_lag_seconds !== undefined) {
       lagEl.textContent = 'lag ' + Number(meta.stt_lag_seconds).toFixed(1) + 's';
+    }
+    if (meta.stt_vad_level_db !== undefined) {
+      const lvl = Number(meta.stt_vad_level_db);
+      const thr = meta.stt_vad_threshold_db;
+      levelEl.textContent = 'lvl ' + lvl.toFixed(0) + (thr !== undefined ? '/' + Number(thr).toFixed(0) : '') + ' dB';
+      levelEl.style.color = (thr !== undefined && lvl > Number(thr)) ? 'var(--accent-2)' : 'var(--muted)';
     }
     if (meta.answers_paused !== undefined) setPaused(meta.answers_paused);
     const b = ev.budget || {};

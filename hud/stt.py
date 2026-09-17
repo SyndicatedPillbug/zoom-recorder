@@ -86,7 +86,7 @@ def looks_hallucinated(text: str, marginal: bool = False,
     words = re.findall(r"[a-z0-9']+", t.lower())
     if len(words) >= 6:
         unique_ratio = len(set(words)) / len(words)
-        if unique_ratio < 0.5:
+        if unique_ratio < 0.45:
             return True
     if len(words) >= 9:
         grams = [tuple(words[i:i + 3]) for i in range(len(words) - 2)]
@@ -341,7 +341,7 @@ class RemoteSTT:
                 except (TypeError, ValueError):
                     pass
         return STTResult(
-            text=" ".join(kept).strip(),
+            text=" ".join(kept).strip() or result.text,
             avg_logprob=(sum(logprobs) / len(logprobs)) if logprobs else None,
             no_speech_prob=max(no_speech) if no_speech else None,
             compression_ratio=max(ratios) if ratios else None,
@@ -476,6 +476,7 @@ class _Source:
         self.thread: Optional[threading.Thread] = None
         self.worker: Optional[threading.Thread] = None
         self.queue: "queue.Queue" = queue.Queue(maxsize=4)
+        self.vad = None
         self.tail: List[str] = []
         self.context_tail = ""
         self.dropped = 0
@@ -637,8 +638,9 @@ class LiveTranscriber:
                 source.speaker or "mixed", exc))
             self.state.set_status("recording", tap_error=str(exc))
             return
+        source.vad = build_vad(self.cfg, self.log)
         chunker = Chunker(self.cfg.stt_chunk_seconds, self.cfg.stt_min_speech_seconds,
-                          vad=build_vad(self.cfg, self.log))
+                          vad=source.vad)
         assert source.proc.stdout is not None
         try:
             for block in self._iter_blocks(source.proc.stdout):
@@ -682,8 +684,17 @@ class LiveTranscriber:
         queued = sum(s.queue.qsize() for s in self._sources)
         dropped = sum(s.dropped for s in self._sources)
         lag = round(queued * self.cfg.stt_chunk_seconds, 1)
-        self.state.set_meta(stt_lag_seconds=lag, stt_queued=queued,
-                            stt_dropped=dropped)
+        meta = {"stt_lag_seconds": lag, "stt_queued": queued, "stt_dropped": dropped}
+        thresholds = [t for t in (
+            getattr(s.vad, "threshold_db", lambda: None)()
+            for s in self._sources if s.vad is not None) if t is not None]
+        levels = [s.vad.last_level_db for s in self._sources
+                  if getattr(s.vad, "last_level_db", None) is not None]
+        if thresholds:
+            meta["stt_vad_threshold_db"] = round(max(thresholds), 1)
+        if levels:
+            meta["stt_vad_level_db"] = round(max(levels), 1)
+        self.state.set_meta(**meta)
 
     def _stt_worker(self, source: _Source) -> None:
         while not self._stop.is_set():

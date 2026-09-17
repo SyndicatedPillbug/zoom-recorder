@@ -251,6 +251,17 @@ gate by default, which rejects steady hum without any dependency. Installing
 `"webrtcvad"` to require the package. `stt.hallucination_filter` and the
 confidence thresholds control the non-speech text filter.
 
+The HUD header shows `lvl <level>/<threshold> dB` while recording. If dialogue
+isn't appearing, that pill tells you why:
+
+- **level stays below threshold** — the gate is too strict for your input.
+  Lower `stt.vad_margin_db` (default 6), or set `stt.adaptive_vad: false`
+  (fixed peak gate at `stt.silence_db`, the original behaviour), or force
+  `stt.vad_backend: "energy"`.
+- **level clears threshold but nothing appears** — turn off `stt.verbose_stt`
+  (segment confidence gating) or `stt.hallucination_filter` to isolate the text
+  filter, and check the log for `dropped likely hallucination` lines.
+
 **Providers.** All are OpenAI-compatible, so the same client serves each of
 them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
 `--stt-backend` flags:
