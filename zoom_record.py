@@ -788,13 +788,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="do not auto-open the HUD in a browser")
     parser.add_argument("--live-no-answers", action="store_true",
                         help="live transcript only; never call an answer provider")
+    parser.add_argument("--no-live-summary", action="store_true",
+                        help="do not generate an end-of-call summary/action items/email")
     parser.add_argument("--live-audio-file", default=None,
                         help="feed a media file to the HUD instead of a live tap (testing)")
     parser.add_argument("--stt-backend", default=None,
                         help="live STT backend: groq | openai | local")
     parser.add_argument("--stt-model", default=None, help="override the STT model")
     parser.add_argument("--stt-chunk-seconds", type=float, default=None,
-                        help="live STT chunk length in seconds (default 14)")
+                        help="live STT chunk length in seconds (default 10)")
+    parser.add_argument("--glossary-term", action="append", default=None,
+                        help="name/acronym to bias live transcription (repeatable)")
     parser.add_argument("--answer-backend", default=None,
                         help="answer provider: groq | openrouter | openai | ollama")
     parser.add_argument("--answer-model", default=None, help="override the question answer model")
@@ -806,6 +810,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="directory of .md files for context (repeatable)")
     parser.add_argument("--kb-top-k", type=int, default=None,
                         help="number of knowledge-base snippets per answer (default 5)")
+    parser.add_argument("--kb-embed-backend", default=None,
+                        help="KB embeddings: auto | sentence-transformers | ollama | openai")
     parser.add_argument("--kb-reindex", action="store_true",
                         help="rebuild the knowledge-base embedding index")
     parser.add_argument("--self-name", default=None,
@@ -833,6 +839,8 @@ def build_hud_config(args: argparse.Namespace):
         cfg.open_browser = False
     if args.live_no_answers:
         cfg.answers_enabled = False
+    if args.no_live_summary:
+        cfg.summary_enabled = False
     if args.live_audio_file:
         cfg.audio_file = args.live_audio_file
     if args.stt_backend:
@@ -841,6 +849,8 @@ def build_hud_config(args: argparse.Namespace):
         cfg.stt_model = args.stt_model
     if args.stt_chunk_seconds is not None:
         cfg.stt_chunk_seconds = args.stt_chunk_seconds
+    if args.glossary_term:
+        cfg.stt_glossary = args.glossary_term
     if args.answer_backend:
         cfg.answers_backend = args.answer_backend
     if args.answer_model:
@@ -853,6 +863,8 @@ def build_hud_config(args: argparse.Namespace):
         cfg.kb_dirs = args.kb_dir
     if args.kb_top_k is not None:
         cfg.kb_top_k = args.kb_top_k
+    if args.kb_embed_backend:
+        cfg.kb_embed_backend = args.kb_embed_backend
     if args.kb_reindex:
         cfg.kb_reindex = True
     if args.self_name:

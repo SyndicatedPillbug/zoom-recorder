@@ -71,6 +71,8 @@
       <button class="mini secondary" data-load-models="stt">Load</button></div></div>
     <div class="row"><label>Chunk seconds</label><div class="ctl">
       <input type="number" step="1" min="5" id="stt.chunk_seconds" /></div></div>
+    <div class="row"><label>Glossary</label><div class="ctl">
+      <input type="text" id="stt.glossary" placeholder="Acme, Q3, names… (comma separated)" /></div></div>
   </section>
 
   <section>
@@ -95,6 +97,21 @@
       <input type="checkbox" id="answers.rolling_enabled" /></div></div>
     <div class="row"><label>Max tokens</label><div class="ctl">
       <input type="number" step="50" min="100" id="answers.max_tokens" /></div></div>
+    <div class="row"><label>Answer my questions</label><div class="ctl">
+      <input type="checkbox" id="answers.answer_self_questions" /></div></div>
+    <div class="row"><label>Point dedupe score</label><div class="ctl">
+      <input type="number" step="0.05" min="0" max="1" id="answers.point_dedupe_score" />
+      <span class="hint">semantic similarity to suppress</span></div></div>
+    <div class="row"><label>End-of-call summary</label><div class="ctl">
+      <input type="checkbox" id="answers.summary_enabled" /></div></div>
+    <div class="row"><label>Ground talking points</label><div class="ctl">
+      <input type="checkbox" id="answers.talking_points_grounded" />
+      <span class="hint">transcript-only, quote-verified</span></div></div>
+    <div class="row"><label>Max points</label><div class="ctl">
+      <input type="number" step="1" min="1" id="answers.talking_points_max" /></div></div>
+    <div class="row"><label>Min new words</label><div class="ctl">
+      <input type="number" step="10" min="0" id="answers.talking_points_min_new_words" />
+      <span class="hint">before a refresh fires</span></div></div>
   </section>
 
   <section>
@@ -110,9 +127,20 @@
     </div></div>
     <div class="row"><label>Snippets (top k)</label><div class="ctl">
       <input type="number" step="1" min="1" id="kb.top_k" /></div></div>
-    <div class="row"><label>Embedding model</label><div class="ctl">
+    <div class="row"><label>Embeddings</label><div class="ctl">
+      <select id="kb.embed_backend">
+        <option value="auto">auto (recommended)</option>
+        <option value="sentence-transformers">sentence-transformers (local)</option>
+        <option value="ollama">ollama (local)</option>
+        <option value="openai">openai (remote)</option>
+      </select></div></div>
+    <div class="row"><label>Local model</label><div class="ctl">
       <input type="text" id="kb.model" /></div></div>
-    <div class="hint">Grounding needs <code>sentence-transformers</code> in a venv; without it the HUD runs without KB.</div>
+    <div class="row"><label>Remote embed model</label><div class="ctl">
+      <input type="text" id="kb.embed_model" placeholder="provider default" /></div></div>
+    <div class="row"><label>Min score</label><div class="ctl">
+      <input type="number" step="0.05" min="0" max="1" id="kb.min_score" /></div></div>
+    <div class="hint">auto uses a local model if installed, else Ollama, else the OpenAI key. Local embeddings stay on this Mac; remote ones send note chunks to that provider.</div>
   </section>
 
   <section>
@@ -132,6 +160,9 @@
       <input type="number" step="1" min="0" id="hud.port" /><span class="hint">0 = random</span></div></div>
     <div class="row"><label>Open browser</label><div class="ctl">
       <input type="checkbox" id="hud.open_browser" /></div></div>
+    <div class="row"><label>Flush seconds</label><div class="ctl">
+      <input type="number" step="5" min="0" id="hud.persist_seconds" />
+      <span class="hint">crash-safe derived/</span></div></div>
     <div class="row"><label>TPM cap</label><div class="ctl">
       <input type="number" step="1000" min="0" id="budget.tpm" /><span class="hint">0 = trust provider</span></div></div>
     <div class="row"><label>TPD cap</label><div class="ctl">
@@ -220,16 +251,26 @@
     cfg = c;
     setVal('stt.backend', c.stt.backend); setVal('stt.model', c.stt.model);
     setVal('stt.chunk_seconds', c.stt.chunk_seconds);
+    setVal('stt.glossary', (c.stt.glossary || []).join(', '));
     setVal('answers.enabled', c.answers.enabled); setVal('answers.backend', c.answers.backend);
     setVal('answers.fallback', (c.answers.fallback || []).join(', '));
     setVal('answers.chat_model', c.answers.chat_model); setVal('answers.rolling_model', c.answers.rolling_model);
     setVal('answers.interval', c.answers.interval); setVal('answers.rolling_enabled', c.answers.rolling_enabled);
     setVal('answers.max_tokens', c.answers.max_tokens);
+    setVal('answers.answer_self_questions', c.answers.answer_self_questions);
+    setVal('answers.point_dedupe_score', c.answers.point_dedupe_score);
+    setVal('answers.summary_enabled', c.answers.summary_enabled);
+    setVal('answers.talking_points_grounded', c.answers.talking_points_grounded);
+    setVal('answers.talking_points_max', c.answers.talking_points_max);
+    setVal('answers.talking_points_min_new_words', c.answers.talking_points_min_new_words);
     setVal('kb.enabled', c.kb.enabled); setVal('kb.top_k', c.kb.top_k); setVal('kb.model', c.kb.model);
+    setVal('kb.embed_backend', c.kb.embed_backend); setVal('kb.embed_model', c.kb.embed_model);
+    setVal('kb.min_score', c.kb.min_score);
     kbDirs = (c.kb.dirs || []).slice(); renderDirs();
     setVal('speakers.enabled', c.speakers.enabled); setVal('speakers.self_name', c.speakers.self_name);
     setVal('speakers.remote_name', c.speakers.remote_name);
     setVal('hud.port', c.hud.port); setVal('hud.open_browser', c.hud.open_browser);
+    setVal('hud.persist_seconds', c.hud.persist_seconds);
     setVal('budget.tpm', c.budget.tpm); setVal('budget.tpd', c.budget.tpd);
   }
 
@@ -237,20 +278,31 @@
     const num = id => Number($(id).value || 0);
     return {
       stt: { backend: $('stt.backend').value, model: $('stt.model').value || null,
-             chunk_seconds: num('stt.chunk_seconds') },
+             chunk_seconds: num('stt.chunk_seconds'),
+             glossary: $('stt.glossary').value.split(',').map(s => s.trim()).filter(Boolean) },
       answers: { enabled: $('answers.enabled').checked, backend: $('answers.backend').value,
                  fallback: $('answers.fallback').value.split(',').map(s => s.trim()).filter(Boolean),
                  chat_model: $('answers.chat_model').value || null,
                  rolling_model: $('answers.rolling_model').value || null,
                  interval: num('answers.interval'),
                  rolling_enabled: $('answers.rolling_enabled').checked,
-                 max_tokens: num('answers.max_tokens') },
+                 max_tokens: num('answers.max_tokens'),
+                 answer_self_questions: $('answers.answer_self_questions').checked,
+                 point_dedupe_score: Number($('answers.point_dedupe_score').value || 0.9),
+                 summary_enabled: $('answers.summary_enabled').checked,
+                 talking_points_grounded: $('answers.talking_points_grounded').checked,
+                 talking_points_max: num('answers.talking_points_max'),
+                 talking_points_min_new_words: num('answers.talking_points_min_new_words') },
       kb: { enabled: $('kb.enabled').checked, dirs: kbDirs.slice(),
-            top_k: num('kb.top_k'), model: $('kb.model').value },
+            top_k: num('kb.top_k'), model: $('kb.model').value,
+            embed_backend: $('kb.embed_backend').value,
+            embed_model: $('kb.embed_model').value || null,
+            min_score: Number($('kb.min_score').value || 0.1) },
       speakers: { enabled: $('speakers.enabled').checked,
                   self_name: $('speakers.self_name').value,
                   remote_name: $('speakers.remote_name').value },
-      hud: { port: num('hud.port'), open_browser: $('hud.open_browser').checked },
+      hud: { port: num('hud.port'), open_browser: $('hud.open_browser').checked,
+             persist_seconds: num('hud.persist_seconds') },
       budget: { tpm: num('budget.tpm'), tpd: num('budget.tpd') },
     };
   }

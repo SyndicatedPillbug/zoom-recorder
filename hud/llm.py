@@ -3,19 +3,22 @@
 
 Groq, OpenRouter, OpenAI and Ollama all speak the same
 ``/chat/completions`` + ``/audio/transcriptions`` schema, so a single client
-covers every provider. Deliberately uses only the standard library (``urllib``)
-to match the rest of this repo's dependency-light style.
+covers every provider. Deliberately uses only the standard library.
+
+Connections are reused per thread (``http.client`` keep-alive) so the many
+small STT/answer calls during a call don't each pay a fresh TCP+TLS handshake.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
+import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 
 class LLMError(Exception):
@@ -76,6 +79,12 @@ class LLMClient:
         # OpenRouter likes these but they are harmless elsewhere.
         self.extra_headers.setdefault(
             "X-OpenRouter-Title", "zoom-recorder-hud")
+        parts = urlsplit(self.base_url)
+        self._scheme = parts.scheme or "https"
+        self._host = parts.hostname or ""
+        self._port = parts.port
+        self._prefix = parts.path.rstrip("/")
+        self._local = threading.local()
 
     # -- internals ---------------------------------------------------------
     def _headers(self, content_type: str) -> Dict[str, str]:
@@ -91,52 +100,101 @@ class LLMClient:
         headers.update(self.extra_headers)
         return headers
 
-    def _request(self, path: str, data: bytes, content_type: str,
-                 timeout: Optional[float] = None):
-        url = "{}{}".format(self.base_url, path)
-        req = urllib.request.Request(
-            url, data=data, headers=self._headers(content_type), method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
-                raw = resp.read()
-                return json.loads(raw.decode("utf-8")), _lower_headers(resp.headers)
-        except urllib.error.HTTPError as exc:
-            body = ""
+    def _connection(self) -> http.client.HTTPConnection:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
+        if self._scheme == "https":
+            conn = http.client.HTTPSConnection(self._host, self._port, timeout=self.timeout)
+        else:
+            conn = http.client.HTTPConnection(self._host, self._port, timeout=self.timeout)
+        self._local.conn = conn
+        return conn
+
+    def _drop_connection(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
             try:
-                body = exc.read().decode("utf-8", errors="replace")
+                conn.close()
             except Exception:  # noqa: BLE001
                 pass
+            self._local.conn = None
+
+    def close(self) -> None:
+        """Close this thread's pooled connection (best effort)."""
+        self._drop_connection()
+
+    def _raw_request(self, method: str, path: str, body: Optional[bytes],
+                     headers: Dict[str, str],
+                     timeout: Optional[float]) -> Tuple[int, bytes, Dict[str, str]]:
+        """POST/GET over a reusable connection, retrying once on a dropped socket."""
+        url = "{}{}".format(self._prefix, path)
+        last_exc: Optional[BaseException] = None
+        for attempt in range(2):
+            conn = self._connection()
+            try:
+                if conn.sock is not None and timeout:
+                    conn.sock.settimeout(timeout)
+                conn.request(method, url, body=body, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                status = resp.status
+                resp_headers = dict(resp.getheaders())
+                if resp.will_close:
+                    self._drop_connection()
+                return status, raw, resp_headers
+            except (http.client.HTTPException, OSError) as exc:
+                last_exc = exc
+                self._drop_connection()
+                if attempt == 1:
+                    break
+        raise last_exc if last_exc is not None else OSError("request failed")
+
+    def _decode(self, raw: bytes) -> Any:
+        return json.loads(raw.decode("utf-8"))
+
+    def _request(self, path: str, data: bytes, content_type: str,
+                 timeout: Optional[float] = None):
+        headers = self._headers(content_type)
+        url = "{}{}".format(self.base_url, path)
+        try:
+            status, raw, resp_headers = self._raw_request(
+                "POST", path, data, headers, timeout or self.timeout)
+        except (http.client.HTTPException, OSError) as exc:
+            raise LLMError("network error for {}: {}".format(url, exc)) from exc
+        if status >= 400:
+            body = raw.decode("utf-8", errors="replace")
             retry_after = None
-            ra = exc.headers.get("Retry-After") if exc.headers else None
+            ra = resp_headers.get("Retry-After") or resp_headers.get("retry-after")
             if ra:
                 try:
                     retry_after = float(ra)
                 except ValueError:
                     retry_after = None
             raise LLMError(
-                "{} {} -> HTTP {}".format(req.get_method(), url, exc.code),
-                status=exc.code, retry_after=retry_after, body=body) from exc
-        except urllib.error.URLError as exc:
-            raise LLMError("network error for {}: {}".format(url, exc.reason)) from exc
+                "POST {} -> HTTP {}".format(url, status),
+                status=status, retry_after=retry_after, body=body)
+        try:
+            return self._decode(raw), _lower_headers(resp_headers)
+        except ValueError as exc:
+            raise LLMError("invalid JSON from {}".format(url)) from exc
 
     # -- models ------------------------------------------------------------
     def _get_json(self, path: str, timeout: Optional[float] = None) -> Any:
+        headers = self._headers("application/json")
         url = "{}{}".format(self.base_url, path)
-        req = urllib.request.Request(
-            url, headers=self._headers("application/json"), method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = ""
-            try:
-                body = exc.read().decode("utf-8", errors="replace")
-            except Exception:  # noqa: BLE001
-                pass
-            raise LLMError("GET {} -> HTTP {}".format(url, exc.code),
-                           status=exc.code, body=body) from exc
-        except urllib.error.URLError as exc:
-            raise LLMError("network error for {}: {}".format(url, exc.reason)) from exc
+            status, raw, _resp_headers = self._raw_request(
+                "GET", path, None, headers, timeout or self.timeout)
+        except (http.client.HTTPException, OSError) as exc:
+            raise LLMError("network error for {}: {}".format(url, exc)) from exc
+        if status >= 400:
+            raise LLMError("GET {} -> HTTP {}".format(url, status),
+                           status=status, body=raw.decode("utf-8", errors="replace"))
+        try:
+            return self._decode(raw)
+        except ValueError as exc:
+            raise LLMError("invalid JSON from {}".format(url)) from exc
 
     def models(self, timeout: Optional[float] = None) -> List[str]:
         """Return the provider's model ids (used by the settings GUI)."""
@@ -170,6 +228,30 @@ class LLMClient:
             text = ((choices[0].get("message") or {}).get("content") or "").strip()
         return LLMResult(text=text, model=obj.get("model", model),
                          usage=obj.get("usage") or {}, headers=headers)
+
+    # -- embeddings --------------------------------------------------------
+    def embed(self, inputs: List[str], model: str,
+              timeout: Optional[float] = None) -> List[List[float]]:
+        """Call an OpenAI-compatible ``/embeddings`` endpoint."""
+        payload = {"model": model, "input": list(inputs)}
+        data = json.dumps(payload).encode("utf-8")
+        obj, _headers = self._request("/embeddings", data, "application/json", timeout)
+        rows = obj.get("data") if isinstance(obj, dict) else obj
+        vectors: List[Optional[List[float]]] = [None] * len(inputs)
+        if isinstance(rows, list):
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item.get("index", 0))
+                except (TypeError, ValueError):
+                    index = 0
+                embedding = item.get("embedding")
+                if 0 <= index < len(vectors) and isinstance(embedding, list):
+                    vectors[index] = [float(x) for x in embedding]
+        if any(v is None for v in vectors):
+            raise LLMError("embeddings response incomplete (model={})".format(model))
+        return [v for v in vectors if v is not None]
 
     # -- speech-to-text ----------------------------------------------------
     def transcribe(self, wav_bytes: bytes, model: str, filename: str = "chunk.wav",

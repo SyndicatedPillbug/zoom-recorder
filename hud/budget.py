@@ -38,6 +38,7 @@ class BudgetGovernor:
         self._header_rpd_remaining: Optional[int] = None
         self._blocked_until = 0.0
         self._last_error = ""
+        self._pending_reserve = 0
         self.total_calls = 0
         self.total_tokens = 0
 
@@ -95,8 +96,10 @@ class BudgetGovernor:
         with self._lock:
             now = time.time()
             self._roll(now)
-            self._minute_window.append((now, max(0, est_tokens)))
-            self._day_tokens += max(0, est_tokens)
+            amount = max(0, est_tokens)
+            self._minute_window.append((now, amount))
+            self._day_tokens += amount
+            self._pending_reserve = amount
 
     def record(self, headers: Optional[Dict[str, str]],
                usage: Optional[Dict[str, Any]]) -> None:
@@ -111,6 +114,15 @@ class BudgetGovernor:
                     tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
             self.total_tokens += tokens
             self._day_requests += 1
+            # True the optimistic reservation up to the actual usage so the
+            # daily cap doesn't drift on repeated estimate/actual differences.
+            if tokens and self._pending_reserve:
+                delta = tokens - self._pending_reserve
+                self._day_tokens = max(0, self._day_tokens + delta)
+                if self._minute_window:
+                    ts, amount = self._minute_window[-1]
+                    self._minute_window[-1] = (ts, max(0, amount + delta))
+            self._pending_reserve = 0
             if headers:
                 rl_tokens = headers.get("x-ratelimit-remaining-tokens")
                 if rl_tokens is not None and str(rl_tokens).strip().isdigit():

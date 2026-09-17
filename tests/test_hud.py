@@ -10,27 +10,31 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from hud.answers import (AnswerEngine, detect_question, estimate_tokens,  # noqa: E402
-                         parse_bullets)
+from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
+                         detect_question_turns, estimate_tokens, grounded_in,
+                         is_ambiguous_question, parse_bullets, parse_point_objects)
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
-from hud.kb import chunk_markdown  # noqa: E402
+from hud.kb import KBIndex, chunk_markdown  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
 from hud.menu_state import describe  # noqa: E402
 from hud.server import HudServer  # noqa: E402
-from hud.state import LiveState  # noqa: E402
-from hud.stt import (Chunker, LiveTranscriber, frame_rms_dbfs,  # noqa: E402
-                     overlap_suffix_prefix, pcm_to_wav, split_words)
+from hud.state import LiveState, is_duplicate_point  # noqa: E402
+from hud.stt import (Chunker, LiveTranscriber, _Source, frame_rms_dbfs,  # noqa: E402
+                     fuzzy_overlap, overlap_suffix_prefix, pcm_to_wav, split_words)
 
 
 def tone(seconds: float, freq: float = 440.0, amp: int = 16000) -> bytes:
@@ -58,6 +62,21 @@ class OverlapTests(unittest.TestCase):
         new = split_words("hello there everyone")
         self.assertEqual(overlap_suffix_prefix(prev, new), 3)
 
+    def test_fuzzy_overlap_exact(self) -> None:
+        self.assertEqual(
+            fuzzy_overlap(split_words("the deadline is friday next week"),
+                          split_words("friday next week we ship")), 3)
+
+    def test_fuzzy_overlap_tolerates_asr_variants(self) -> None:
+        overlap = fuzzy_overlap(
+            split_words("we will roll out the feature"),
+            split_words("rollout the feature next week"))
+        self.assertGreaterEqual(overlap, 3)
+
+    def test_fuzzy_overlap_no_match(self) -> None:
+        self.assertEqual(
+            fuzzy_overlap(split_words("alpha beta"), split_words("gamma delta")), 0)
+
 
 class ChunkerTests(unittest.TestCase):
     def test_speech_emits_chunk(self) -> None:
@@ -79,13 +98,95 @@ class ChunkerTests(unittest.TestCase):
         self.assertLess(quiet, -100)
         self.assertGreater(loud, -20)
 
+    def test_phrase_pause_flushes_before_full_chunk(self) -> None:
+        c = Chunker(chunk_seconds=10.0, min_speech_seconds=0.2,
+                    silence_flush_seconds=3.0, phrase_silence_seconds=0.2,
+                    phrase_min_speech_seconds=1.0)
+        out = c.feed(tone(1.5) + b"\x00\x00" * 16000)  # 1.5s speech + 1s silence
+        self.assertTrue(out)
+        self.assertLess(len(out[0]), int(10.0 * 16000 * 2))
+
+
+class SttPipelineTests(unittest.TestCase):
+    def _transcriber(self, cfg):
+        return LiveTranscriber(LiveState(), lambda _m: None, cfg, "Mic", None)
+
+    def test_enqueue_drops_oldest_when_full(self) -> None:
+        tr = self._transcriber(HudConfig(stt_queue_chunks=1))
+        src = _Source("You", [])
+        src.queue = queue.Queue(maxsize=1)
+        tr._sources = [src]
+        tr._enqueue(src, b"first")
+        tr._enqueue(src, b"second")
+        self.assertEqual(src.dropped, 1)
+        _ts, chunk = src.queue.get_nowait()
+        self.assertEqual(chunk, b"second")
+
+    def test_prompt_uses_glossary_and_context(self) -> None:
+        tr = self._transcriber(HudConfig(stt_glossary=["Acme", "Q3"]))
+        src = _Source("You", [])
+        src.context_tail = "we shipped the beta"
+        prompt = tr._prompt_for(src)
+        self.assertIsNotNone(prompt)
+        assert prompt is not None
+        self.assertIn("Acme", prompt)
+        self.assertIn("Q3", prompt)
+        self.assertIn("beta", prompt)
+
+    def test_worker_transcribes_with_prompt(self) -> None:
+        tr = self._transcriber(HudConfig(stt_glossary=["Acme"]))
+        seen = {}
+
+        class FakeSTT:
+            def transcribe(self, pcm, prompt=None):
+                seen["prompt"] = prompt
+                return "hello Acme world"
+
+        tr._stt = FakeSTT()
+        src = _Source("You", [])
+        src.queue = queue.Queue()
+        tr._sources = [src]
+        worker = threading.Thread(target=tr._stt_worker, args=(src,), daemon=True)
+        worker.start()
+        tr._enqueue(src, b"\x00\x00" * 100)
+        src.queue.put_nowait(None)
+        worker.join(timeout=3)
+        events = tr.state.snapshot()["transcript"]
+        self.assertEqual(events[0]["text"], "hello Acme world")
+        self.assertIn("Acme", seen["prompt"])
+
 
 class TextTests(unittest.TestCase):
-    def test_detect_question(self) -> None:
-        self.assertEqual(detect_question("Can you explain the rollout plan?"),
+    def test_detect_question_text(self) -> None:
+        self.assertEqual(detect_question_text("Can you explain the rollout plan?"),
                          "Can you explain the rollout plan?")
-        self.assertIsNotNone(detect_question("How do we handle rollbacks"))
-        self.assertIsNone(detect_question("The report is ready."))
+        self.assertIsNotNone(detect_question_text("How do we handle rollbacks"))
+        self.assertIsNone(detect_question_text("The report is ready."))
+
+    def test_detect_question_turns_spans_chunks(self) -> None:
+        now = time.time()
+        turns = [
+            Turn(1, now - 30, "Client", "Let me walk you through the rollout."),
+            Turn(2, now - 20, "Client", "We stage it in three rings."),
+            Turn(3, now - 10, "Client", "What about rollbacks?"),
+        ]
+        got = detect_question_turns(turns, 90.0, now)
+        self.assertIsNotNone(got)
+        assert got is not None
+        self.assertEqual(got["question"], "What about rollbacks?")
+        self.assertEqual(got["speaker"], "Client")
+        self.assertIn("three rings", got["context"])
+
+    def test_detect_question_turns_lookback(self) -> None:
+        now = time.time()
+        turns = [Turn(1, now - 600, "Client", "What is the plan?")]
+        self.assertIsNone(detect_question_turns(turns, 90.0, now))
+
+    def test_is_ambiguous_question(self) -> None:
+        self.assertTrue(is_ambiguous_question("What about that?"))
+        self.assertTrue(is_ambiguous_question("Why?"))
+        self.assertFalse(is_ambiguous_question(
+            "What are the three rollout rings and their timelines?"))
 
     def test_parse_bullets_json(self) -> None:
         raw = json.dumps({"bullets": ["First point", "Second point"]})
@@ -100,6 +201,19 @@ class TextTests(unittest.TestCase):
 
 
 class KBTests(unittest.TestCase):
+    class KeywordEmbedder:
+        """Deterministic bag-of-keywords vectors, no third-party deps."""
+
+        label = "test:keywords"
+        KEYWORDS = ["alpha", "beta", "gamma", "rollout", "pricing"]
+
+        def encode(self, texts):
+            out = []
+            for text in texts:
+                low = text.lower()
+                out.append([float(low.count(k)) for k in self.KEYWORDS])
+            return out
+
     def test_chunk_markdown_headings(self) -> None:
         md = "# Alpha\n\nFirst paragraph about alpha.\n\n## Beta\n\nSecond paragraph about beta."
         chunks = chunk_markdown(md, "notes.md", target_chars=40, overlap_chars=0)
@@ -110,6 +224,38 @@ class KBTests(unittest.TestCase):
 
     def test_chunk_markdown_empty(self) -> None:
         self.assertEqual(chunk_markdown("", "x.md"), [])
+
+    def test_index_builds_and_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "a.md").write_text("# Alpha\n\nalpha alpha alpha content\n")
+            (root / "b.md").write_text("# Beta\n\nbeta beta beta content\n")
+            cache = Path(tmp) / "cache"
+            index = KBIndex([str(root)], self.KeywordEmbedder(),
+                            cache_dir=str(cache), log=lambda _m: None)
+            self.assertTrue(index.build())
+            hits = index.query("beta", top_k=1)
+            self.assertTrue(hits)
+            self.assertEqual(hits[0].source, "b.md")
+
+    def test_index_uses_cache_on_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "a.md").write_text("# Alpha\n\nalpha content\n")
+            cache = Path(tmp) / "cache"
+            KBIndex([str(root)], self.KeywordEmbedder(),
+                    cache_dir=str(cache), log=lambda _m: None).build()
+            again = KBIndex([str(root)], self.KeywordEmbedder(),
+                            cache_dir=str(cache), log=lambda _m: None)
+            self.assertTrue(again.build())
+            self.assertTrue(again.query("alpha"))
+
+    def test_is_duplicate_point(self) -> None:
+        existing = ["Price is $10 per seat."]
+        self.assertTrue(is_duplicate_point("price is 10 per seat", existing))
+        self.assertFalse(is_duplicate_point("Latency budget is 200ms", existing))
 
 
 class BudgetTests(unittest.TestCase):
@@ -137,6 +283,13 @@ class BudgetTests(unittest.TestCase):
         # Provider-reported remaining tokens still gate spending.
         b.record({"x-ratelimit-remaining-tokens": "50"}, {"total_tokens": 1})
         self.assertFalse(b.can_afford(100))
+
+    def test_record_trues_up_reservation(self) -> None:
+        b = BudgetGovernor(tpm=100000, tpd=10000)
+        b.reserve(1000)
+        self.assertEqual(b.snapshot()["day_tokens"], 1000)
+        b.record({}, {"total_tokens": 300})
+        self.assertEqual(b.snapshot()["day_tokens"], 300)
 
 
 class ConfigTests(unittest.TestCase):
@@ -180,12 +333,26 @@ class ConfigTests(unittest.TestCase):
             answers_backend="openrouter", answers_fallback=["groq", "ollama"],
             kb_dirs=["/a", "/b"], kb_top_k=7, budget_tpm=100, budget_tpd=200,
             port=1234, open_browser=False, answer_interval=20.0,
-            chat_model="m1", rolling_model="m2", answers_enabled=False)
+            chat_model="m1", rolling_model="m2", answers_enabled=False,
+            context_max_chars=4321, question_lookback_seconds=42.0,
+            question_rewrite=False, kb_embed_backend="ollama",
+            kb_embed_model="nomic-embed-text", kb_min_score=0.25,
+            answer_self_questions=True, point_dedupe_score=0.8,
+            max_context_qa=5, summary_enabled=False, persist_seconds=15.0,
+            talking_points_grounded=False, talking_points_max=2,
+            talking_points_min_new_words=80, talking_points_min_words=30,
+            talking_points_quote_overlap=0.6)
         again = config_from_dict(config_to_dict(cfg))
         for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
                      "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
                      "open_browser", "answer_interval", "chat_model", "rolling_model",
-                     "answers_enabled"):
+                     "answers_enabled", "context_max_chars", "question_lookback_seconds",
+                     "question_rewrite", "kb_embed_backend", "kb_embed_model",
+                     "kb_min_score", "answer_self_questions", "point_dedupe_score",
+                     "max_context_qa", "summary_enabled", "persist_seconds",
+                     "talking_points_grounded", "talking_points_max",
+                     "talking_points_min_new_words", "talking_points_min_words",
+                     "talking_points_quote_overlap"):
             self.assertEqual(getattr(cfg, attr), getattr(again, attr), attr)
 
     def test_save_preserves_unknown_keys_and_backs_up(self) -> None:
@@ -222,14 +389,28 @@ class StateTests(unittest.TestCase):
         state = LiveState()
         state.add("transcript", text="hello")
         state.add("transcript", text="world")
-        state.add("answer", kind="rolling", bullets=["a"])
+        state.add_talking_points(["a useful point"])
         snap = state.snapshot()
         self.assertEqual(len(snap["transcript"]), 2)
-        self.assertEqual(len(snap["answers"]), 1)
+        self.assertEqual(len(snap["answers"]), 0)
+        self.assertEqual(len(snap["talking_points"]), 1)
         text = state.transcript_text()
         self.assertIn("hello", text)
         self.assertIn("world", text)
         self.assertIn("Talking points", state.answers_markdown())
+
+    def test_talking_points_dedupe_and_snapshot(self) -> None:
+        state = LiveState()
+        added = state.add_talking_points(["Price is $10 per seat.", "Ship in Q3."])
+        self.assertEqual(len(added), 2)
+        again = state.add_talking_points([
+            "price is 10 per seat", "Latency budget is 200ms"])
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0]["type"], "talking_point")
+        self.assertEqual(again[0]["text"], "Latency budget is 200ms")
+        self.assertEqual(len(state.talking_points()), 3)
+        # First point event carries the event id the SSE client needs.
+        self.assertTrue(added[0]["id"])
 
     def test_since_and_latest(self) -> None:
         state = LiveState()
@@ -240,10 +421,17 @@ class StateTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["text"], "b")
 
+    def test_set_meta_emits_event(self) -> None:
+        state = LiveState()
+        state.set_meta(stt_lag_seconds=1.5)
+        self.assertEqual(state.snapshot()["meta"]["stt_lag_seconds"], 1.5)
+        metas = [e for e in state.since(0) if e["type"] == "meta"]
+        self.assertEqual(metas[-1]["meta"]["stt_lag_seconds"], 1.5)
+
     def test_timeline_interleaves_transcript_and_answers(self) -> None:
         state = LiveState()
         state.add("transcript", text="hello there")
-        state.add("answer", kind="rolling", bullets=["point a"])
+        state.add_talking_points(["point a"])
         state.add("transcript", text="what is the plan?")
         state.add("answer", kind="question", question="what is the plan?",
                   bullets=["phase 1"], sources=["notes.md"])
@@ -252,7 +440,6 @@ class StateTests(unittest.TestCase):
         # Chronological: speech, its answer, next speech, its answer.
         self.assertLess(md.index("hello there"), md.index("point a"))
         self.assertLess(md.index("point a"), md.index("what is the plan?"))
-        self.assertIn("Talking points", md)
         self.assertIn("notes.md", md)
 
     def test_timeline_empty(self) -> None:
@@ -374,12 +561,167 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(resp.status, 200)
                 self.assertTrue(json.loads(resp.read())["ok"])
             state.add("transcript", text="live text")
+            state.add_talking_points(["a live point"])
             with urllib.request.urlopen(
                     "http://127.0.0.1:{}/state".format(port), timeout=5) as resp:
                 snap = json.loads(resp.read())
                 self.assertEqual(snap["transcript"][0]["text"], "live text")
+                self.assertEqual(snap["talking_points"][0]["text"], "a live point")
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:{}/".format(port), timeout=5) as resp:
+                html = resp.read().decode("utf-8")
+                self.assertIn("Talking points", html)
+                self.assertIn("talking_point", html)
         finally:
             server.stop()
+
+
+class HudWriteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = LiveState()
+        self.seen = {}
+        self.server = HudServer(
+            self.state, port=0, token="secret",
+            on_ask=lambda text, expand: self.seen.__setitem__("ask", (text, expand)) or True,
+            on_pause=lambda paused: self.seen.__setitem__("paused", paused))
+        self.port = self.server.start()
+        self.base = "http://127.0.0.1:{}".format(self.port)
+
+    def tearDown(self) -> None:
+        self.server.stop()
+
+    def _post(self, path, body):
+        import urllib.request
+
+        req = urllib.request.Request(
+            self.base + path, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def test_token_required(self) -> None:
+        import urllib.error
+        import urllib.request
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/state", timeout=5)
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_token_allows_state_and_ask(self) -> None:
+        import urllib.request
+
+        with urllib.request.urlopen(self.base + "/state?token=secret", timeout=5) as resp:
+            self.assertIn("status", json.loads(resp.read()))
+        result = self._post("/ask?token=secret", {"text": "what is the plan?"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.seen["ask"], ("what is the plan?", False))
+        result = self._post("/ask?token=secret", {"text": "expand me", "expand": True})
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.seen["ask"], ("expand me", True))
+
+    def test_pause_endpoint(self) -> None:
+        result = self._post("/pause?token=secret", {"paused": True})
+        self.assertTrue(result["ok"])
+        self.assertTrue(self.seen["paused"])
+
+
+class LLMTests(unittest.TestCase):
+    def test_embed_orders_by_index(self) -> None:
+        from hud.llm import LLMClient
+
+        client = LLMClient("http://example.invalid/v1", "k")
+
+        def fake_request(path, data, content_type, timeout=None):
+            self.assertEqual(path, "/embeddings")
+            return ({"data": [
+                {"index": 1, "embedding": [1.0, 2.0]},
+                {"index": 0, "embedding": [3.0, 4.0]},
+            ]}, {})
+
+        client._request = fake_request  # type: ignore[assignment]
+        vectors = client.embed(["a", "b"], "m")
+        self.assertEqual(vectors, [[3.0, 4.0], [1.0, 2.0]])
+
+
+class HttpClientTests(unittest.TestCase):
+    def _serve(self, handler_cls):
+        import http.server
+        import threading
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server
+
+    def test_keepalive_connection_is_reused(self) -> None:
+        import http.server
+        from hud.llm import LLMClient
+
+        connections = {"n": 0}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                connections["n"] += 1
+                super().setup()
+
+            def log_message(self, *args):
+                return
+
+            def do_GET(self):
+                payload = json.dumps({"data": [{"id": "m"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = self._serve(Handler)
+        client = LLMClient("http://127.0.0.1:{}/v1".format(server.server_address[1]), None)
+        self.addCleanup(client.close)
+        for _ in range(3):
+            self.assertEqual(client.models(), ["m"])
+        # Three requests, one persistent connection.
+        self.assertEqual(connections["n"], 1)
+
+    def test_http_error_maps_status_and_retry_after(self) -> None:
+        import http.server
+        from hud.llm import LLMClient, LLMError
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                body = b'{"error": "slow down"}'
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "3")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = self._serve(Handler)
+        client = LLMClient("http://127.0.0.1:{}".format(server.server_address[1]), None)
+        self.addCleanup(client.close)
+        with self.assertRaises(LLMError) as ctx:
+            client.chat([{"role": "user", "content": "hi"}], "m")
+        self.assertEqual(ctx.exception.status, 429)
+        self.assertEqual(ctx.exception.retry_after, 3.0)
+
+    def test_network_error_raises_llm_error(self) -> None:
+        from hud.llm import LLMClient, LLMError
+
+        # Port 1 is not listening; connection refused.
+        client = LLMClient("http://127.0.0.1:1", None, timeout=2.0)
+        with self.assertRaises(LLMError):
+            client.chat([{"role": "user", "content": "hi"}], "m")
 
 
 class MenuStateTests(unittest.TestCase):
@@ -423,29 +765,333 @@ class AnswerEngineTests(unittest.TestCase):
             return LLMResult(text="- first point\n- second point", model=model,
                              usage={"total_tokens": 12})
 
+    class _EchoClient:
+        def chat(self, messages, model, max_tokens=600, temperature=0.2,
+                 response_format=None, timeout=None):
+            return LLMResult(text=json.dumps({"bullets": ["Point one", "Point two"]}),
+                             model=model, usage={"total_tokens": 5})
+
+    class _KeywordEmbedder:
+        label = "test:keywords"
+        KEYWORDS = ["pricing", "dollars", "seat", "rollout", "latency"]
+
+        def encode(self, texts):
+            return [[float(t.lower().count(k)) for k in self.KEYWORDS] for t in texts]
+
     class _Chain:
         def __init__(self, entries):
             self.entries = entries
 
-    def test_json_mode_400_falls_back_to_plain_text(self) -> None:
-        from hud.state import LiveState
+    def _engine(self, state, cfg):
+        engine = AnswerEngine(state, lambda _m: None, cfg)
+        engine._chain = self._Chain([{
+            "name": "groq", "client": self._FakeClient(),
+            "chat_model": "m", "rolling_model": "m", "structured": True,
+        }])
+        return engine
 
-        cfg = HudConfig(answers_backend="groq", rolling_enabled=False, kb_enabled=False)
+    def test_json_mode_400_falls_back_to_plain_text(self) -> None:
+        cfg = HudConfig(answers_backend="groq", rolling_enabled=False,
+                        kb_enabled=False, question_rewrite=False)
+        state = LiveState()
+        engine = self._engine(state, cfg)
+        engine._buffer = [Turn(1, 0.0, "Client", "What is the rollout plan?")]
+        engine._execute({"kind": "question", "question": "What is the rollout plan?",
+                         "context": "[00:00:00] Client: What is the rollout plan?",
+                         "window": engine._context_text()})
+
+        # Tried structured first, then retried plain.
+        self.assertEqual(engine._chain.entries[0]["client"].response_formats,
+                         [{"type": "json_object"}, None])
+        answers = state.snapshot()["answers"]
+        self.assertEqual(answers[0]["bullets"], ["first point", "second point"])
+        self.assertEqual(answers[0]["kind"], "question")
+
+    def test_rolling_emits_talking_points_not_answers(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        talking_points_grounded=False)
+        state = LiveState()
+        engine = AnswerEngine(state, lambda _m: None, cfg)
+        engine._chain = self._Chain([{
+            "name": "groq", "client": self._EchoClient(),
+            "chat_model": "m", "rolling_model": "m", "structured": False,
+        }])
+        engine._buffer = [Turn(1, 0.0, "Client", "We should talk about pricing.")]
+
+        engine._rolling_payload = {"window": engine._context_text()}
+        engine._execute({"kind": "rolling"})
+        snap = state.snapshot()
+        self.assertEqual(snap["answers"], [])
+        self.assertEqual(len(snap["talking_points"]), 2)
+        # A second refresh with identical bullets adds nothing (dedupe).
+        engine._rolling_payload = {"window": engine._context_text()}
+        engine._execute({"kind": "rolling"})
+        self.assertEqual(len(state.talking_points()), 2)
+
+    def test_ambiguous_question_is_rewritten_first(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        question_rewrite=True)
         state = LiveState()
         engine = AnswerEngine(state, lambda _m: None, cfg)
         client = self._FakeClient()
         engine._chain = self._Chain([{
-            "name": "groq", "client": client, "chat_model": "m", "rolling_model": "m",
-            "structured": True,
+            "name": "groq", "client": client,
+            "chat_model": "m", "rolling_model": "m", "structured": False,
         }])
-        engine._buffer = [(0.0, "What is the rollout plan?")]
-        ok = engine._answer(kind="question", question="What is the rollout plan?")
-
-        self.assertTrue(ok)
-        # Tried structured first, then retried plain.
-        self.assertEqual(client.response_formats, [{"type": "json_object"}, None])
+        engine._buffer = [Turn(1, 0.0, "Client", "What about that?")]
+        engine._execute({"kind": "question", "question": "What about that?",
+                         "context": "[00:00:00] Client: We stage it in three rings.",
+                         "window": engine._context_text()})
         answers = state.snapshot()["answers"]
-        self.assertEqual(answers[0]["bullets"], ["first point", "second point"])
+        self.assertEqual(len(answers), 1)
+        self.assertIsNotNone(answers[0]["rewritten_question"])
+
+    def test_self_questions_gated_by_default(self) -> None:
+        engine = AnswerEngine(LiveState(), lambda _m: None, HudConfig(self_name="Dana"))
+        self.assertFalse(engine._should_answer(
+            {"question": "Why is that?", "speaker": "Dana"}))
+        self.assertTrue(engine._should_answer(
+            {"question": "Why is that?", "speaker": "Client"}))
+        self.assertFalse(engine._should_answer(
+            {"question": "That is great, right?", "speaker": "Client"}))
+
+    def test_self_questions_can_be_enabled(self) -> None:
+        engine = AnswerEngine(LiveState(), lambda _m: None,
+                              HudConfig(self_name="Dana", answer_self_questions=True))
+        self.assertTrue(engine._should_answer(
+            {"question": "Why is that?", "speaker": "Dana"}))
+
+    def test_semantic_dedupe_filters_paraphrase(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        point_dedupe_score=0.9)
+        engine = AnswerEngine(LiveState(), lambda _m: None, cfg)
+        engine._embedder = self._KeywordEmbedder()
+        existing = ["pricing is ten dollars per seat"]
+        picked = engine._filter_new_points(
+            ["pricing costs 10 dollars per seat", "latency budget is 200ms"], existing)
+        self.assertEqual([t for t, _v in picked], ["latency budget is 200ms"])
+
+    def test_qa_chain_added_to_prompt(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False)
+        state = LiveState()
+        engine = self._engine(state, cfg)
+        engine._buffer = [Turn(1, 0.0, "Client", "What is the price?")]
+        engine._execute({"kind": "question", "question": "What is the price?",
+                         "context": "", "window": engine._context_text()})
+        qa = engine._qa_recent()
+        self.assertEqual(len(qa), 1)
+        prompt = engine._build_prompt("question", "What about support?", "",
+                                      engine._context_text(), [], qa=qa)
+        self.assertIn("Earlier questions this call", prompt)
+        self.assertIn("What is the price?", prompt)
+
+    def test_worker_processes_manual_ask(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        question_rewrite=False)
+        state = LiveState()
+        engine = self._engine(state, cfg)
+        worker = threading.Thread(target=engine._worker_loop, daemon=True)
+        worker.start()
+        self.assertTrue(engine.ask("What about pricing?"))
+        for _ in range(60):
+            if state.snapshot()["answers"]:
+                break
+            time.sleep(0.05)
+        engine._stop.set()
+        engine._queue.put((0, next(engine._job_seq), None))
+        worker.join(timeout=2)
+        answers = state.snapshot()["answers"]
+        self.assertEqual(len(answers), 1)
+        self.assertEqual(answers[0]["question"], "What about pricing?")
+
+
+class TalkingPointGroundingTests(unittest.TestCase):
+    class _PointClient:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def chat(self, messages, model, max_tokens=600, temperature=0.2,
+                 response_format=None, timeout=None):
+            return LLMResult(text=json.dumps(self.payload), model=model,
+                             usage={"total_tokens": 5})
+
+    class _Chain:
+        def __init__(self, entries):
+            self.entries = entries
+
+    WINDOW = ("[12:02:21] Odin: this is just part of the computer feature for "
+              "tagging things with color. Fascinating and a little delightful.")
+
+    def _engine(self, state, payload, **cfg_kwargs):
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False, **cfg_kwargs)
+        engine = AnswerEngine(state, lambda _m: None, cfg)
+        engine._chain = self._Chain([{
+            "name": "groq", "client": self._PointClient(payload),
+            "chat_model": "m", "rolling_model": "m", "structured": False,
+        }])
+        return engine
+
+    def test_parse_point_objects(self) -> None:
+        raw = json.dumps({"bullets": [
+            {"text": "Pricing is final", "quote": "the pricing is final"},
+            "plain string bullet",
+        ]})
+        parsed = parse_point_objects(raw)
+        self.assertEqual(parsed[0], {"text": "Pricing is final",
+                                     "quote": "the pricing is final"})
+        self.assertEqual(parsed[1]["text"], "plain string bullet")
+        self.assertEqual(parsed[1]["quote"], "")
+        md = parse_point_objects("- one thing\n- another thing")
+        self.assertEqual([p["text"] for p in md], ["one thing", "another thing"])
+
+    def test_grounded_accepts_supported_quote(self) -> None:
+        self.assertTrue(grounded_in(
+            "The feature is part of the computer",
+            "this is just part of the computer", self.WINDOW))
+
+    def test_grounded_rejects_fabricated_quote(self) -> None:
+        self.assertFalse(grounded_in(
+            "Color tags sync across devices",
+            "they sync across devices using cloud storage", self.WINDOW))
+
+    def test_grounded_falls_back_to_point_tokens(self) -> None:
+        self.assertTrue(grounded_in(
+            "tagging things with color", "", self.WINDOW))
+        self.assertFalse(grounded_in(
+            "Users can create custom color palettes", "", self.WINDOW))
+
+    def test_refresh_drops_ungrounded_points(self) -> None:
+        state = LiveState()
+        payload = {"bullets": [
+            {"text": "Color tags sync across devices via cloud storage",
+             "quote": "they sync across devices via cloud storage"},
+            {"text": "This is part of the computer",
+             "quote": "this is just part of the computer"},
+        ]}
+        engine = self._engine(state, payload)
+        engine._refresh_talking_points({"window": self.WINDOW})
+        self.assertEqual([p["text"] for p in state.talking_points()],
+                         ["This is part of the computer"])
+
+    def test_refresh_drops_all_invented_points(self) -> None:
+        state = LiveState()
+        payload = {"bullets": [
+            "Color tags are synced across devices via cloud storage",
+            "Users can create custom color palettes for their workflow",
+            "Color coding integrates with Trello or Asana",
+        ]}
+        engine = self._engine(state, payload)
+        engine._refresh_talking_points({"window": self.WINDOW})
+        self.assertEqual(state.talking_points(), [])
+
+    def test_refresh_caps_points(self) -> None:
+        state = LiveState()
+        quote = "tagging things with color"
+        payload = {"bullets": [
+            {"text": "A", "quote": quote},
+            {"text": "B", "quote": quote},
+            {"text": "C", "quote": quote},
+        ]}
+        engine = self._engine(state, payload, talking_points_max=2)
+        engine._refresh_talking_points({"window": self.WINDOW})
+        self.assertEqual(len(state.talking_points()), 2)
+
+    def test_substance_gate_blocks_sparse_refresh(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False, answer_interval=0,
+                        talking_points_min_new_words=10, talking_points_min_words=1)
+        engine = AnswerEngine(LiveState(), lambda _m: None, cfg)
+        engine._buffer = [Turn(1, time.time(), "You", "just a few words here")]
+        engine._words_since_rolling = 4
+        engine._tick()
+        self.assertFalse(engine._rolling_queued)
+        engine._words_since_rolling = 25
+        engine._tick()
+        self.assertTrue(engine._rolling_queued)
+
+
+class SummaryTests(unittest.TestCase):
+    class _SummaryClient:
+        def chat(self, messages, model, max_tokens=600, temperature=0.2,
+                 response_format=None, timeout=None):
+            payload = {
+                "summary": "We agreed to ship in Q3.",
+                "action_items": ["Dana: finalize pricing"],
+                "follow_up_email": "Hi team,\nRecap below.",
+            }
+            return LLMResult(text=json.dumps(payload), model=model,
+                             usage={"total_tokens": 30})
+
+    class _Chain:
+        def __init__(self, entries):
+            self.entries = entries
+
+    def _engine(self, state):
+        engine = AnswerEngine(state, lambda _m: None, HudConfig(kb_enabled=False))
+        engine._chain = self._Chain([{
+            "name": "groq", "client": self._SummaryClient(),
+            "chat_model": "m", "rolling_model": "m", "structured": False,
+        }])
+        return engine
+
+    def test_parse_summary_fallbacks(self) -> None:
+        from hud.answers import parse_summary
+
+        parsed = parse_summary('{"summary": "s", "action_items": ["a"]}')
+        self.assertEqual(parsed["summary"], "s")
+        self.assertEqual(parsed["action_items"], ["a"])
+        plain = parse_summary("just some text")
+        self.assertEqual(plain["summary"], "just some text")
+        self.assertEqual(plain["action_items"], [])
+
+    def test_summarize_returns_structured_output(self) -> None:
+        state = LiveState()
+        state.add("transcript", text="Dana: we should ship in Q3.", speaker="Dana")
+        engine = self._engine(state)
+        summary = engine.finish()
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary["summary"], "We agreed to ship in Q3.")
+        self.assertEqual(summary["action_items"], ["Dana: finalize pricing"])
+        self.assertTrue(summary["follow_up_email"])
+
+    def test_summary_disabled(self) -> None:
+        cfg = HudConfig(kb_enabled=False, summary_enabled=False)
+        engine = AnswerEngine(LiveState(), lambda _m: None, cfg)
+        engine._chain = self._Chain([{
+            "name": "groq", "client": self._SummaryClient(),
+            "chat_model": "m", "rolling_model": "m", "structured": False,
+        }])
+        self.assertIsNone(engine.finish())
+
+    def test_summary_respects_live_no_answers(self) -> None:
+        cfg = HudConfig(kb_enabled=False, answers_enabled=False)
+        engine = AnswerEngine(LiveState(), lambda _m: None, cfg)
+        engine._chain = self._Chain([{
+            "name": "groq", "client": self._SummaryClient(),
+            "chat_model": "m", "rolling_model": "m", "structured": False,
+        }])
+        self.assertIsNone(engine.finish())
+
+    def test_session_writes_outputs_and_summary(self) -> None:
+        from hud.session import LiveSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp) / "2026-01-01_uid"
+            outdir.mkdir(parents=True)
+            session = LiveSession(HudConfig(), outdir, lambda _m: None, "Mic")
+            session.state.add("transcript", text="hello there", speaker="You")
+            session.state.add_talking_points(["price is final"])
+            session._persist(summary={"summary": "done", "action_items": ["ship"],
+                                      "follow_up_email": "hi"})
+            derived = outdir / "derived"
+            self.assertTrue((derived / "live_transcript.txt").is_file())
+            self.assertTrue((derived / "live_conversation.md").is_file())
+            summary_md = (derived / "live_summary.md").read_text()
+            self.assertIn("done", summary_md)
+            self.assertIn("ship", summary_md)
+            self.assertIn("hi", summary_md)
+            # No leftover temp files from the atomic writes.
+            self.assertEqual(list(derived.glob("*.tmp")), [])
 
 
 class WavTests(unittest.TestCase):

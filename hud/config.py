@@ -90,9 +90,11 @@ class HudConfig:
     # Speech-to-text
     stt_backend: str = "groq"          # groq | openai | local
     stt_model: Optional[str] = None    # None => provider default
-    stt_chunk_seconds: float = 14.0    # Groq bills a 10s minimum per request
+    stt_chunk_seconds: float = 10.0    # Groq bills a 10s minimum per request
     stt_min_speech_seconds: float = 0.6
     stt_whisper_bin: str = "whisper-server"
+    stt_glossary: List[str] = field(default_factory=list)
+    stt_queue_chunks: int = 4          # bounded per-source STT queue (drop-oldest)
 
     # Answers
     answers_enabled: bool = True
@@ -103,8 +105,23 @@ class HudConfig:
     answer_interval: float = 35.0
     rolling_enabled: bool = True
     answer_max_tokens: int = 600
-    context_minutes: float = 3.0
+    context_minutes: float = 5.0
+    context_max_chars: int = 6000
     question_cooldown: float = 6.0
+    question_lookback_seconds: float = 90.0
+    question_rewrite: bool = True
+    answer_self_questions: bool = False
+    point_dedupe_score: float = 0.9
+    max_context_qa: int = 3
+    summary_enabled: bool = True
+    summary_model: Optional[str] = None
+    # Talking-point grounding: strictly transcript-anchored, quote-verified,
+    # and gated on enough new speech so sparse audio yields nothing.
+    talking_points_grounded: bool = True
+    talking_points_max: int = 3
+    talking_points_min_new_words: int = 60
+    talking_points_min_words: int = 40
+    talking_points_quote_overlap: float = 0.7
 
     # Knowledge base
     kb_enabled: bool = True
@@ -113,6 +130,9 @@ class HudConfig:
     kb_top_k: int = 5
     kb_reindex: bool = False
     kb_cache_dir: Optional[str] = None
+    kb_embed_backend: str = "auto"      # auto | sentence-transformers | ollama | openai
+    kb_embed_model: Optional[str] = None
+    kb_min_score: float = 0.1
 
     # Speaker labelling (channel-based: mic vs system/loopback)
     speakers_enabled: bool = True
@@ -123,6 +143,7 @@ class HudConfig:
     port: int = 0
     open_browser: bool = True
     host: str = "127.0.0.1"
+    persist_seconds: float = 20.0     # periodic crash-safe flush of derived/
 
     # Budget caps (0 == trust the provider's rate-limit headers)
     budget_tpm: int = 0
@@ -181,9 +202,11 @@ def _defaults() -> Dict[str, Any]:
         "stt": {
             "backend": "groq",
             "model": None,
-            "chunk_seconds": 14.0,
+            "chunk_seconds": 10.0,
             "min_speech_seconds": 0.6,
             "whisper_bin": "whisper-server",
+            "glossary": [],
+            "queue_chunks": 4,
         },
         "answers": {
             "enabled": True,
@@ -194,8 +217,21 @@ def _defaults() -> Dict[str, Any]:
             "interval": 35.0,
             "rolling_enabled": True,
             "max_tokens": 600,
-            "context_minutes": 3.0,
+            "context_minutes": 5.0,
+            "context_max_chars": 6000,
             "question_cooldown": 6.0,
+            "question_lookback_seconds": 90.0,
+            "question_rewrite": True,
+            "answer_self_questions": False,
+            "point_dedupe_score": 0.9,
+            "max_context_qa": 3,
+            "summary_enabled": True,
+            "summary_model": None,
+            "talking_points_grounded": True,
+            "talking_points_max": 3,
+            "talking_points_min_new_words": 60,
+            "talking_points_min_words": 40,
+            "talking_points_quote_overlap": 0.7,
         },
         "kb": {
             "enabled": True,
@@ -204,8 +240,11 @@ def _defaults() -> Dict[str, Any]:
             "top_k": 5,
             "reindex": False,
             "cache_dir": None,
+            "embed_backend": "auto",
+            "embed_model": None,
+            "min_score": 0.1,
         },
-        "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1"},
+        "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1", "persist_seconds": 20.0},
         "speakers": {"enabled": True, "self_name": "You", "remote_name": "Others"},
         "budget": {"tpm": 0, "tpd": 0},
         "api_keys": {},
@@ -246,9 +285,11 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
     return HudConfig(
         stt_backend=str(stt.get("backend") or "groq"),
         stt_model=stt.get("model") or None,
-        stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 14.0),
+        stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 10.0),
         stt_min_speech_seconds=_as_float(stt.get("min_speech_seconds"), 0.6),
         stt_whisper_bin=str(stt.get("whisper_bin") or "whisper-server"),
+        stt_glossary=_as_str_list(stt.get("glossary")),
+        stt_queue_chunks=_as_int(stt.get("queue_chunks"), 4),
         answers_enabled=bool(answers.get("enabled", True)),
         answers_backend=str(answers.get("backend") or "groq"),
         answers_fallback=_as_str_list(answers.get("fallback")),
@@ -257,20 +298,37 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         answer_interval=_as_float(answers.get("interval"), 35.0),
         rolling_enabled=bool(answers.get("rolling_enabled", True)),
         answer_max_tokens=_as_int(answers.get("max_tokens"), 600),
-        context_minutes=_as_float(answers.get("context_minutes"), 3.0),
+        context_minutes=_as_float(answers.get("context_minutes"), 5.0),
+        context_max_chars=_as_int(answers.get("context_max_chars"), 6000),
         question_cooldown=_as_float(answers.get("question_cooldown"), 6.0),
+        question_lookback_seconds=_as_float(answers.get("question_lookback_seconds"), 90.0),
+        question_rewrite=bool(answers.get("question_rewrite", True)),
+        answer_self_questions=bool(answers.get("answer_self_questions", False)),
+        point_dedupe_score=_as_float(answers.get("point_dedupe_score"), 0.9),
+        max_context_qa=_as_int(answers.get("max_context_qa"), 3),
+        summary_enabled=bool(answers.get("summary_enabled", True)),
+        summary_model=answers.get("summary_model") or None,
+        talking_points_grounded=bool(answers.get("talking_points_grounded", True)),
+        talking_points_max=_as_int(answers.get("talking_points_max"), 3),
+        talking_points_min_new_words=_as_int(answers.get("talking_points_min_new_words"), 60),
+        talking_points_min_words=_as_int(answers.get("talking_points_min_words"), 40),
+        talking_points_quote_overlap=_as_float(answers.get("talking_points_quote_overlap"), 0.7),
         kb_enabled=bool(kb.get("enabled", True)),
         kb_dirs=_as_str_list(kb.get("dirs")),
         kb_model=str(kb.get("model") or "all-MiniLM-L6-v2"),
         kb_top_k=_as_int(kb.get("top_k"), 5),
         kb_reindex=bool(kb.get("reindex", False)),
         kb_cache_dir=kb.get("cache_dir") or None,
+        kb_embed_backend=str(kb.get("embed_backend") or "auto"),
+        kb_embed_model=kb.get("embed_model") or None,
+        kb_min_score=_as_float(kb.get("min_score"), 0.1),
         speakers_enabled=bool(speakers.get("enabled", True)),
         self_name=str(speakers.get("self_name") or "You"),
         remote_name=str(speakers.get("remote_name") or "Others"),
         port=_as_int(hud.get("port"), 0),
         open_browser=bool(hud.get("open_browser", True)),
         host=str(hud.get("host") or "127.0.0.1"),
+        persist_seconds=_as_float(hud.get("persist_seconds"), 20.0),
         budget_tpm=_as_int(budget.get("tpm"), 0),
         budget_tpd=_as_int(budget.get("tpd"), 0),
         api_keys={str(k): str(v) for k, v in (data.get("api_keys") or {}).items()},
@@ -286,6 +344,8 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "chunk_seconds": cfg.stt_chunk_seconds,
         "min_speech_seconds": cfg.stt_min_speech_seconds,
         "whisper_bin": cfg.stt_whisper_bin,
+        "glossary": list(cfg.stt_glossary),
+        "queue_chunks": cfg.stt_queue_chunks,
     })
     out["answers"].update({
         "enabled": cfg.answers_enabled,
@@ -297,7 +357,20 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "rolling_enabled": cfg.rolling_enabled,
         "max_tokens": cfg.answer_max_tokens,
         "context_minutes": cfg.context_minutes,
+        "context_max_chars": cfg.context_max_chars,
         "question_cooldown": cfg.question_cooldown,
+        "question_lookback_seconds": cfg.question_lookback_seconds,
+        "question_rewrite": cfg.question_rewrite,
+        "answer_self_questions": cfg.answer_self_questions,
+        "point_dedupe_score": cfg.point_dedupe_score,
+        "max_context_qa": cfg.max_context_qa,
+        "summary_enabled": cfg.summary_enabled,
+        "summary_model": cfg.summary_model,
+        "talking_points_grounded": cfg.talking_points_grounded,
+        "talking_points_max": cfg.talking_points_max,
+        "talking_points_min_new_words": cfg.talking_points_min_new_words,
+        "talking_points_min_words": cfg.talking_points_min_words,
+        "talking_points_quote_overlap": cfg.talking_points_quote_overlap,
     })
     out["kb"].update({
         "enabled": cfg.kb_enabled,
@@ -306,6 +379,9 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "top_k": cfg.kb_top_k,
         "reindex": cfg.kb_reindex,
         "cache_dir": cfg.kb_cache_dir,
+        "embed_backend": cfg.kb_embed_backend,
+        "embed_model": cfg.kb_embed_model,
+        "min_score": cfg.kb_min_score,
     })
     out["speakers"].update({
         "enabled": cfg.speakers_enabled,
@@ -316,6 +392,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "port": cfg.port,
         "open_browser": cfg.open_browser,
         "host": cfg.host,
+        "persist_seconds": cfg.persist_seconds,
     })
     out["budget"].update({"tpm": cfg.budget_tpm, "tpd": cfg.budget_tpd})
     out["api_keys"] = dict(cfg.api_keys) if include_keys else {}

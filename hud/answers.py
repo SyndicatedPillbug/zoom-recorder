@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Generative answer engine for the right-hand HUD column.
+"""Generative answer engine for the HUD.
 
-Two triggers:
-  * a question detected in the rolling transcript -> answered immediately with
-    the higher-quality model;
-  * a periodic (default 35 s) refresh -> short talking points from the cheaper,
-    high-quota model.
+Two independent triggers, deliberately kept in separate output streams:
+
+  * a question detected across the rolling conversation -> answered with the
+    higher-quality model and surfaced as a Q&A card;
+  * a periodic (default 35 s) refresh -> short *new* talking points appended to
+    a persistent bullet list (never mixed in with the Q&A cards).
 
 Both are grounded in the recent conversation plus retrieved ``.md`` snippets.
 All provider calls are governed by :class:`hud.budget.BudgetGovernor` so an
@@ -14,17 +15,21 @@ aggressive cadence degrades gracefully instead of hammering a free tier.
 
 from __future__ import annotations
 
+import itertools
 import json
+import math
+import queue
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .budget import BudgetGovernor
 from .config import HudConfig, get_provider
 from .kb import KBIndex
 from .llm import LLMClient, LLMError
-from .state import LiveState
+from .state import LiveState, is_duplicate_point
 
 QUESTION_WORDS = re.compile(
     r"^\s*(what|how|why|when|who|where|which|can|could|would|should|do|does|did|"
@@ -38,21 +43,143 @@ QUESTION_PHRASES = re.compile(
     re.I,
 )
 BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*)$")
+SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+
+# Follow-up questions that only make sense with earlier context: short, open
+# with a discourse connector, or lean on a pronoun. These are the ones worth a
+# cheap rewrite pass before answering.
+AMBIGUOUS_START_RE = re.compile(
+    r"^\s*(what about|how about|and\b|so\b|then\b|why\b|which one|the other|both|those|these)\b",
+    re.I,
+)
+REFERENCE_RE = re.compile(
+    r"\b(it|that|this|those|these|they|them|he|she|one|ones|there|the other)\b",
+    re.I,
+)
+
+# Backchannel / rhetorical questions that don't need an answer.
+RHETORICAL_RE = re.compile(
+    r"(?:,\s*(?:right|correct|yeah|okay|ok|no)\?|\bisn'?t (?:it|that|this)\b|"
+    r"\baren'?t (?:they|we|you)\b|"
+    r"\b(?:you know|make sense|sound good|does that make sense)\s*\?)\s*$",
+    re.I,
+)
 
 
-def detect_question(text: str) -> Optional[str]:
-    """Return the most recent question-like sentence, or None."""
-    if not text:
-        return None
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+@dataclass
+class Turn:
+    seq: int
+    ts: float
+    speaker: str
+    text: str
+
+
+# --------------------------------------------------------------------------
+# Pure text helpers (unit-tested)
+# --------------------------------------------------------------------------
+def split_sentences(text: str) -> List[str]:
+    return [s.strip() for s in SENTENCE_RE.split((text or "").strip()) if s.strip()]
+
+
+def is_question_sentence(sentence: str) -> bool:
+    s = (sentence or "").strip().lstrip("\"'“”‘’")
+    if not s:
+        return False
+    if s.endswith("?"):
+        return True
+    if QUESTION_WORDS.match(s):
+        return True
+    if QUESTION_PHRASES.search(s):
+        return True
+    return False
+
+
+def is_rhetorical_question(question: str) -> bool:
+    return bool(RHETORICAL_RE.search((question or "").strip()))
+
+
+def detect_question_text(text: str) -> Optional[str]:
+    """Return the most recent question-like sentence in one blob of text."""
     candidate: Optional[str] = None
-    for sentence in sentences:
-        s = sentence.strip()
-        if not s:
-            continue
-        if s.endswith("?") or QUESTION_WORDS.match(s) or QUESTION_PHRASES.search(s):
-            candidate = s
+    for sentence in split_sentences(text):
+        if is_question_sentence(sentence):
+            candidate = sentence
     return candidate
+
+
+# Backwards-compatible name for the single-string helper.
+detect_question = detect_question_text
+
+
+def _format_turn(turn: Turn) -> str:
+    stamp = time.strftime("%H:%M:%S", time.localtime(turn.ts))
+    prefix = "{}: ".format(turn.speaker) if turn.speaker else ""
+    return "[{}] {}{}".format(stamp, prefix, turn.text)
+
+
+def _question_from_turn(turn: Turn) -> Optional[str]:
+    found: Optional[str] = None
+    for sentence in split_sentences(turn.text):
+        if is_question_sentence(sentence):
+            found = sentence
+    return found
+
+
+def detect_questions_since(turns: List[Turn], after_seq: int,
+                           lookback_seconds: float = 90.0,
+                           now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """All question turns newer than ``after_seq`` inside the lookback window.
+
+    Returns them oldest-first so the caller can answer a burst of questions in
+    the order they were asked.
+    """
+    if not turns:
+        return []
+    now = time.time() if now is None else now
+    cutoff = now - max(1.0, lookback_seconds)
+    recent = [t for t in turns if t.ts >= cutoff]
+    out: List[Dict[str, Any]] = []
+    for idx, turn in enumerate(recent):
+        if turn.seq <= after_seq:
+            continue
+        question = _question_from_turn(turn)
+        if not question:
+            continue
+        context = "\n".join(_format_turn(t) for t in recent[max(0, idx - 2):idx])
+        out.append({
+            "question": question,
+            "speaker": turn.speaker or "",
+            "seq": turn.seq,
+            "context": context,
+        })
+    return out
+
+
+def detect_question_turns(turns: List[Turn], lookback_seconds: float = 90.0,
+                          now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Find the most recent question across the rolling conversation.
+
+    Unlike the old single-chunk check this scans every turn inside the lookback
+    window, so a question split across STT chunks (or asked a few turns ago) is
+    still caught. It also returns the turns immediately preceding the question
+    so the answer prompt can resolve references like "what about that one?".
+    """
+    found = detect_questions_since(turns, 0, lookback_seconds, now)
+    return found[-1] if found else None
+
+
+def is_ambiguous_question(question: str) -> bool:
+    """True when a question likely needs earlier turns to be understood."""
+    q = (question or "").strip()
+    if not q:
+        return False
+    if len(q.split()) <= 6:
+        return True
+    if AMBIGUOUS_START_RE.match(q):
+        return True
+    if REFERENCE_RE.search(q):
+        return True
+    return False
 
 
 def parse_bullets(text: str) -> List[str]:
@@ -75,12 +202,117 @@ def parse_bullets(text: str) -> List[str]:
             bullets.append(m.group(1).strip())
     if not bullets:
         # Fall back to sentences so we never show an empty card.
-        bullets = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        bullets = [s.strip() for s in split_sentences(text) if s.strip()]
     return bullets[:6]
+
+
+_PUNCT_RE = re.compile(r"[^a-z0-9\s]")
+
+
+def _normalize_tokens(text: str) -> List[str]:
+    return _PUNCT_RE.sub(" ", (text or "").lower()).split()
+
+
+def parse_point_objects(text: str) -> List[Dict[str, str]]:
+    """Parse transcript-grounded points ``{"text", "quote"}``.
+
+    Prefers the JSON schema (objects with an evidence quote); tolerates plain
+    string bullets and markdown fallbacks so a model that ignores the schema
+    still produces *something* we can ground-check.
+    """
+    text = (text or "").strip()
+    out: List[Dict[str, str]] = []
+    if not text:
+        return out
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            bullets = obj.get("bullets") or obj.get("points") or []
+            if isinstance(bullets, list):
+                for item in bullets:
+                    if isinstance(item, dict):
+                        point = str(item.get("text") or item.get("point") or "").strip()
+                        quote = str(item.get("quote") or item.get("evidence") or "").strip()
+                        if point:
+                            out.append({"text": point, "quote": quote})
+                    elif str(item).strip():
+                        out.append({"text": str(item).strip(), "quote": ""})
+                return out
+        except ValueError:
+            pass
+    for line in text.splitlines():
+        m = BULLET_RE.match(line)
+        if m and m.group(1).strip():
+            out.append({"text": m.group(1).strip(), "quote": ""})
+    if not out:
+        out = [{"text": s, "quote": ""} for s in split_sentences(text) if s.strip()]
+    return out
+
+
+def grounded_in(point_text: str, quote: str, window: str,
+                min_tokens: int = 4, threshold: float = 0.7) -> bool:
+    """True when a point is actually supported by the transcript window.
+
+    A supplied quote must match the window (exact normalised span, or token
+    overlap above ``threshold``). With no quote, the bullet's own tokens must
+    overlap the window. This is the cheap guard that stops the model inventing
+    plausible-but-unsaid content.
+    """
+    window_tokens = _normalize_tokens(window)
+    if not window_tokens:
+        return False
+    window_text = " ".join(window_tokens)
+    window_set = set(window_tokens)
+
+    def matches(candidate: str) -> bool:
+        tokens = _normalize_tokens(candidate)
+        if len(tokens) < min_tokens:
+            return False
+        if " ".join(tokens) in window_text:
+            return True
+        overlap = sum(1 for t in tokens if t in window_set) / len(tokens)
+        return overlap >= threshold
+
+    if quote.strip():
+        return matches(quote)
+    return matches(point_text)
 
 
 def estimate_tokens(text: str, max_tokens: int) -> int:
     return max(1, len(text) // 4) + max_tokens
+
+
+def parse_follow_up(text: str) -> bool:
+    """True when the model marked an answer as a follow-up to the previous one."""
+    text = (text or "").strip()
+    if text.startswith("{"):
+        try:
+            return bool(json.loads(text).get("follow_up"))
+        except ValueError:
+            return False
+    return False
+
+
+def parse_summary(text: str) -> Dict[str, Any]:
+    """Parse the end-of-call JSON, tolerating a plain-text fallback."""
+    text = (text or "").strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            pass
+    return {"summary": text, "action_items": [], "follow_up_email": ""}
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
 
 
 class _Chain:
@@ -101,14 +333,28 @@ class AnswerEngine:
         self.cfg = cfg
         self.budget = budget or BudgetGovernor()
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._worker: Optional[threading.Thread] = None
+        self._queue: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._job_seq = itertools.count()
+        self._paused = False
+
         self._id_cursor = 0
-        self._buffer: List[Tuple[float, str]] = []
+        self._seq = 0
+        self._buffer: List[Turn] = []
+        self._last_question_seq = 0
+        self._last_answer_id = 0
+        self._qa_thread: List[Dict[str, Any]] = []
+        self._rolling_payload: Optional[Dict[str, Any]] = None
+        self._rolling_queued = False
         self._last_rolling_ts = 0.0
         self._last_rolling_hash = ""
-        self._last_question_ts = 0.0
-        self._last_question_hash = ""
+        self._words_since_rolling = 0
+
         self._kb: Optional[KBIndex] = None
+        self._embedder: Any = None
+        self._vec_cache: Dict[str, List[float]] = {}
         self._chain: Optional[_Chain] = None
         self._chain_index = 0
 
@@ -119,8 +365,37 @@ class AnswerEngine:
 
     def stop(self) -> None:
         self._stop.set()
+        self._queue.put((0, next(self._job_seq), None))
         if self._thread is not None:
-            self._thread.join(timeout=10.0)
+            self._thread.join(timeout=12.0)
+        if self._chain is not None:
+            for entry in self._chain.entries:
+                closer = getattr(entry.get("client"), "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    def pause(self, paused: bool = True) -> None:
+        with self._lock:
+            self._paused = paused
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def ask(self, text: str, expand: bool = False) -> bool:
+        """Queue a manual question (or 'expand this point') from the UI."""
+        text = (text or "").strip()
+        if not text or self.paused:
+            return False
+        question = ("Expand on this talking point with concrete detail, an example, "
+                    "and why it matters: {}".format(text)) if expand else text
+        self._put(0, {"kind": "question", "question": question, "speaker": "You",
+                      "context": "", "window": self._context_text(), "manual": True})
+        return True
 
     # -- setup -------------------------------------------------------------
     def _build_chain(self) -> _Chain:
@@ -150,15 +425,67 @@ class AnswerEngine:
             })
         return _Chain(entries)
 
-    def _setup_kb(self) -> None:
-        if not self.cfg.kb_enabled or not self.cfg.kb_dirs:
+    def _start_kb(self) -> None:
+        """Build the embedder/KB on a side thread so answers aren't blocked.
+
+        The embedder is also used for semantic talking-point dedupe, so it is
+        built even when the KB itself is disabled.
+        """
+        want_kb = self.cfg.kb_enabled and bool(self.cfg.kb_dirs)
+        want_dedupe = self.cfg.point_dedupe_score > 0
+        if not (want_kb or want_dedupe):
             return
-        self._kb = KBIndex(self.cfg.kb_dirs, self.cfg.kb_model,
-                           self.cfg.kb_cache_dir, self.log)
-        if not self._kb.available():
-            self._kb = None
-            return
-        self._kb.build(force=self.cfg.kb_reindex)
+
+        def _work() -> None:
+            try:
+                embedder = self._build_embedder()
+                if embedder is None:
+                    if want_kb:
+                        self.log("KB: no embedding backend available; continuing without KB")
+                    return
+                self._embedder = embedder
+                if want_kb:
+                    kb = KBIndex(self.cfg.kb_dirs, embedder,
+                                 cache_dir=self.cfg.kb_cache_dir, log=self.log,
+                                 min_score=self.cfg.kb_min_score)
+                    if kb.build(force=self.cfg.kb_reindex):
+                        self._kb = kb
+                    else:
+                        self.log("KB: disabled (build failed)")
+            except Exception as exc:  # noqa: BLE001
+                self.log("KB setup failed: {}".format(exc))
+
+        threading.Thread(target=_work, name="hud-kb", daemon=True).start()
+
+    def _build_embedder(self):
+        """Pick an embedding backend: local model, then Ollama, then OpenAI."""
+        from .kb import LocalEmbedder, RemoteEmbedder
+
+        backend = (self.cfg.kb_embed_backend or "auto").lower()
+        model = self.cfg.kb_embed_model
+        if backend in ("local", "sentence-transformers", "auto"):
+            try:
+                return LocalEmbedder(model or self.cfg.kb_model)
+            except Exception as exc:  # noqa: BLE001
+                self.log("KB: local embeddings unavailable ({})".format(exc))
+                if backend != "auto":
+                    return None
+        if backend in ("ollama", "auto"):
+            try:
+                provider = get_provider("ollama")
+                return RemoteEmbedder(
+                    LLMClient(provider.base_url, None),
+                    model or "nomic-embed-text", name="ollama")
+            except Exception as exc:  # noqa: BLE001
+                self.log("KB: ollama embeddings unavailable ({})".format(exc))
+        if backend in ("openai", "auto"):
+            api_key = self.cfg.api_key_for("openai")
+            if api_key:
+                provider = get_provider("openai")
+                return RemoteEmbedder(
+                    LLMClient(provider.base_url, api_key),
+                    model or "text-embedding-3-small", name="openai")
+        return None
 
     # -- main loop ---------------------------------------------------------
     def _run(self) -> None:
@@ -172,9 +499,12 @@ class AnswerEngine:
                 "feature off" if not self.cfg.answers_enabled else "no provider key"))
             return
 
-        self._setup_kb()
         self._id_cursor = self.state.latest_id()
         self.state.set_budget(self.budget.snapshot())
+        self._start_kb()
+        self._worker = threading.Thread(target=self._worker_loop,
+                                        name="hud-answers-work", daemon=True)
+        self._worker.start()
         self.log("answers enabled via {} (chat={}, rolling={}, interval={:.0f}s)".format(
             self.cfg.answers_backend, self._chain.entries[0]["chat_model"],
             self._chain.entries[0]["rolling_model"], self.cfg.answer_interval))
@@ -184,25 +514,64 @@ class AnswerEngine:
                 self._tick()
             except Exception as exc:  # noqa: BLE001
                 self.log("answers loop error: {}".format(exc))
+
+        if self._worker is not None:
+            self._worker.join(timeout=12.0)
         self._flush_buffer()
+
+    def _put(self, priority: int, job: Dict[str, Any]) -> None:
+        self._queue.put((priority, next(self._job_seq), job))
+
+    def _worker_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                _priority, _seq, job = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            if self.paused:
+                continue
+            try:
+                self._execute(job)
+            except Exception as exc:  # noqa: BLE001
+                self.log("answers job error: {}".format(exc))
+
+    def _execute(self, job: Dict[str, Any]) -> None:
+        if job.get("kind") == "rolling":
+            with self._lock:
+                self._rolling_queued = False
+                payload = self._rolling_payload
+                self._rolling_payload = None
+            if payload:
+                self._refresh_talking_points(payload)
+            return
+        self._answer_question(job)
 
     def _tick(self) -> None:
         self._drain_events()
         self._trim_buffer()
         self.state.set_budget(self.budget.snapshot())
 
-        if self.budget.blocked_seconds() > 0:
+        if self.paused or self.budget.blocked_seconds() > 0:
             return
         now = time.time()
-        # Questions take priority and use the better model.
-        latest = self._buffer[-1][1] if self._buffer else ""
-        question = detect_question(latest)
-        if (question and now - self._last_question_ts >= self.cfg.question_cooldown
-                and self._question_hash(question) != self._last_question_hash):
-            if self._answer(kind="question", question=question):
-                self._last_question_ts = now
-                self._last_question_hash = self._question_hash(question)
-            return
+
+        # Enqueue every new question (oldest first); the worker answers them
+        # with the stronger model without blocking detection.
+        lookback = self.cfg.question_lookback_seconds
+        for detected in detect_questions_since(self._buffer, self._last_question_seq,
+                                               lookback, now):
+            self._last_question_seq = max(self._last_question_seq, detected["seq"])
+            if not self._should_answer(detected):
+                continue
+            self._put(0, {
+                "kind": "question",
+                "question": detected["question"],
+                "speaker": detected["speaker"],
+                "context": detected["context"],
+                "window": self._context_text(),
+            })
 
         if not self.cfg.rolling_enabled:
             return
@@ -212,17 +581,39 @@ class AnswerEngine:
         if not window:
             self._last_rolling_ts = now
             return
+        # Substance gate: don't manufacture points from sparse/noisy audio.
+        if len(window.split()) < self.cfg.talking_points_min_words:
+            self._last_rolling_ts = now
+            return
+        if self._words_since_rolling < self.cfg.talking_points_min_new_words:
+            self._last_rolling_ts = now
+            return
         digest = str(hash(window))
         if digest == self._last_rolling_hash:
             self._last_rolling_ts = now
             return
         if self.budget.daily_budget_low():
-            # Degrade rolling refreshes first; keep question answers working.
+            # Degrade talking points first; keep question answers working.
             self._last_rolling_ts = now
             return
-        if self._answer(kind="rolling", question=None):
-            self._last_rolling_ts = now
-            self._last_rolling_hash = digest
+        self._last_rolling_ts = now
+        self._last_rolling_hash = digest
+        self._words_since_rolling = 0
+        with self._lock:
+            self._rolling_payload = {"window": window}
+            if not self._rolling_queued:
+                self._rolling_queued = True
+                self._put(1, {"kind": "rolling"})
+
+    def _should_answer(self, detected: Dict[str, Any]) -> bool:
+        question = detected.get("question", "")
+        speaker = detected.get("speaker") or ""
+        if is_rhetorical_question(question):
+            return False
+        if (not self.cfg.answer_self_questions and speaker
+                and speaker == self.cfg.self_name):
+            return False
+        return True
 
     # -- transcript buffer -------------------------------------------------
     def _drain_events(self) -> None:
@@ -230,53 +621,60 @@ class AnswerEngine:
         for event in events:
             self._id_cursor = max(self._id_cursor, int(event.get("id", 0)))
             if event.get("type") == "transcript" and event.get("source") == "live":
-                text = str(event.get("text", ""))
-                speaker = event.get("speaker")
-                if speaker:
-                    text = "{}: {}".format(speaker, text)
-                self._buffer.append((float(event.get("ts", time.time())), text))
+                text = str(event.get("text", "")).strip()
+                if not text:
+                    continue
+                self._seq += 1
+                self._buffer.append(Turn(
+                    seq=self._seq, ts=float(event.get("ts", time.time())),
+                    speaker=event.get("speaker") or "", text=text))
+                self._words_since_rolling += len(text.split())
 
     def _trim_buffer(self) -> None:
         cutoff = time.time() - self.cfg.context_minutes * 60.0
-        self._buffer = [(ts, t) for ts, t in self._buffer if ts >= cutoff][-400:]
+        self._buffer = [t for t in self._buffer if t.ts >= cutoff][-400:]
 
     def _context_text(self) -> str:
-        return " ".join(t for _ts, t in self._buffer).strip()
-
-    def _question_hash(self, question: str) -> str:
-        return str(hash(question.lower()))
+        text = "\n".join(_format_turn(t) for t in self._buffer).strip()
+        limit = self.cfg.context_max_chars
+        if limit and len(text) > limit:
+            return text[-limit:]
+        return text
 
     def _flush_buffer(self) -> None:
         self._buffer = []
 
     # -- generation --------------------------------------------------------
-    def _answer(self, kind: str, question: Optional[str]) -> bool:
-        window = self._context_text()
-        if not window and not question:
-            return False
-        snippets = []
-        if self._kb is not None:
-            query_text = question or window[-1500:]
-            snippets = self._kb.query(query_text, self.cfg.kb_top_k)
-        prompt = self._build_prompt(kind, question, window, snippets)
-        est = estimate_tokens(prompt, self.cfg.answer_max_tokens)
+    def _qa_recent(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(qa) for qa in self._qa_thread]
 
-        for offset in range(len(self._chain.entries)):  # type: ignore[union-attr]
-            entry = self._chain.entries[(self._chain_index + offset) % len(self._chain.entries)]  # type: ignore[union-attr]
-            model = entry["rolling_model"] if kind == "rolling" else entry["chat_model"]
+    def _chat(self, kind: str, system: str, prompt: str,
+              max_tokens: Optional[int] = None, temperature: float = 0.2,
+              model_override: Optional[str] = None):
+        """Run one provider call (with fallback + JSON-mode retry)."""
+        if self._chain is None or not self._chain.entries:
+            return None
+        max_out = max_tokens or self.cfg.answer_max_tokens
+        est = estimate_tokens(system + prompt, max_out)
+        entries = self._chain.entries
+        for offset in range(len(entries)):
+            entry = entries[(self._chain_index + offset) % len(entries)]
+            model = model_override or (
+                entry["rolling_model"] if kind == "rolling" else entry["chat_model"])
             if not self.budget.can_afford(est):
-                return False
+                return None
             self.budget.reserve(est)
             messages = [
-                {"role": "system", "content": self._system_prompt(kind)},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ]
             response_format = {"type": "json_object"} if entry.get("structured") else None
             try:
                 try:
                     result = entry["client"].chat(
-                        messages, model, max_tokens=self.cfg.answer_max_tokens,
-                        temperature=0.2, response_format=response_format)
+                        messages, model, max_tokens=max_out,
+                        temperature=temperature, response_format=response_format)
                 except LLMError as exc:
                     if exc.status == 400 and response_format is not None:
                         # Reasoning models (e.g. Groq's gpt-oss-120b) can emit
@@ -286,8 +684,8 @@ class AnswerEngine:
                         self.log("answers: {} JSON mode rejected; retrying plain text".format(
                             entry["name"]))
                         result = entry["client"].chat(
-                            messages, model, max_tokens=self.cfg.answer_max_tokens,
-                            temperature=0.2, response_format=None)
+                            messages, model, max_tokens=max_out,
+                            temperature=temperature, response_format=None)
                     else:
                         raise
             except LLMError as exc:
@@ -295,55 +693,284 @@ class AnswerEngine:
                 if exc.status == 429:
                     self.budget.pause(exc.retry_after, reason=str(exc))
                     self.log("answers: rate limited by {}; backing off".format(entry["name"]))
-                    return False
+                    return None
                 self.log("answers: {} error: {}".format(entry["name"], exc))
                 continue
             except Exception as exc:  # noqa: BLE001
                 self.log("answers: {} unexpected error: {}".format(entry["name"], exc))
                 continue
             self.budget.record(result.headers, result.usage)
-            self._chain_index = (self._chain_index + offset) % len(self._chain.entries)  # type: ignore[union-attr]
-            bullets = parse_bullets(result.text)
-            if not bullets:
-                continue
-            self.state.add(
-                "answer", kind=kind, question=question, bullets=bullets,
-                sources=[s.source for s in snippets], model=result.model,
-                usage=result.usage)
+            self._chain_index = (self._chain_index + offset) % len(entries)
             self.state.set_budget(self.budget.snapshot())
-            return True
+            return result
+        return None
 
-        self.state.add("answer", kind=kind, question=question, bullets=[],
-                       sources=[], model="", error="all providers failed")
+    def _answer_question(self, job: Dict[str, Any]) -> None:
+        question = job.get("question") or ""
+        context = job.get("context") or ""
+        window = job.get("window") or self._context_text()
+        if not question and not window:
+            return
+
+        rewritten = ""
+        if (not job.get("manual") and question and self.cfg.question_rewrite
+                and is_ambiguous_question(question)):
+            rewritten = self._rewrite_question(question, context)
+        effective = rewritten or question
+
+        snippets = []
+        if self._kb is not None:
+            if effective:
+                query_text = "{} {}".format(effective, context or window[-1200:]).strip()
+            else:
+                query_text = window[-1500:]
+            snippets = self._kb.query(query_text, self.cfg.kb_top_k)
+
+        system = self._system_prompt("question")
+        prompt = self._build_prompt("question", effective, context, window, snippets,
+                                    qa=self._qa_recent())
+        result = self._chat("question", system, prompt)
+        if result is None:
+            self.state.add("answer", kind="question", question=question, bullets=[],
+                           sources=[], model="", error="all providers failed")
+            return
+        bullets = parse_bullets(result.text)
+        if not bullets:
+            self.state.add("answer", kind="question", question=question, bullets=[],
+                           sources=[], model=result.model, error="no answer produced")
+            return
+
+        parent_id = None
+        if parse_follow_up(result.text):
+            with self._lock:
+                parent_id = self._last_answer_id or None
+        event = self.state.add(
+            "answer", kind="question", question=question,
+            rewritten_question=rewritten or None, bullets=bullets,
+            sources=[s.source for s in snippets], model=result.model,
+            usage=result.usage, parent_id=parent_id)
+        with self._lock:
+            self._last_answer_id = event["id"]
+            self._qa_thread.append({"question": question, "bullets": bullets})
+            keep = max(1, self.cfg.max_context_qa)
+            del self._qa_thread[:-keep]
+
+    def _refresh_talking_points(self, payload: Dict[str, Any]) -> None:
+        window = payload.get("window") or self._context_text()
+        if not window:
+            return
+        snippets = []
+        if self._kb is not None:
+            snippets = self._kb.query(window[-1500:], self.cfg.kb_top_k)
+        existing = [p["text"] for p in self.state.talking_points()]
+        system = self._system_prompt("rolling")
+        prompt = self._build_prompt("rolling", None, "", window, snippets, existing=existing)
+        result = self._chat("rolling", system, prompt, temperature=0.0)
+        if result is None:
+            self.log("answers: talking-point refresh failed on all providers")
+            return
+        candidates = parse_point_objects(result.text)
+        if not candidates:
+            return
+        if self.cfg.talking_points_grounded:
+            grounded = [
+                p for p in candidates
+                if grounded_in(p["text"], p["quote"], window,
+                               threshold=self.cfg.talking_points_quote_overlap)
+            ]
+            dropped = len(candidates) - len(grounded)
+            if dropped:
+                self.log("answers: dropped {} ungrounded talking point(s)".format(dropped))
+        else:
+            grounded = candidates
+        grounded = grounded[: max(1, self.cfg.talking_points_max)]
+        if not grounded:
+            return
+        new_points = self._filter_new_points([p["text"] for p in grounded], existing)
+        if not new_points:
+            return
+        sources = [s.source for s in snippets]
+        added = self.state.add_talking_points(
+            [text for text, _vec in new_points], sources=sources, model=result.model)
+        for text, vec in new_points:
+            if vec is not None:
+                self._vec_cache[text] = vec
+        if added:
+            self.log("answers: {} new talking point(s)".format(len(added)))
+
+    def _filter_new_points(self, bullets: List[str],
+                           existing: List[str]) -> List[Tuple[str, Optional[List[float]]]]:
+        out: List[Tuple[str, Optional[List[float]]]] = []
+        known = list(existing)
+        for bullet in bullets:
+            if is_duplicate_point(bullet, known):
+                continue
+            vec = self._embed_one(bullet)
+            if vec is not None and self._too_similar(vec, known):
+                continue
+            out.append((bullet, vec))
+            known.append(bullet)
+        return out
+
+    def _too_similar(self, vec: List[float], known: List[str]) -> bool:
+        if self._embedder is None or self.cfg.point_dedupe_score <= 0:
+            return False
+        for text in known:
+            other = self._vec_cache.get(text)
+            if other is None:
+                other = self._embed_one(text)
+                if other is not None:
+                    self._vec_cache[text] = other
+            if other is not None and _cosine(vec, other) >= self.cfg.point_dedupe_score:
+                return True
         return False
+
+    def _embed_one(self, text: str) -> Optional[List[float]]:
+        if self._embedder is None:
+            return None
+        try:
+            return self._embedder.encode([text])[0]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def summarize(self) -> Optional[Dict[str, Any]]:
+        """End-of-call summary + action items + follow-up email (best effort)."""
+        if (not self.cfg.answers_enabled or not self.cfg.summary_enabled
+                or self._chain is None or not self._chain.entries):
+            return None
+        transcript = self.state.transcript_text().strip()
+        if not transcript:
+            return None
+        points = [p["text"] for p in self.state.talking_points()]
+        qa = self._qa_recent()
+        system = ("You are wrapping up a live call. Produce a concise JSON object with exactly the "
+                  "keys \"summary\" (a short paragraph), \"action_items\" (a list of concrete "
+                  "next steps, including owners when known), and \"follow_up_email\" (a short, "
+                  "professional plain-text email recapping the call). Respond ONLY with JSON.")
+        parts = ["Transcript:\n{}".format(transcript[-12000:])]
+        if points:
+            parts.append("Talking points raised:\n" + "\n".join("- {}".format(p) for p in points[-30:]))
+        if qa:
+            qa_text = "\n\n".join(
+                "Q: {}\nA: {}".format(q.get("question", ""), " / ".join(q.get("bullets") or []))
+                for q in qa[-5:])
+            parts.append("Questions asked during the call:\n" + qa_text)
+        prompt = "\n\n".join(parts)
+        result = self._chat("question", system, prompt,
+                            max_tokens=max(self.cfg.answer_max_tokens, 900),
+                            temperature=0.3, model_override=self.cfg.summary_model)
+        if result is None:
+            self.log("summary: all providers failed")
+            return None
+        summary = parse_summary(result.text)
+        self.state.add("summary", summary=summary)
+        return summary
+
+    def finish(self) -> Optional[Dict[str, Any]]:
+        """Generate the summary before shutdown without ever raising."""
+        try:
+            return self.summarize()
+        except Exception as exc:  # noqa: BLE001
+            self.log("summary failed: {}".format(exc))
+            return None
+
+    def _rewrite_question(self, question: str, context: str) -> str:
+        """Resolve a follow-up question into a self-contained one (cheap model)."""
+        if self._chain is None or not self._chain.entries:
+            return ""
+        entry = self._chain.entries[self._chain_index % len(self._chain.entries)]
+        system = ("Rewrite the follow-up question as a fully self-contained question using the "
+                  "conversation. Keep it short. Reply with only the rewritten question, no quotes "
+                  "or preamble.")
+        user = "Conversation:\n{}\n\nFollow-up question: {}".format(
+            context or "(none)", question)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        est = estimate_tokens(system + user, 80)
+        if not self.budget.can_afford(est):
+            return ""
+        self.budget.reserve(est)
+        try:
+            result = entry["client"].chat(
+                messages, entry["rolling_model"], max_tokens=80, temperature=0.0)
+        except LLMError as exc:
+            self.budget.record(None, None)
+            if exc.status == 429:
+                self.budget.pause(exc.retry_after, reason=str(exc))
+            self.log("answers: question rewrite failed ({}); using original".format(exc))
+            return ""
+        except Exception as exc:  # noqa: BLE001
+            self.log("answers: question rewrite error ({}); using original".format(exc))
+            return ""
+        self.budget.record(result.headers, result.usage)
+        rewritten = (result.text or "").strip().strip('"').strip()
+        return rewritten
 
     def _system_prompt(self, kind: str) -> str:
         if kind == "question":
-            task = ("Answer the most recent question from the conversation. Be accurate and "
-                    "concrete; if the reference notes are relevant, use and cite them.")
+            task = ("Answer the most recent question from the conversation. Use the surrounding "
+                    "conversation (and the earlier Q&A in this call) to resolve references "
+                    "(this, that, it, the other one) and answer the speaker's actual intent, not "
+                    "just the literal words. Ground factual claims in the conversation or the "
+                    "reference notes and cite the file; do not invent specific numbers, names, or "
+                    "integrations. If something is not covered or you are unsure, say so rather "
+                    "than guessing.")
+            schema = '{"bullets": ["..."], "sources": ["file.md"], "follow_up": false}'
+            tail = ("Each bullet must be a single short sentence. Set follow_up true only if this "
+                    "question is a direct follow-up to the previous question. ")
         else:
-            task = ("Surface 3-5 concise, useful talking points or key facts relevant to what "
-                    "is being discussed right now. Prioritize anything that helps the listener "
-                    "contribute. Use the reference notes when relevant and cite them.")
+            task = ("You are a passive note-taker. Summarize ONLY what the speakers actually said "
+                    "in the recent conversation. Use no outside or general knowledge; never invent "
+                    "features, integrations, products, plans, or consequences. Every point must be "
+                    "directly supported by the transcript and must include a short verbatim quote "
+                    "copied from the transcript as evidence. If the conversation is casual, "
+                    "fragmentary, or contains nothing substantive, return an empty bullets list -- "
+                    "that is the correct answer. At most {} points, and never repeat or paraphrase "
+                    "points already shown.".format(max(1, self.cfg.talking_points_max)))
+            schema = '{"bullets": [{"text": "...", "quote": "exact words from the transcript"}]}'
+            tail = "Each text must be a single short sentence. "
         return (
             "You are a live meeting copilot that fills a side panel during a call. "
             + task +
-            " Respond ONLY with JSON of the form "
-            '{"bullets": ["...", "..."], "sources": ["file.md"]}. '
-            "Each bullet must be a single short sentence. No preamble, no markdown."
+            " Respond ONLY with JSON of the form " + schema + ". " + tail +
+            "No preamble, no markdown."
         )
 
-    def _build_prompt(self, kind: str, question: Optional[str], window: str,
-                      snippets: List[Any]) -> str:
+    def _build_prompt(self, kind: str, question: Optional[str], context: str, window: str,
+                      snippets: List[Any], existing: Optional[List[str]] = None,
+                      qa: Optional[List[Dict[str, Any]]] = None) -> str:
         parts: List[str] = []
-        parts.append("Recent conversation:\n{}".format(window[-4000:] or "(none yet)"))
+        parts.append("Conversation so far (most recent last):\n{}".format(window or "(none yet)"))
+        if qa:
+            lines = []
+            for item in qa[-3:]:
+                answer = " / ".join(item.get("bullets") or [])
+                lines.append("Q: {}\nA: {}".format(item.get("question", ""), answer))
+            parts.append("Earlier questions this call:\n" + "\n\n".join(lines))
+        if question and context:
+            parts.append("Turns immediately before the question:\n{}".format(context))
         if snippets:
             notes = []
             for s in snippets:
                 notes.append("[{} — {}] {}".format(s.source, s.heading, s.text[:1200]))
             parts.append("Reference notes:\n" + "\n\n".join(notes))
+        else:
+            parts.append("Reference notes: (none retrieved)")
         if question:
             parts.append("Question to answer: {}".format(question))
+            parts.append("Resolve any references using the conversation above so the answer fits "
+                         "what is actually being discussed. Cite reference notes by filename when "
+                         "you rely on them.")
         else:
-            parts.append("Task: provide the most useful current talking points.")
+            if existing:
+                parts.append("Talking points already shown (do NOT repeat or paraphrase these):\n"
+                             + "\n".join("- {}".format(e) for e in existing[-40:]))
+            parts.append("Only use the conversation above (and the reference notes if present); "
+                         "do not use outside knowledge. Quote the exact transcript words you rely "
+                         "on for each point.")
+            parts.append("Task: add only NEW talking points that were explicitly said in the "
+                         "conversation right now. Return an empty bullets list if there is "
+                         "nothing substantive.")
         return "\n\n".join(parts)

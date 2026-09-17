@@ -9,11 +9,13 @@ start leaves the recording completely unaffected.
 
 from __future__ import annotations
 
+import os
+import secrets
 import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .answers import AnswerEngine
 from .budget import BudgetGovernor
@@ -38,16 +40,21 @@ class LiveSession:
 
         self.state = LiveState()
         self.budget = BudgetGovernor(cfg.budget_tpm, cfg.budget_tpd)
+        self.token = secrets.token_urlsafe(18)
         self.server: Optional[HudServer] = None
         self.stt: Optional[LiveTranscriber] = None
         self.answers: Optional[AnswerEngine] = None
         self._started = False
         self._port = 0
+        self._stop = threading.Event()
+        self._flush_thread: Optional[threading.Thread] = None
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> Optional[int]:
         try:
-            self.server = HudServer(self.state, self.cfg.host, self.cfg.port, self.log)
+            self.server = HudServer(self.state, self.cfg.host, self.cfg.port, self.log,
+                                    token=self.token, on_ask=self._on_ask,
+                                    on_pause=self._on_pause)
             self._port = self.server.start()
         except Exception as exc:  # noqa: BLE001
             self.log("live HUD: HTTP server failed ({}); continuing without HUD".format(exc))
@@ -77,6 +84,11 @@ class LiveSession:
         if self.cfg.open_browser:
             threading.Thread(target=self._open_browser, daemon=True).start()
 
+        if self.cfg.persist_seconds > 0:
+            self._flush_thread = threading.Thread(target=self._flush_loop,
+                                                  name="hud-flush", daemon=True)
+            self._flush_thread.start()
+
         try:
             HUD_URLFILE.write_text(self.url, encoding="utf-8")
         except OSError:
@@ -93,13 +105,22 @@ class LiveSession:
         if not self._started:
             return
         self._started = False
+        self._stop.set()
+        if self._flush_thread is not None:
+            self._flush_thread.join(timeout=2.5)
+        summary = None
+        if self.answers is not None:
+            try:
+                summary = self.answers.finish()
+            except Exception as exc:  # noqa: BLE001
+                self.log("live HUD: summary failed ({})".format(exc))
+        self._persist(summary=summary)
         for component in (self.answers, self.stt):
             if component is not None:
                 try:
                     component.stop()
                 except Exception:  # noqa: BLE001
                     pass
-        self._persist()
         self.state.set_status("stopped")
         try:
             HUD_URLFILE.unlink(missing_ok=True)
@@ -118,7 +139,18 @@ class LiveSession:
 
     @property
     def url(self) -> str:
-        return "http://{}:{}/".format(self.cfg.host, self._port)
+        base = "http://{}:{}/".format(self.cfg.host, self._port)
+        return "{}?token={}".format(base, self.token) if self.token else base
+
+    def _on_ask(self, text: str, expand: bool) -> bool:
+        if self.answers is None:
+            return False
+        return self.answers.ask(text, expand)
+
+    def _on_pause(self, paused: bool) -> None:
+        if self.answers is not None:
+            self.answers.pause(paused)
+        self.state.set_meta(answers_paused=paused)
 
     def _open_browser(self) -> None:
         time.sleep(0.4)
@@ -127,28 +159,62 @@ class LiveSession:
         except Exception:  # noqa: BLE001
             pass
 
-    def _persist(self) -> None:
+    @staticmethod
+    def _atomic_write(path: Path, text: str) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+
+    def _write_outputs(self) -> list:
         derived = self.outdir / "derived"
+        derived.mkdir(parents=True, exist_ok=True)
         written = []
+        transcript = self.state.transcript_text()
+        if transcript:
+            self._atomic_write(derived / "live_transcript.txt", transcript + "\n")
+            written.append("live_transcript.txt")
+        answers = self.state.answers_markdown()
+        if answers:
+            self._atomic_write(derived / "live_answers.md", answers)
+            written.append("live_answers.md")
+        # Interleaved transcript + answers, so each answer sits next to the
+        # speech that prompted it.
+        title = "Live conversation — {} {}".format(
+            self.outdir.parent.name, self.outdir.name)
+        conversation = self.state.timeline_markdown(title=title)
+        if conversation:
+            self._atomic_write(derived / "live_conversation.md", conversation)
+            written.append("live_conversation.md")
+        return written
+
+    def _flush_loop(self) -> None:
+        interval = max(2.0, float(self.cfg.persist_seconds))
+        while not self._stop.wait(interval):
+            try:
+                self._write_outputs()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _write_summary(self, summary: Dict[str, Any]) -> None:
+        derived = self.outdir / "derived"
+        derived.mkdir(parents=True, exist_ok=True)
+        lines = ["# Call summary", "", str(summary.get("summary", "")).strip(), ""]
+        items = [str(i).strip() for i in (summary.get("action_items") or []) if str(i).strip()]
+        if items:
+            lines.append("## Action items")
+            lines.extend("- {}".format(i) for i in items)
+            lines.append("")
+        email = summary.get("follow_up_email")
+        if email:
+            lines.extend(["## Follow-up email", "", "```", str(email).strip(), "```", ""])
+        self._atomic_write(derived / "live_summary.md", "\n".join(lines))
+
+    def _persist(self, summary: Optional[Dict[str, Any]] = None) -> None:
         try:
-            derived.mkdir(parents=True, exist_ok=True)
-            transcript = self.state.transcript_text()
-            if transcript:
-                (derived / "live_transcript.txt").write_text(
-                    transcript + "\n", encoding="utf-8")
-                written.append("live_transcript.txt")
-            answers = self.state.answers_markdown()
-            if answers:
-                (derived / "live_answers.md").write_text(answers, encoding="utf-8")
-                written.append("live_answers.md")
-            # Interleaved transcript + answers, so each answer sits next to the
-            # speech that prompted it.
-            title = "Live conversation — {} {}".format(
-                self.outdir.parent.name, self.outdir.name)
-            conversation = self.state.timeline_markdown(title=title)
-            if conversation:
-                (derived / "live_conversation.md").write_text(conversation, encoding="utf-8")
-                written.append("live_conversation.md")
+            written = self._write_outputs()
+            if summary:
+                self._write_summary(summary)
+                written.append("live_summary.md")
             if written:
                 self.log("Live HUD: wrote derived/{}".format(", ".join(written)))
         except OSError as exc:

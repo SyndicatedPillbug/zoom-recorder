@@ -222,3 +222,98 @@ form (launched via `./settings.py` or the menu bar) that edits the config with
 live model dropdowns, connection tests, and a KB folder picker. It uses a
 one-time token, never exposes stored keys, writes atomically with a backup and
 idle-shuts-down, so it fits the no-persistent-daemon constraint.
+
+## Phase 2.1: context-aware Q&A, talking-point pane, KB enablement
+
+Follow-up work driven by real use of the HUD:
+
+- **Question detection now spans the conversation, not one chunk.** The engine
+  keeps structured, speaker-labelled turns and scans a rolling window
+  (`answers.question_lookback_seconds`, default 90 s), so a question split
+  across STT chunks is still caught. A question is answered once per new turn,
+  with retry-after-cooldown on failure instead of a per-tick hammer.
+- **Real context in the prompt.** The window is rendered as timestamped
+  `[hh:mm:ss] Speaker: …` lines with a larger char budget
+  (`answers.context_max_chars`) and the turns immediately preceding the
+  question, plus an instruction to resolve references (`it`, `that`, `the other
+  one`). Fixes answers that only addressed the literal sentence containing `?`.
+- **Hybrid follow-up resolution.** Short / connector-led / pronoun-heavy
+  questions (`is_ambiguous_question`) get one cheap rewrite call into a
+  self-contained question before the strong model answers. Toggle with
+  `answers.question_rewrite`.
+- **Talking points are their own stream and pane.** Rolling refreshes no longer
+  emit Q&A cards. They append only *new* bullets (server-side normalized +
+  token-overlap dedupe) to a canonical list that survives the event-ring
+  eviction and page reloads. The HUD's right column is now a stacked
+  **Talking points** list over a **Q&A** column.
+- **KB is pluggable and on by default when a backend exists.** Embeddings can
+  come from `sentence-transformers` (local), Ollama (local) or OpenAI (remote),
+  selected by `kb.embed_backend: auto`; vectors are stored/compared in pure
+  Python, so the heavy `torch`/`numpy` stack is no longer required. Retrieval
+  queries on the question plus its context and uses a configurable score floor
+  (`kb.min_score`). The settings GUI and `--kb-embed-backend` expose the choice.
+
+All of the above is covered by `tests/test_hud.py` (`python3 -m unittest
+discover -s tests`).
+
+## Phase 2.2: latency, live-robustness and usefulness pass
+
+Second round of improvements (all except remote multi-speaker diarization,
+source deep-links and a cost meter):
+
+- **Connection reuse.** `LLMClient` now keeps a thread-local `http.client`
+  keep-alive connection per provider instead of a fresh TLS handshake per STT
+  chunk/answer, retrying once on a dropped socket.
+- **STT no longer blocks the audio tap.** Each source has a bounded queue and a
+  dedicated worker; if transcription falls behind, the oldest queued chunk is
+  dropped and a `stt_lag_seconds` metric is published to the HUD. Chunking is
+  phrase-aware (emits on a natural pause after ~6 s, capped at
+  `stt.chunk_seconds`, now 10).
+- **Better transcription.** Chunks are seeded with the previous text plus a
+  `stt.glossary` of names/acronyms, and cross-chunk word de-duplication is now
+  fuzzy (`difflib`) so ASR variants like *roll out*/*rollout* stop duplicating
+  or dropping words.
+- **Detection is decoupled from generation.** A single priority worker answers
+  *all* newly detected questions in order (not just the latest) and coalesces
+  talking-point refreshes; the KB/embedder is built on a side thread so the
+  first answers aren't blocked. The transcript window and preceding turns are
+  snapshotted at enqueue time so a slow call can't drift.
+- **Answer quality.** Prompts now include the last few Q&A pairs, instruct the
+  model to resolve references, ground factual claims in notes and admit
+  uncertainty. Only remote questions are answered by default
+  (`answers.answer_self_questions`); rhetorical questions are skipped; the model
+  flags follow-ups (`parent_id`) so the UI can group them. Talking-point dedupe
+  is lexical **and** semantic via the shared embedder.
+- **Write actions, safely.** The HUD now takes a per-session token (validated on
+  every route, plus a Host check) before exposing `POST /ask` (manual question /
+  expand) and `POST /pause`. The UI gained an Ask box, pause toggle, copy/pin on
+  points and answers, and the STT lag pill.
+- **Crash-safe outputs + wrap-up.** `derived/` is flushed atomically every
+  `hud.persist_seconds` (default 20), and on stop the engine produces
+  `live_summary.md` (summary, action items, follow-up email); `--no-live-summary`
+  opts out. The budget governor now trues its reservation up to actual usage.
+
+## Phase 2.3: talking-point grounding (hallucination fix)
+
+Real-use feedback: with sparse/quirky audio the cheap rolling model invented a
+whole product feature set ("syncs across devices", "Trello/Asana integration")
+from a single sentence. Fixes:
+
+- **Strict prompt.** The rolling task is now "a passive note-taker" that may use
+  *only* what was said, must not use outside knowledge, must supply a verbatim
+  quote per point, and is told that an **empty list is the correct answer** for
+  casual/fragmentary audio. Capped at `talking_points_max` (default 3);
+  temperature 0.0.
+- **Local quote verification.** Response schema is
+  `{"bullets":[{"text","quote"}]}`; `grounded_in()` checks the quote (normalised
+  span, else token overlap ≥ `talking_points_quote_overlap`, default 0.7)
+  against the transcript window and drops unsupported points. No extra API call.
+- **Substance gate.** A refresh only fires once `talking_points_min_new_words`
+  (60) of *new* speech have arrived and the window has
+  `talking_points_min_words` (40) words, so idle/noisy stretches add nothing.
+- **Lighter Q&A rule.** Answers may use general knowledge but must cite notes and
+  not invent specific numbers/names/integrations.
+- All exposed in the settings GUI and covered by `TalkingPointGroundingTests`.
+
+
+

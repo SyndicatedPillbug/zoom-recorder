@@ -31,15 +31,19 @@ with a usable free tier):
 export GROQ_API_KEY=...        # or put it in ~/.config/zoom-recorder/config.json
 ```
 
-To ground answers in your own notes, install the embedding stack in a virtual
-environment (this pulls in `torch`, so keep it out of the system Python):
+To ground answers in your own notes you need an embedding backend. The lightest
+options are a local [Ollama](https://ollama.com) (`ollama pull nomic-embed-text`)
+or an OpenAI key; both are selected automatically under `kb.embed_backend:
+"auto"`. To run embeddings fully locally with `sentence-transformers` instead,
+install it in a virtual environment (this pulls in `torch`, so keep it out of
+the system Python):
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install sentence-transformers
 ```
 
-Without it the HUD still runs, just with no knowledge-base grounding.
+Without any backend the HUD still runs, just with no knowledge-base grounding.
 
 ## Usage
 
@@ -170,10 +174,10 @@ otherwise. Safe to run at any time, including while it's already up.
 
 ### Live transcript + AI answer HUD (`--live`)
 
-`--live` opens a small local two-column window in your browser: **live
-transcript on the left**, **bullet-pointed answers and talking points on the
-right**, generated from both the conversation and a background database of
-`.md` files:
+`--live` opens a small local window in your browser: **live transcript on the
+left**, and on the right a persistent **talking-points** bullet list above a
+**Q&A** column. Both are generated from the conversation and, when configured,
+a background database of `.md` files:
 
 ```bash
 ./zoom_record.py --live                          # Groq STT + Groq answers
@@ -183,13 +187,20 @@ right**, generated from both the conversation and a background database of
 ```
 
 The window is served from `127.0.0.1` (a random free port) and closes when the
-recording stops. Three files are written under `derived/`:
+recording stops. These files are written under `derived/` (flushed every
+`hud.persist_seconds`, default 20, so a crash doesn't lose the session):
 
 | File | Contents |
 | --- | --- |
 | `live_transcript.txt` | The transcript alone (unchanged transcript behaviour) |
 | `live_conversation.md` | Transcript **and** answers interleaved in order, so each answer sits next to the speech that prompted it |
 | `live_answers.md` | Just the AI answers and talking points |
+| `live_summary.md` | End-of-call summary, action items and a follow-up email draft |
+
+The window itself is interactive: type a question in the **Ask** box at the
+bottom of the Q&A pane, click a talking point's **pin** to keep it at the top,
+and **copy** on any point or answer. **Pause answers** stops AI generation while
+the transcript keeps running, and the header shows a live STT **lag** indicator.
 
 **Speaker labels (partial diarization).** Because the mic and the
 system/loopback are captured as *separate channels*, the HUD can attribute
@@ -210,11 +221,23 @@ mixes mic + system into one unlabelled stream as before.
 
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
-energy-gated, chopped into short chunks, and transcribed either by a remote
-OpenAI-compatible endpoint or locally with whisper.cpp. Answers are generated
-on two triggers: immediately when a question is detected, and every ~35 s as
-rolling talking points. Nothing in the HUD can affect the recording — if it
-fails to start, recording proceeds normally.
+energy-gated, chopped into phrase-sized chunks, and queued to per-source STT
+workers (so a slow network call never makes the tap fall behind; if it does,
+the lag is shown and stale audio is dropped to stay live). The transcript is
+either transcribed by a remote OpenAI-compatible endpoint or locally with
+whisper.cpp, seeded with a short context prompt plus a configurable glossary of
+names/acronyms (`stt.glossary`). The HUD then runs two independent streams:
+**questions** are detected across the recent conversation (not just the newest
+chunk) and answered with the stronger model, giving it the surrounding turns,
+the earlier Q&A, and your notes so follow-ups like *"what about the other one?"*
+resolve correctly; **talking points** are refreshed every ~35 s on the cheap
+model and appended, deduplicated (lexically and semantically), to their own
+persistent pane — they never get mixed into the Q&A cards. Talking points are
+strictly **transcript-grounded**: the model must supply a verbatim quote for
+each one, that quote is verified locally, and anything unsupported is dropped.
+A minimum amount of new speech is required before a refresh fires, so sparse or
+noisy audio produces **no** points rather than invented ones. Nothing in the HUD
+can affect the recording — if it fails to start, recording proceeds normally.
 
 **Providers.** All are OpenAI-compatible, so the same client serves each of
 them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
@@ -228,31 +251,56 @@ them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
 | `ollama` | — | ✅ | Fully local; pair with `--stt-backend local` |
 | `local` | ✅ whisper.cpp | — | Private; needs `--model` pointing at a ggml file |
 
-Rolling talking points use the lighter model (`openai/gpt-oss-20b` on Groq)
-while detected questions use the stronger one (`openai/gpt-oss-120b`). The
-budget governor trusts the provider's own rate-limit headers, so it adapts to
-whatever plan you're on; if a daily token cap exists and runs low, rolling
-refreshes are dropped first so question answers keep working. Set `budget.tpm`
-/ `budget.tpd` in the config to impose limits below the provider's.
+Talking points use the lighter model (`openai/gpt-oss-20b` on Groq) while
+detected questions use the stronger one (`openai/gpt-oss-120b`). By default only
+questions from the other party are answered (`answers.answer_self_questions`
+includes your own); rhetorical/backchannel questions are skipped. When a
+follow-up question is ambiguous (short, or full of *it/that/the other one*), one
+extra cheap call first rewrites it into a self-contained question using the
+recent turns; unambiguous questions cost nothing extra. The budget governor
+trusts the provider's own rate-limit headers, so it adapts to whatever plan
+you're on; if a daily token cap exists and runs low, talking-point refreshes are
+dropped first so question answers keep working. Set `budget.tpm` / `budget.tpd`
+in the config to impose limits below the provider's.
 
 **Configuration.** Defaults can be set in `~/.config/zoom-recorder/config.json`
 (keep it `chmod 600`); environment variables always win:```json
 {
-  "stt":     {"backend": "groq", "chunk_seconds": 14},
+  "stt":     {"backend": "groq", "chunk_seconds": 10, "glossary": ["Acme", "Q3"]},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
+               "context_minutes": 5, "question_rewrite": true,
+               "answer_self_questions": false, "summary_enabled": true,
+               "talking_points_grounded": true, "talking_points_max": 3,
                "fallback": ["openrouter", "ollama"]},
-  "kb":      {"dirs": ["~/notes"], "top_k": 5},
-  "hud":     {"port": 0, "open_browser": true},
+  "kb":      {"dirs": ["~/notes"], "top_k": 5, "embed_backend": "auto"},
+  "hud":     {"port": 0, "open_browser": true, "persist_seconds": 20},
   "speakers": {"enabled": true, "self_name": "You", "remote_name": "Others"},
   "api_keys": {"openrouter": "sk-or-..."}
 }
 ```
 
+**Grounding in your notes (knowledge base).** Point `kb.dirs` / `--kb-dir` at a
+folder of `.md` files and the HUD retrieves the few most relevant snippets for
+each answer, citing the file. Embeddings are pluggable via `kb.embed_backend`:
+
+| Backend | Where it runs | Needs |
+| --- | --- | --- |
+| `sentence-transformers` | fully local | `pip install sentence-transformers` (heavy: pulls torch) |
+| `ollama` | fully local | an [Ollama](https://ollama.com) server with an embedding model (`ollama pull nomic-embed-text`) |
+| `openai` | remote | an OpenAI key (`text-embedding-3-small`) |
+| `auto` (default) | picks the first available of the above | — |
+
+The index is cached locally and rebuilt only when files change. With a remote
+embedding backend, note chunks leave the machine; with a local backend or
+`sentence-transformers`, they never do.
+
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your
-`.md` files) is sent to the answer provider. The HUD header always shows the
-egress state. For a fully local setup, use `--stt-backend local` with an
-`ollama` answer backend.
+`.md` files) is sent to the answer provider. If `kb.embed_backend` is `openai`,
+note chunks are also sent to OpenAI to compute embeddings. The HUD header always
+shows the egress state. For a fully local setup, use `--stt-backend local` with
+an `ollama` answer backend and a local embedding backend
+(`sentence-transformers` or `ollama`).
 
 ### Settings GUI
 
@@ -289,14 +337,17 @@ to the **next** recording, since the HUD reads config at session start.
 | `--model PATH` | base.en | Whisper model to use |
 | `--live` | off | Open the live transcript + AI answer HUD |
 | `--live-no-answers` | off | Live transcript only; never call an answer provider |
+| `--no-live-summary` | off | Skip the end-of-call summary/action items/email |
 | `--hud-port N` | random | Port for the local HUD |
 | `--no-hud-browser` | off | Do not auto-open the HUD in a browser |
 | `--stt-backend X` | groq | Live STT backend: `groq` \| `openai` \| `local` |
-| `--stt-chunk-seconds N` | 14 | Live STT chunk length |
+| `--stt-chunk-seconds N` | 10 | Live STT chunk length |
+| `--glossary-term WORD` | none | Name/acronym to bias live transcription (repeatable) |
 | `--answer-backend X` | groq | Answer provider: `groq` \| `openrouter` \| `openai` \| `ollama` |
 | `--answer-interval N` | 35 | Seconds between rolling talking-point refreshes |
 | `--kb-dir PATH` | none | Directory of `.md` files for context (repeatable) |
 | `--kb-top-k N` | 5 | Knowledge-base snippets per answer |
+| `--kb-embed-backend X` | auto | KB embeddings: `auto` \| `sentence-transformers` \| `ollama` \| `openai` |
 | `--kb-reindex` | off | Rebuild the embedding index |
 | `--self-name NAME` | You | Label your microphone audio with this name in the transcript |
 | `--remote-name NAME` | Others | Label the system/loopback audio with this name |

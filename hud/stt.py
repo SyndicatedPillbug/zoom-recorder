@@ -12,8 +12,10 @@ threads, and every failure is caught and reported to the HUD status line.
 
 from __future__ import annotations
 
+import difflib
 import io
 import math
+import queue
 import shutil
 import struct
 import subprocess
@@ -74,6 +76,35 @@ def split_words(text: str) -> List[str]:
     return [w for w in (text or "").split() if w]
 
 
+def _normalize_word(word: str) -> str:
+    return word.lower().strip(".,!?;:\"'()[]")
+
+
+def fuzzy_overlap(prev_words: List[str], new_words: List[str],
+                  max_overlap: int = 12, threshold: float = 0.75) -> int:
+    """Longest run where prev's tail matches new's head, tolerating ASR noise.
+
+    Exact matches are preferred; near-matches (e.g. ``"roll out"`` vs
+    ``"rollout"``, or one word differing in a three-word run) count when the
+    character-level similarity is high enough. Returns the number of overlapped
+    words.
+    """
+    max_k = min(len(prev_words), len(new_words), max_overlap)
+    # Prefer an exact tail/head match so fuzzy matching never over-reaches.
+    for k in range(max_k, 0, -1):
+        a = " ".join(_normalize_word(w) for w in prev_words[-k:])
+        b = " ".join(_normalize_word(w) for w in new_words[:k])
+        if a == b:
+            return k
+    # No exact match: allow a high-similarity near-match (ASR variants).
+    for k in range(max_k, 2, -1):
+        a = " ".join(_normalize_word(w) for w in prev_words[-k:])
+        b = " ".join(_normalize_word(w) for w in new_words[:k])
+        if difflib.SequenceMatcher(None, a, b).ratio() >= threshold:
+            return k
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Chunking
 # --------------------------------------------------------------------------
@@ -87,10 +118,13 @@ class Chunker:
 
     def __init__(self, chunk_seconds: float, min_speech_seconds: float = 0.6,
                  silence_flush_seconds: float = 1.4, silence_db: float = -50.0,
-                 frame_ms: int = 100) -> None:
+                 frame_ms: int = 100, phrase_silence_seconds: float = 0.6,
+                 phrase_min_speech_seconds: float = 6.0) -> None:
         self.chunk_bytes = int(chunk_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.min_speech_bytes = int(min_speech_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.silence_flush_bytes = int(silence_flush_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
+        self.phrase_silence_bytes = int(phrase_silence_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
+        self.phrase_min_bytes = int(phrase_min_speech_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.silence_db = silence_db
         self.frame_bytes = int(frame_ms / 1000.0 * SAMPLE_RATE * SAMPLE_WIDTH)
         self._buf = bytearray()
@@ -129,6 +163,15 @@ class Chunker:
                     pending.clear()
                     self._speech_bytes = 0
                     self._silence_run = 0
+                elif (self.phrase_min_bytes and len(pending) >= self.phrase_min_bytes
+                      and self._silence_run >= self.phrase_silence_bytes):
+                    # A natural phrase pause after enough speech: emit now for
+                    # lower latency without adding a billed STT request (the
+                    # provider bills a 10 s minimum anyway).
+                    out.append(bytes(pending))
+                    pending.clear()
+                    self._speech_bytes = 0
+                    self._silence_run = 0
         return out
 
     def flush(self) -> Optional[bytes]:
@@ -150,9 +193,10 @@ class RemoteSTT:
         self.model = model
         self.log = log
 
-    def transcribe(self, pcm: bytes) -> str:
+    def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> str:
         wav = pcm_to_wav(pcm)
-        result = self.client.transcribe(wav, self.model, filename="chunk.wav")
+        result = self.client.transcribe(wav, self.model, filename="chunk.wav",
+                                        prompt=prompt)
         return result.text
 
 
@@ -207,19 +251,22 @@ class LocalWhisperSTT:
                 time.sleep(0.15)
         self.log("local STT: whisper-server on port {}".format(port))
 
-    def transcribe(self, pcm: bytes) -> str:
+    def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> str:
         wav = pcm_to_wav(pcm)
         if self._server is not None and self._port is not None:
             try:
-                return self._server_transcribe(wav)
+                return self._server_transcribe(wav, prompt)
             except Exception as exc:  # noqa: BLE001
                 self.log("local STT: server request failed ({}); using whisper-cli".format(exc))
-        return self._cli_transcribe(wav)
+        return self._cli_transcribe(wav, prompt)
 
-    def _server_transcribe(self, wav: bytes) -> str:
+    def _server_transcribe(self, wav: bytes, prompt: Optional[str] = None) -> str:
         from .llm import _encode_multipart  # reuse encoder
+        fields = {"response_format": "json", "temperature": "0.0"}
+        if prompt:
+            fields["prompt"] = prompt
         body, content_type = _encode_multipart(
-            {"response_format": "json", "temperature": "0.0"},
+            fields,
             [("file", "chunk.wav", "audio/wav", wav)],
         )
         import urllib.request
@@ -231,7 +278,7 @@ class LocalWhisperSTT:
             obj = json.loads(resp.read().decode("utf-8"))
         return (obj.get("text") or "").strip()
 
-    def _cli_transcribe(self, wav: bytes) -> str:
+    def _cli_transcribe(self, wav: bytes, prompt: Optional[str] = None) -> str:
         if not self._cli:
             raise RuntimeError("no local whisper binary available")
         with tempfile.TemporaryDirectory(prefix="zoomrec_stt_") as tmp:
@@ -240,6 +287,8 @@ class LocalWhisperSTT:
             wav_path.write_bytes(wav)
             cmd = [self._cli, "-m", str(self.model), "-f", str(wav_path),
                    "-otxt", "-of", str(out_base), "-np"]
+            if prompt:
+                cmd += ["--prompt", prompt]
             subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             out_file = out_base.with_suffix(".txt")
             if out_file.is_file():
@@ -265,9 +314,11 @@ class LocalWhisperSTT:
 class _Source:
     """One independent audio source (mic or system/loopback).
 
-    Each source gets its own ffmpeg tap, chunker and transcription thread, so
-    speech can be attributed to the channel it arrived on -- no diarization
-    model needed for the two-party case.
+    Each source gets its own ffmpeg tap, chunker, a bounded queue and a
+    dedicated transcription worker, so a slow network call never blocks reading
+    audio (which would make the tap drift behind real time). Speech can also be
+    attributed to the channel it arrived on -- no diarization model needed for
+    the two-party case.
     """
 
     def __init__(self, speaker: Optional[str], cmd: List[str]) -> None:
@@ -275,7 +326,12 @@ class _Source:
         self.cmd = cmd
         self.proc: Optional[subprocess.Popen] = None
         self.thread: Optional[threading.Thread] = None
+        self.worker: Optional[threading.Thread] = None
+        self.queue: "queue.Queue" = queue.Queue(maxsize=4)
         self.tail: List[str] = []
+        self.context_tail = ""
+        self.dropped = 0
+        self.transcribed = 0
 
 
 class LiveTranscriber:
@@ -291,6 +347,7 @@ class LiveTranscriber:
         self._stop = threading.Event()
         self._sources: List[_Source] = []
         self._stt: object = None
+        self._glossary = [g for g in getattr(cfg, "stt_glossary", []) if g]
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -308,9 +365,17 @@ class LiveTranscriber:
             return
 
         label = " + ".join(s.speaker or "mixed" for s in self._sources)
-        self.log("live STT running ({} backend, {:.0f}s chunks, sources: {})".format(
-            self.cfg.stt_backend, self.cfg.stt_chunk_seconds, label))
+        self.log("live STT running ({} backend, {:.0f}s chunks, {} queue, sources: {})".format(
+            self.cfg.stt_backend, self.cfg.stt_chunk_seconds,
+            getattr(self.cfg, "stt_queue_chunks", 4), label))
+        if self._glossary:
+            self.log("live STT glossary: {}".format(", ".join(self._glossary)))
         for source in self._sources:
+            source.queue = queue.Queue(maxsize=max(1, int(getattr(self.cfg, "stt_queue_chunks", 4))))
+            source.worker = threading.Thread(
+                target=self._stt_worker, args=(source,),
+                name="hud-stt-work-{}".format(source.speaker or "mix"), daemon=True)
+            source.worker.start()
             source.thread = threading.Thread(
                 target=self._run_source, args=(source,),
                 name="hud-stt-{}".format(source.speaker or "mix"), daemon=True)
@@ -332,6 +397,21 @@ class LiveTranscriber:
         for source in self._sources:
             if source.thread is not None:
                 source.thread.join(timeout=8.0)
+        for source in self._sources:
+            try:
+                source.queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    source.queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    source.queue.put_nowait(None)
+                except queue.Full:
+                    pass
+        for source in self._sources:
+            if source.worker is not None:
+                source.worker.join(timeout=8.0)
         closer = getattr(self._stt, "close", None)
         if callable(closer):
             try:
@@ -410,10 +490,10 @@ class LiveTranscriber:
         try:
             for block in self._iter_blocks(source.proc.stdout):
                 for chunk in chunker.feed(block):
-                    self._transcribe_chunk(chunk, source)
+                    self._enqueue(source, chunk)
             tail = chunker.flush()
             if tail:
-                self._transcribe_chunk(tail, source)
+                self._enqueue(source, tail)
         except Exception as exc:  # noqa: BLE001
             self.log("live transcription loop stopped ({}): {}".format(
                 source.speaker or "mixed", exc))
@@ -425,12 +505,65 @@ class LiveTranscriber:
                 return
             yield data
 
-    def _transcribe_chunk(self, chunk: bytes, source: "_Source") -> None:
+    def _enqueue(self, source: _Source, chunk: bytes) -> None:
+        if self._stop.is_set():
+            return
+        item = (time.time(), chunk)
+        try:
+            source.queue.put_nowait(item)
+        except queue.Full:
+            # Backpressure: drop the oldest queued chunk so the tap stays live
+            # rather than drifting further and further behind.
+            try:
+                source.queue.get_nowait()
+            except queue.Empty:
+                pass
+            source.dropped += 1
+            try:
+                source.queue.put_nowait(item)
+            except queue.Full:
+                pass
+        self._publish_lag()
+
+    def _publish_lag(self) -> None:
+        queued = sum(s.queue.qsize() for s in self._sources)
+        dropped = sum(s.dropped for s in self._sources)
+        lag = round(queued * self.cfg.stt_chunk_seconds, 1)
+        self.state.set_meta(stt_lag_seconds=lag, stt_queued=queued,
+                            stt_dropped=dropped)
+
+    def _stt_worker(self, source: _Source) -> None:
+        while not self._stop.is_set():
+            try:
+                item = source.queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            captured_at, chunk = item
+            self._transcribe_chunk(chunk, source, captured_at)
+
+    def _prompt_for(self, source: _Source) -> Optional[str]:
+        parts: List[str] = []
+        if self._glossary:
+            parts.append(", ".join(self._glossary))
+        if source.context_tail:
+            parts.append(source.context_tail)
+        prompt = " ".join(parts).strip()
+        # Whisper prompts are short; keep well inside the token budget.
+        return prompt[-600:] if prompt else None
+
+    def _transcribe_chunk(self, chunk: bytes, source: "_Source",
+                          captured_at: Optional[float] = None) -> None:
         if self._stop.is_set():
             return
         started = time.time()
+        prompt = self._prompt_for(source)
         try:
-            text = self._stt.transcribe(chunk)  # type: ignore[attr-defined]
+            try:
+                text = self._stt.transcribe(chunk, prompt=prompt)  # type: ignore[attr-defined]
+            except TypeError:
+                text = self._stt.transcribe(chunk)  # type: ignore[attr-defined]
         except LLMError as exc:
             self.log("STT error: {}".format(exc))
             self.state.add("status", status="recording", stt_error=str(exc))
@@ -440,17 +573,22 @@ class LiveTranscriber:
             return
         if not text:
             return
+        source.context_tail = (source.context_tail + " " + text).strip()[-200:]
+        source.transcribed += 1
         delta = self._delta_text(source, text)
         if delta:
             self.state.add("transcript", text=delta, source="live",
                            speaker=source.speaker,
                            latency=round(time.time() - started, 2))
+        if captured_at is not None:
+            self.state.set_meta(
+                stt_lag_seconds=round(max(0.0, time.time() - captured_at), 1))
 
     def _delta_text(self, source: "_Source", text: str) -> str:
         words = split_words(text)
         if not words:
             return ""
-        k = overlap_suffix_prefix(source.tail, words)
+        k = fuzzy_overlap(source.tail, words)
         new_words = words[k:]
         source.tail = (source.tail + new_words)[-12:]
         return " ".join(new_words)

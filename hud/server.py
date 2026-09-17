@@ -9,6 +9,7 @@ so it never competes with the recorder's main loop.
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from .state import LiveState
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -28,6 +30,9 @@ class _Handler(BaseHTTPRequestHandler):
     # injected by HudServer
     state: LiveState
     logger: Optional[Callable[[str], None]] = None
+    token: str = ""
+    on_ask: Optional[Callable[[str, bool], bool]] = None
+    on_pause: Optional[Callable[[bool], None]] = None
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         if self.logger:
@@ -35,6 +40,27 @@ class _Handler(BaseHTTPRequestHandler):
                 self.logger("hud: " + (fmt % args))
             except Exception:  # noqa: BLE001
                 pass
+
+    # -- guards ------------------------------------------------------------
+    def _host_ok(self) -> bool:
+        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        return host in ALLOWED_HOSTS
+
+    def _token_ok(self, parsed: Any) -> bool:
+        if not self.token:
+            return True
+        query = parse_qs(parsed.query)
+        provided = (query.get("token", [""])[0]
+                    or self.headers.get("X-Auth-Token", ""))
+        return secrets.compare_digest(provided, self.token)
+
+    def _reject(self, code: int, message: str) -> None:
+        payload = json.dumps({"ok": False, "error": message}).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     # -- helpers -----------------------------------------------------------
     def _send_json(self, obj: Any, status: int = 200) -> None:
@@ -59,9 +85,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _read_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+            return obj if isinstance(obj, dict) else {}
+        except ValueError:
+            return {}
+
     # -- routes ------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if not self._host_ok() or not self._token_ok(parsed):
+            self._reject(403, "forbidden")
+            return
         path = parsed.path
         if path in ("/", "/index.html"):
             self._send_file(STATIC_DIR / "hud.html", "text/html; charset=utf-8")
@@ -82,6 +125,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._stream_events(parsed)
         elif path == "/health":
             self._send_json({"ok": True, "status": self.state.status})
+        else:
+            self.send_error(404, "not found")
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if not self._host_ok() or not self._token_ok(parsed):
+            self._reject(403, "forbidden")
+            return
+        body = self._read_body()
+        if parsed.path == "/ask":
+            text = str(body.get("text") or "").strip()
+            expand = bool(body.get("expand"))
+            ok = bool(self.on_ask and text and self.on_ask(text, expand))
+            self._send_json({"ok": ok})
+        elif parsed.path == "/pause":
+            paused = bool(body.get("paused", True))
+            if self.on_pause:
+                self.on_pause(paused)
+            self._send_json({"ok": True, "paused": paused})
         else:
             self.send_error(404, "not found")
 
@@ -127,16 +189,29 @@ class _Handler(BaseHTTPRequestHandler):
 
 class HudServer:
     def __init__(self, state: LiveState, host: str = "127.0.0.1", port: int = 0,
-                 log: Optional[Callable[[str], None]] = None) -> None:
+                 log: Optional[Callable[[str], None]] = None, token: str = "",
+                 on_ask: Optional[Callable[[str, bool], bool]] = None,
+                 on_pause: Optional[Callable[[bool], None]] = None) -> None:
         self.state = state
         self.host = host
         self.port = port
         self.log = log
+        self.token = token
+        self.on_ask = on_ask
+        self.on_pause = on_pause
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> int:
-        handler = type("_BoundHandler", (_Handler,), {"state": self.state, "logger": self.log})
+        # Wrap callables in staticmethod so assigning them as class attributes
+        # does not turn them into bound methods (which would pass `self`).
+        handler = type("_BoundHandler", (_Handler,), {
+            "state": self.state,
+            "logger": staticmethod(self.log) if self.log else None,
+            "token": self.token,
+            "on_ask": staticmethod(self.on_ask) if self.on_ask else None,
+            "on_pause": staticmethod(self.on_pause) if self.on_pause else None,
+        })
         self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
@@ -149,7 +224,8 @@ class HudServer:
 
     @property
     def url(self) -> str:
-        return "http://{}:{}/".format(self.host, self.port)
+        base = "http://{}:{}/".format(self.host, self.port)
+        return "{}?token={}".format(base, self.token) if self.token else base
 
     def stop(self) -> None:
         if self._httpd is not None:

@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """Background knowledge base: chunk ``.md`` files and retrieve relevant context.
 
-Embeddings are computed locally with ``sentence-transformers`` so the knowledge
-base itself never leaves the machine -- only the few retrieved snippets that are
-relevant to the conversation get folded into the answer prompt. The imports are
-lazy: if the embedding stack is not installed (it needs a separate venv on
-Python 3.9), the HUD simply runs without KB grounding.
+Chunking is dependency-free. Embeddings come from a pluggable backend:
+
+  * ``sentence-transformers`` -- fully local (needs the extra package);
+  * ``ollama`` -- local embeddings over its OpenAI-compatible endpoint;
+  * ``openai`` -- remote embeddings using the configured key.
+
+Vectors are stored and compared in pure Python (no numpy), so the KB works with
+any of the above and the retrieved snippets -- never the whole corpus -- are the
+only notes that join an answer prompt.
 """
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -95,8 +101,9 @@ def _iter_markdown_files(dirs: List[str]):
                 yield path
 
 
-def _fingerprint(files: List[Path]) -> str:
+def _fingerprint(files: List[Path], salt: str = "") -> str:
     h = hashlib.sha256()
+    h.update(salt.encode("utf-8"))
     for path in sorted(files):
         try:
             stat = path.stat()
@@ -106,6 +113,53 @@ def _fingerprint(files: List[Path]) -> str:
         h.update(str(int(stat.st_mtime)).encode())
         h.update(str(stat.st_size).encode())
     return h.hexdigest()
+
+
+def _norm(vector: List[float]) -> float:
+    return math.sqrt(sum(x * x for x in vector))
+
+
+def _dot(a: List[float], b: List[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+# --------------------------------------------------------------------------
+# Embedding backends
+# --------------------------------------------------------------------------
+class LocalEmbedder:
+    """sentence-transformers, fully on-device."""
+
+    def __init__(self, model_name: str) -> None:
+        from sentence_transformers import SentenceTransformer  # lazy, optional
+
+        self.model = SentenceTransformer(model_name)
+        self.model_name = model_name
+        self.label = "sentence-transformers:{}".format(model_name)
+
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        vectors = self.model.encode(
+            list(texts), normalize_embeddings=True, batch_size=32,
+            show_progress_bar=False)
+        return [[float(x) for x in v] for v in vectors]
+
+
+class RemoteEmbedder:
+    """Embeddings over an OpenAI-compatible ``/embeddings`` endpoint."""
+
+    def __init__(self, client, model: str, name: str = "remote",
+                 batch_size: int = 64) -> None:
+        self.client = client
+        self.model_name = model
+        self.label = "{}:{}".format(name, model)
+        self.batch_size = batch_size
+
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        out: List[List[float]] = []
+        items = list(texts)
+        for start in range(0, len(items), self.batch_size):
+            batch = items[start:start + self.batch_size]
+            out.extend(self.client.embed(batch, self.model_name))
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -120,50 +174,31 @@ class KBSnippet:
 
 
 class KBIndex:
-    def __init__(self, dirs: List[str], model_name: str = "all-MiniLM-L6-v2",
-                 cache_dir: Optional[str] = None,
-                 log: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, dirs: List[str], embedder, cache_dir: Optional[str] = None,
+                 log: Optional[Callable[[str], None]] = None,
+                 min_score: float = 0.1) -> None:
         self.dirs = [d for d in dirs if d]
-        self.model_name = model_name
+        self.embedder = embedder
         self.cache_dir = Path(os.path.expanduser(cache_dir)) if cache_dir else DEFAULT_CACHE
         self.log = log or (lambda _m: None)
-        self._model = None
+        self.min_score = min_score
         self._chunks: List[Dict[str, str]] = []
-        self._vectors = None
+        self._vectors: List[List[float]] = []
         self._ready = False
-        self._error = ""
-
-    # -- availability ------------------------------------------------------
-    def available(self) -> bool:
-        return self._load_deps()
-
-    def _load_deps(self) -> bool:
-        if self._model is not None:
-            return True
-        try:
-            import sentence_transformers  # noqa: F401
-            import numpy  # noqa: F401
-        except Exception as exc:  # noqa: BLE001
-            self._error = "sentence-transformers not installed ({})".format(exc)
-            self.log("KB disabled: {}".format(self._error))
-            return False
-        return True
 
     # -- build -------------------------------------------------------------
     def build(self, force: bool = False) -> bool:
         if not self.dirs:
             return False
-        if not self._load_deps():
-            return False
         files = list(_iter_markdown_files(self.dirs))
         if not files:
             self.log("KB: no markdown files found in {}".format(", ".join(self.dirs)))
             return False
-        fingerprint = _fingerprint(files)
-        cache_file = self.cache_dir / "index.npz"
+        fingerprint = _fingerprint(files, salt=getattr(self.embedder, "label", ""))
         meta_file = self.cache_dir / "index.json"
-        if not force and cache_file.is_file() and meta_file.is_file():
-            if self._load_cache(cache_file, meta_file, fingerprint):
+        vectors_file = self.cache_dir / "vectors.json.gz"
+        if not force and meta_file.is_file() and vectors_file.is_file():
+            if self._load_cache(meta_file, vectors_file, fingerprint):
                 self._ready = True
                 return True
 
@@ -177,45 +212,45 @@ class KBIndex:
         if not chunks:
             return False
         try:
-            import numpy as np
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer(self.model_name)
-            vectors = model.encode(
-                [c["text"] for c in chunks],
-                normalize_embeddings=True, batch_size=32, show_progress_bar=False,
-            )
-            vectors = np.asarray(vectors, dtype="float32")
+            vectors = self.embedder.encode([c["text"] for c in chunks])
         except Exception as exc:  # noqa: BLE001
             self.log("KB: failed to embed ({}); continuing without KB".format(exc))
             return False
+        if len(vectors) != len(chunks):
+            self.log("KB: embedding count mismatch ({} != {}); skipping KB".format(
+                len(vectors), len(chunks)))
+            return False
 
-        self._model = model
         self._chunks = chunks
         self._vectors = vectors
         self._ready = True
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(cache_file, vectors=vectors)
             meta_file.write_text(json.dumps(
-                {"fingerprint": fingerprint, "model": self.model_name,
+                {"fingerprint": fingerprint,
+                 "embedder": getattr(self.embedder, "label", ""),
                  "chunks": chunks}), encoding="utf-8")
+            with gzip.open(vectors_file, "wt", encoding="utf-8") as fh:
+                json.dump(vectors, fh)
         except OSError as exc:
             self.log("KB: could not write cache ({})".format(exc))
-        self.log("KB: indexed {} chunk(s) from {} file(s)".format(len(chunks), len(files)))
+        self.log("KB: indexed {} chunk(s) from {} file(s) [{}]".format(
+            len(chunks), len(files), getattr(self.embedder, "label", "?")))
         return True
 
-    def _load_cache(self, cache_file: Path, meta_file: Path, fingerprint: str) -> bool:
+    def _load_cache(self, meta_file: Path, vectors_file: Path, fingerprint: str) -> bool:
         try:
-            import numpy as np
-            from sentence_transformers import SentenceTransformer
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            if meta.get("fingerprint") != fingerprint or meta.get("model") != self.model_name:
+            if meta.get("fingerprint") != fingerprint:
                 return False
-            vectors = np.load(cache_file)["vectors"]
-            self._model = SentenceTransformer(self.model_name)
+            with gzip.open(vectors_file, "rt", encoding="utf-8") as fh:
+                vectors = json.load(fh)
             self._chunks = meta.get("chunks") or []
             self._vectors = vectors
-            self.log("KB: loaded cached index ({} chunks)".format(len(self._chunks)))
+            if len(self._vectors) != len(self._chunks):
+                return False
+            self.log("KB: loaded cached index ({} chunks, {})".format(
+                len(self._chunks), getattr(self.embedder, "label", "?")))
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -225,23 +260,33 @@ class KBIndex:
         if not self._ready or not text.strip():
             return []
         try:
-            import numpy as np
-            vec = self._model.encode([text], normalize_embeddings=True)  # type: ignore[union-attr]
-            vec = np.asarray(vec, dtype="float32")
-            scores = (self._vectors @ vec.T).reshape(-1)  # type: ignore[operator]
-            order = scores.argsort()[::-1][: max(1, top_k)]
-            out: List[KBSnippet] = []
-            for idx in order:
-                if scores[idx] <= 0.1:
-                    continue
-                chunk = self._chunks[int(idx)]
-                out.append(KBSnippet(
-                    source=Path(chunk["source"]).name,
-                    heading=chunk.get("heading", ""),
-                    text=chunk["text"],
-                    score=float(scores[idx]),
-                ))
-            return out
+            query_vec = self.embedder.encode([text])[0]
         except Exception as exc:  # noqa: BLE001
             self.log("KB query failed: {}".format(exc))
             return []
+        qnorm = _norm(query_vec)
+        if not qnorm:
+            return []
+
+        scored: List["tuple[float, int]"] = []
+        for idx, vec in enumerate(self._vectors):
+            norm = _norm(vec)
+            if not norm:
+                continue
+            score = _dot(query_vec, vec) / (qnorm * norm)
+            if score > self.min_score:
+                scored.append((score, idx))
+        scored.sort(reverse=True)
+
+        out: List[KBSnippet] = []
+        for score, idx in scored[: max(1, top_k)]:
+            if idx >= len(self._chunks):
+                continue
+            chunk = self._chunks[int(idx)]
+            out.append(KBSnippet(
+                source=Path(chunk["source"]).name,
+                heading=chunk.get("heading", ""),
+                text=chunk["text"],
+                score=float(score),
+            ))
+        return out
