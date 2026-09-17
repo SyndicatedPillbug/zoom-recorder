@@ -642,10 +642,17 @@ class LiveTranscriber:
         chunker = Chunker(self.cfg.stt_chunk_seconds, self.cfg.stt_min_speech_seconds,
                           vad=source.vad)
         assert source.proc.stdout is not None
+        last_publish = 0.0
         try:
             for block in self._iter_blocks(source.proc.stdout):
                 for chunk in chunker.feed(block):
                     self._enqueue(source, chunk, chunker.last_margin_db)
+                # Publish the live level even when the gate is rejecting
+                # everything, so the HUD can show why nothing is transcribed.
+                now = time.time()
+                if now - last_publish >= 2.0:
+                    last_publish = now
+                    self._publish_lag()
             tail = chunker.flush()
             if tail:
                 self._enqueue(source, tail, chunker.last_margin_db)
