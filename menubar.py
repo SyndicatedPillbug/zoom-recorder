@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-keystroke-equivalent activation: a menu-bar toggle for zoom_record.py.
+"""Menu-bar app for zoom-recorder.
 
 No background daemon watches for calls or auto-arms itself -- per the
 2026-09-16 decision, a persistent process with silent mic access and file
@@ -7,10 +7,11 @@ writes is exactly what an EDR (Falcon) is tuned to flag, and it's a consent
 risk if it ever records something it shouldn't. This app only exists, visibly,
 in the menu bar; the recorder subprocess only exists while you're actually
 recording, and the icon always shows which state you're in (🎙 idle,
-🔴 recording, 🧠 HUD recording with the live window up).
+🔴 recording, 🧠 recording with the transcript window up).
 
-The menu gives the live HUD its own distinct options: "Start with Live HUD"
-and "Open Live HUD…", separate from the plain "Start Recording" toggle.
+The menu is written for non-technical users: Volume (with the live level),
+Start/Stop recording (with a timer), Open transcript window, My recordings,
+Check my audio setup, Settings, Help, and Play sound through.
 
 Usage:
     pip3 install --user rumps
@@ -38,12 +39,26 @@ PIDFILE = Path.home() / ".zoom_recorder.pid"
 HUD_URLFILE = Path.home() / ".zoom_recorder_hud.url"
 SETTINGS_PIDFILE = Path.home() / ".zoom_recorder_settings.pid"
 SETTINGS_URLFILE = Path.home() / ".zoom_recorder_settings.url"
+CONTROL_PIDFILE = Path.home() / ".zoom_recorder_control.pid"
+CONTROL_URLFILE = Path.home() / ".zoom_recorder_control.url"
 
 IDLE_TITLE = "🎙"
 
 
+def live_transcript_available() -> bool:
+    """True when a live transcript backend is configured (local or a key)."""
+    try:
+        from hud.config import load_config
+        cfg = load_config()
+        if cfg.provider_for_stt() is None:
+            return True  # local backend
+        return bool(cfg.api_key_for(cfg.stt_backend))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def audio_menu_specs(outputs, paired):
-    """Pure spec for the "Audio Out" dropdown: [(label, device_name_or_None)].
+    """Pure spec for the "Play sound through" dropdown: [(label, device_name)].
 
     label None means a separator; device_name None means "Rebuild Routing".
     """
@@ -108,13 +123,22 @@ class RecorderApp(rumps.App):
         # Volume is deliberately the first top-level item so the current
         # level is visible at all times (its title carries the percentage).
         self.volume_item = rumps.MenuItem("Volume")
-        self.toggle_item = rumps.MenuItem("Start Recording", callback=self.toggle)
-        self.live_item = rumps.MenuItem("Start with Live HUD", callback=self.start_live)
-        self.open_hud_item = rumps.MenuItem("Open Live HUD…", callback=self.open_hud)
-        self.settings_item = rumps.MenuItem("Settings…", callback=self.open_settings)
-        self.audio_item = rumps.MenuItem("Audio Out")
-        self.menu = [self.volume_item, self.toggle_item, self.live_item, None,
-                     self.open_hud_item, self.settings_item, self.audio_item]
+        self.toggle_item = rumps.MenuItem("Start recording", callback=self.toggle)
+        self.live_item = rumps.MenuItem("Start with live transcript", callback=self.start_live)
+        self.open_hud_item = rumps.MenuItem("Open transcript window", callback=self.open_hud)
+        self.recordings_item = rumps.MenuItem("My recordings…",
+                                              callback=lambda _s: self.open_control("recordings"))
+        self.setup_item = rumps.MenuItem("Check my audio setup…",
+                                         callback=lambda _s: self.open_control("setup"))
+        self.settings_item = rumps.MenuItem("Settings…",
+                                            callback=lambda _s: self.open_control("settings"))
+        self.help_item = rumps.MenuItem("Help",
+                                        callback=lambda _s: self.open_control("help"))
+        self.audio_item = rumps.MenuItem("Play sound through")
+        self.menu = [self.volume_item, self.toggle_item, self.live_item,
+                     self.open_hud_item, None,
+                     self.recordings_item, self.setup_item, self.settings_item,
+                     self.help_item, None, self.audio_item]
         self._audio_sig = None
         self._volume_value = None
         self._volume_muted = None
@@ -127,8 +151,16 @@ class RecorderApp(rumps.App):
         return HUD_URLFILE.is_file() and _read_pidfile() is not None
 
     def _sync_ui(self) -> None:
-        recording = _read_pidfile() is not None
-        state = describe(recording, self._hud_active())
+        pid = _read_pidfile()
+        recording = pid is not None
+        elapsed = 0.0
+        if recording:
+            try:
+                elapsed = max(0.0, time.time() - PIDFILE.stat().st_mtime)
+            except OSError:
+                elapsed = 0.0
+        state = describe(recording, self._hud_active(), elapsed_s=elapsed,
+                         live_available=live_transcript_available())
         self.title = state["icon"]
         self.toggle_item.title = state["toggle_title"]
         self.live_item.title = state["live_title"]
@@ -136,6 +168,31 @@ class RecorderApp(rumps.App):
         self.open_hud_item.set_callback(self.open_hud if state["open_enabled"] else None)
         self._sync_volume_if_changed()
         self._sync_audio_menu()
+
+    def open_control(self, tab: str) -> None:
+        """Open the Control Center (Setup/Recordings/Settings/Help).
+
+        Reuses a running instance when there is one; otherwise starts it in
+        the background (it shuts itself down when idle).
+        """
+        pid = _read_pidfile(CONTROL_PIDFILE)
+        if pid is not None and CONTROL_URLFILE.is_file():
+            url = CONTROL_URLFILE.read_text(encoding="utf-8").strip()
+            if url:
+                from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+                parts = urlsplit(url)
+                token = (parse_qs(parts.query).get("token") or [""])[0]
+                target = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                     urlencode({"token": token, "tab": tab}), ""))
+                subprocess.Popen(["open", target])
+                return
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "hud.control", "--tab", tab],
+                cwd=str(SCRIPT_DIR),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            rumps.notification("zoom-recorder", "Could not open the window", str(exc))
 
     def _read_volume(self):
         try:
@@ -242,7 +299,7 @@ class RecorderApp(rumps.App):
             else:
                 entries.append(rumps.MenuItem(label, callback=self._pair_output))
         entries.append(None)
-        entries.append(rumps.MenuItem("Restore Normal Routing…",
+        entries.append(rumps.MenuItem("Reset audio…",
                                       callback=self.restore_routing))
         populate_submenu(self.audio_item, entries)
 
@@ -352,27 +409,6 @@ class RecorderApp(rumps.App):
             subprocess.Popen(["open", "-a", "Audio MIDI Setup"])
         rumps.notification("zoom-recorder", "Audio routing", detail)
 
-    def open_settings(self, _sender) -> None:
-        if _read_pidfile(SETTINGS_PIDFILE) is None:
-            try:
-                subprocess.Popen([sys.executable, str(SETTINGS)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except OSError as exc:
-                rumps.notification("zoom-recorder", "Settings failed to start", str(exc))
-                return
-        threading.Thread(target=self._open_settings_when_ready, daemon=True).start()
-
-    def _open_settings_when_ready(self) -> None:
-        for _ in range(50):
-            if SETTINGS_URLFILE.is_file():
-                url = SETTINGS_URLFILE.read_text(encoding="utf-8").strip()
-                if url:
-                    subprocess.Popen(["open", url])
-                    return
-            time.sleep(0.1)
-        rumps.notification("zoom-recorder", "Settings",
-                           "Settings window did not start; run ./settings.py")
-
     def _start(self, live: bool = False) -> None:
         args = [sys.executable, str(RECORDER)]
         extra = os.environ.get("ZOOM_RECORDER_ARGS")
@@ -383,7 +419,8 @@ class RecorderApp(rumps.App):
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         PIDFILE.write_text(str(proc.pid))
         rumps.notification("zoom-recorder", "Recording started",
-                           "Live HUD enabled" if live else "")
+                           "Open the transcript window from the 🎙 menu"
+                           if live else "Click 🎙 again to stop")
 
     def _stop(self, pid: int) -> None:
         try:
@@ -391,12 +428,14 @@ class RecorderApp(rumps.App):
         except ProcessLookupError:
             pass
         PIDFILE.unlink(missing_ok=True)
-        rumps.notification("zoom-recorder", "Recording stopped", "Merging and verifying...")
+        rumps.notification("zoom-recorder", "Saved",
+                           "Your recording and transcript are in My recordings")
 
-    @rumps.timer(5)
+    @rumps.timer(1)
     def _poll(self, _sender) -> None:
         # Catches the recorder exiting on its own (crash, no usable mic, etc.)
-        # so the icon doesn't lie about whether we're actually recording.
+        # so the icon doesn't lie about whether we're actually recording. Also
+        # keeps the elapsed timer in the toggle title ticking.
         self._sync_ui()
 
 
@@ -404,6 +443,9 @@ if __name__ == "__main__":
     app = RecorderApp()
     print("zoom-recorder menubar started (pid {}); menu: {}".format(
         os.getpid(),
-        " | ".join([app.toggle_item.title, app.live_item.title,
-                    app.open_hud_item.title, app.settings_item.title])), flush=True)
+        " | ".join([app.volume_item.title, app.toggle_item.title,
+                    app.live_item.title, app.open_hud_item.title,
+                    app.recordings_item.title, app.setup_item.title,
+                    app.settings_item.title, app.help_item.title,
+                    app.audio_item.title])), flush=True)
     app.run()

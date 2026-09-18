@@ -18,13 +18,27 @@ PYTHON3="$(command -v python3)"
 LOG_DIR="$HOME/Library/Logs"
 UID_NUM="$(id -u)"
 DRY_RUN=0
+DISABLE=0
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
+    --disable) DISABLE=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$DISABLE" == "1" ]]; then
+  echo "Disabling login autostart for $LABEL..."
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "  [dry-run] launchctl bootout gui/$UID_NUM/$LABEL; rm -f $PLIST"
+  else
+    launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "Removed $PLIST (your settings and recordings are untouched)."
+  fi
+  exit 0
+fi
 
 if [[ ! -x "$PYTHON3" ]]; then
   echo "ERROR: python3 not found on PATH." >&2

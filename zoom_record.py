@@ -186,6 +186,7 @@ class Config:
     outdir: Path
     workdir: Path
     system_capture: str = "auto"  # resolved: "tap" | "loopback"
+    record_mic: bool = True       # False for system-only recordings
 
 
 def fmt_db(value: Optional[float]) -> str:
@@ -388,37 +389,46 @@ def _warn_system(log: Log, chosen: Optional[Candidate]) -> None:
                      "(or use the menu-bar app: Fix Audio Routing).")
 
 
-def build_capture_cmd(mic_name: str, system_name: Optional[str], pcm_source,
+def build_capture_cmd(mic_name: Optional[str], system_name: Optional[str], pcm_source,
                       sdir: Path, segment_seconds: int) -> Tuple[List[str], tuple]:
     """Pure ffmpeg command assembly for one recording session.
 
-    Returns (cmd, pass_fds). ``pcm_source`` feeds raw PCM via a pipe fd
-    (SystemTap); ``system_name`` selects an avfoundation input device.
+    Any of the two sources may be absent (microphone-only or system-only
+    recordings). Returns (cmd, pass_fds); ``pcm_source`` feeds raw PCM via a
+    pipe fd (SystemTap), ``system_name`` selects an avfoundation input device.
     """
     mic_pattern = str(sdir / "seg_%05d_mic.wav")
     sys_pattern = str(sdir / "seg_%05d_sys.wav")
-    cmd = [
-        "ffmpeg", "-hide_banner", "-thread_queue_size", "1024",
-        "-f", "avfoundation", "-i", ":{}".format(mic_name),
-    ]
+    cmd = ["ffmpeg", "-hide_banner"]
     pass_fds: tuple = ()
+    mic_index: Optional[int] = None
+    sys_index: Optional[int] = None
+    index = 0
+    if mic_name is not None:
+        cmd += ["-thread_queue_size", "1024",
+                "-f", "avfoundation", "-i", ":{}".format(mic_name)]
+        mic_index = index
+        index += 1
     if system_name is not None:
-        cmd += [
-            "-thread_queue_size", "1024",
-            "-f", "avfoundation", "-i", ":{}".format(system_name),
-        ]
+        cmd += ["-thread_queue_size", "1024",
+                "-f", "avfoundation", "-i", ":{}".format(system_name)]
+        sys_index = index
+        index += 1
     elif pcm_source is not None:
         cmd += pcm_source.ffmpeg_args()
         pass_fds = (pcm_source.read_fd,)
+        sys_index = index
+        index += 1
     segment_opts = [
         "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
         "-f", "segment",
         "-segment_time", str(segment_seconds),
         "-reset_timestamps", "1",
     ]
-    cmd += ["-map", "0:a"] + segment_opts + [mic_pattern]
-    if system_name is not None or pcm_source is not None:
-        cmd += ["-map", "1:a"] + segment_opts + [sys_pattern]
+    if mic_index is not None:
+        cmd += ["-map", "{}:a".format(mic_index)] + segment_opts + [mic_pattern]
+    if sys_index is not None:
+        cmd += ["-map", "{}:a".format(sys_index)] + segment_opts + [sys_pattern]
     return cmd, pass_fds
 
 
@@ -442,9 +452,10 @@ class Recorder:
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, mic: Device, system: Optional[Device],
+    def start(self, mic: Optional[Device], system: Optional[Device],
               pcm_source=None) -> None:
-        """pcm_source: a SystemTap (or similar) feeding PCM via a pipe fd
+        """Either source may be None (microphone-only / system-only).
+        pcm_source: a SystemTap (or similar) feeding PCM via a pipe fd
         instead of an avfoundation device."""
         self.stop()
         self._session += 1
@@ -453,7 +464,7 @@ class Recorder:
         self.sessions.append(sdir)
 
         cmd, pass_fds = build_capture_cmd(
-            mic.name,
+            mic.name if mic is not None else None,
             system.name if system is not None else None,
             pcm_source, sdir, int(self.cfg.segment_seconds))
 
@@ -463,9 +474,9 @@ class Recorder:
             pass_fds=pass_fds,
         )
         self.pcm_source = pcm_source
-        self.mic = Candidate(mic, mic_priority(mic.name))
+        self.mic = Candidate(mic, mic_priority(mic.name)) if mic else None
         self.system = Candidate(system, 0) if system else None
-        src = "{}".format(mic.name)
+        src = mic.name if mic is not None else "(no microphone)"
         if system is not None:
             src += " + {} (separate tracks)".format(system.name)
         elif pcm_source is not None:
@@ -562,6 +573,7 @@ def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
     last_route: Optional[Tuple[Optional[str], Optional[str]]] = None
     tap_mode = cfg.system_capture == "tap"
     while not stop.wait(cfg.chunk_seconds):
+        mic_device = rec.mic.device if rec.mic else None
         # Track the default input/output: headphones or a Bluetooth switch
         # change the routing mid-call, and the system loopback can drop out.
         # (In tap mode the tap follows the default output automatically, so
@@ -581,76 +593,95 @@ def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
                     if new_sys is not None and new_sys.device.name != cur:
                         log.warn("Switching system input: '{}' -> '{}'".format(
                             cur or "(none)", new_sys.device.name))
-                        rec.start(rec.mic.device, new_sys.device,
+                        rec.start(mic_device, new_sys.device,
                                   pcm_source=rec.pcm_source)
                     elif new_sys is None and cur is not None:
                         log.warn("No loopback in the new output path; recording microphone only.")
-                        rec.start(rec.mic.device, None, pcm_source=None)
-                if route[0] != last_route[0]:
+                        rec.start(mic_device, None, pcm_source=None)
+                if mic_device is not None and route[0] != last_route[0]:
                     new_mic = choose_mic(cfg, mic_cands, log, topo=topo)
-                    if new_mic is not None and new_mic.device.name != rec.mic.device.name:
+                    if new_mic is not None and new_mic.device.name != mic_device.name:
                         log.warn("Switching mic: '{}' -> '{}'".format(
-                            rec.mic.device.name, new_mic.device.name))
+                            mic_device.name, new_mic.device.name))
                         rec.start(new_mic.device, rec.system.device if rec.system else None,
                                   pcm_source=rec.pcm_source)
             last_route = route
 
         if not rec.is_alive():
             log.error("Recorder exited unexpectedly; restarting.")
+            new_system = rec.system.device if rec.system else None
+            if mic_device is None:
+                rec.start(None, new_system, pcm_source=rec.pcm_source)
+                silent = 0
+                continue
             new_mic = choose_mic(cfg, mic_cands, log)
             if new_mic is None:
                 log.error("No usable mic; cannot restart.")
                 stop.set()
                 break
-            new_system = rec.system.device if rec.system else None
             rec.start(new_mic.device, new_system, pcm_source=rec.pcm_source)
             silent = 0
             continue
 
-        mic_probe = probe_level(rec.mic.device, cfg.probe_seconds,
-                                max_wait=cfg.probe_seconds + 2.5)
-        if has_signal(mic_probe, cfg.silence_db):
-            if silent:
-                log.info("Mic '{}' recovered.".format(rec.mic.device.name))
-            silent = 0
-            open_failures = 0
-            restarted_for_wedge = False
+        if mic_device is None:
+            # System-only recording: no microphone health checks to run.
+            if rec.system is not None:
+                sys_probe = probe_level(rec.system.device, cfg.probe_seconds)
+                if not sys_probe.ok:
+                    log.warn("System input '{}' failed to open; cycling...".format(
+                        rec.system.device.name))
+                    new_sys = choose_system(cfg, system_cands, log,
+                                            exclude=rec.system.device.name)
+                    if new_sys is not None:
+                        rec.start(None, new_sys.device, pcm_source=rec.pcm_source)
+            elif tap_mode and rec.pcm_source is not None:
+                if rec.pcm_source.stalled_after(5.0):
+                    log.warn("System tap stalled (no data for 5s).")
         else:
-            silent += 1
-            if mic_probe.ok:
-                detail = fmt_db(mic_probe.max_db)
-            else:
-                open_failures += 1
-                detail = "probe failed: {}".format(
-                    mic_probe.error or "unknown") if mic_probe.error else "open failed"
-            log.warn("Mic '{}' silent ({}) — {}/{} before failover.".format(
-                rec.mic.device.name, detail, silent, cfg.fail_threshold))
-
-        if silent >= cfg.fail_threshold:
-            if open_failures >= cfg.fail_threshold and not restarted_for_wedge:
-                # Repeated open failures are NOT silence: the avfoundation
-                # open itself is stuck (device wedged by a hung capture).
-                # A wedged ffmpeg never recovers, so restart it once.
-                log.warn("Mic probes keep failing to open; restarting the capture "
-                         "(device may be wedged by the current ffmpeg).")
-                log_ffmpeg_tail(rec, log)
-                rec.start(rec.mic.device, rec.system.device if rec.system else None,
-                          pcm_source=rec.pcm_source)
+            mic_probe = probe_level(mic_device, cfg.probe_seconds,
+                                    max_wait=cfg.probe_seconds + 2.5)
+            if has_signal(mic_probe, cfg.silence_db):
+                if silent:
+                    log.info("Mic '{}' recovered.".format(mic_device.name))
                 silent = 0
                 open_failures = 0
-                restarted_for_wedge = True
-                continue
-            log.warn("Mic failed health checks; cycling all inputs for signal...")
-            best = hunt_mic(cfg, mic_cands, rec.mic.device.name, log)
-            if best is not None:
-                log.warn("Switching mic: '{}' -> '{}'".format(rec.mic.device.name, best.name))
-                rec.start(best, rec.system.device if rec.system else None,
-                          pcm_source=rec.pcm_source)
-                silent = 0
+                restarted_for_wedge = False
             else:
-                log.warn("No candidate produced signal; keeping capture running "
-                         "(meeting may simply be quiet).")
-                silent = 0
+                silent += 1
+                if mic_probe.ok:
+                    detail = fmt_db(mic_probe.max_db)
+                else:
+                    open_failures += 1
+                    detail = "probe failed: {}".format(
+                        mic_probe.error or "unknown") if mic_probe.error else "open failed"
+                log.warn("Mic '{}' silent ({}) — {}/{} before failover.".format(
+                    mic_device.name, detail, silent, cfg.fail_threshold))
+
+            if silent >= cfg.fail_threshold:
+                if open_failures >= cfg.fail_threshold and not restarted_for_wedge:
+                    # Repeated open failures are NOT silence: the avfoundation
+                    # open itself is stuck (device wedged by a hung capture).
+                    # A wedged ffmpeg never recovers, so restart it once.
+                    log.warn("Mic probes keep failing to open; restarting the capture "
+                             "(device may be wedged by the current ffmpeg).")
+                    log_ffmpeg_tail(rec, log)
+                    rec.start(mic_device, rec.system.device if rec.system else None,
+                              pcm_source=rec.pcm_source)
+                    silent = 0
+                    open_failures = 0
+                    restarted_for_wedge = True
+                    continue
+                log.warn("Mic failed health checks; cycling all inputs for signal...")
+                best = hunt_mic(cfg, mic_cands, mic_device.name, log)
+                if best is not None:
+                    log.warn("Switching mic: '{}' -> '{}'".format(mic_device.name, best.name))
+                    rec.start(best, rec.system.device if rec.system else None,
+                              pcm_source=rec.pcm_source)
+                    silent = 0
+                else:
+                    log.warn("No candidate produced signal; keeping capture running "
+                             "(meeting may simply be quiet).")
+                    silent = 0
 
         if rec.system is not None:
             sys_probe = probe_level(rec.system.device, cfg.probe_seconds)
@@ -660,10 +691,10 @@ def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
                 if new_sys is not None:
                     log.warn("Switching system input: '{}' -> '{}'".format(
                         rec.system.device.name, new_sys.device.name))
-                    rec.start(rec.mic.device, new_sys.device, pcm_source=rec.pcm_source)
+                    rec.start(mic_device, new_sys.device, pcm_source=rec.pcm_source)
                 else:
                     log.warn("No replacement system input available; continuing without it.")
-                    rec.start(rec.mic.device, None, pcm_source=None)
+                    rec.start(mic_device, None, pcm_source=None)
         elif tap_mode and rec.pcm_source is not None:
             if rec.pcm_source.stalled_after(5.0):
                 log.warn("System tap stalled (no data for 5s); it follows the default "
@@ -893,17 +924,20 @@ def append_manifest(basedir: Path, outdir: Path, path: Path,
     log.info("Manifest updated: {} ({})".format(manifest_path, path.name))
 
 
-def build_mixed_copy(mic_path: Path, sys_path: Optional[Path], out_path: Path, log: Log) -> Optional[Path]:
+def build_mixed_copy(mic_path: Optional[Path], sys_path: Optional[Path], out_path: Path, log: Log) -> Optional[Path]:
     """Build a mixed-down copy for transcription only. The originals stay
     untouched and separate; this file lives under derived/ and is never
     treated as a source of truth."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if sys_path is not None and sys_path.is_file():
+    if mic_path is not None and mic_path.is_file() and sys_path is not None and sys_path.is_file():
         cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(mic_path), "-i", str(sys_path),
                "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest[a]",
                "-map", "[a]", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", str(out_path)]
     else:
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(mic_path),
+        source = mic_path if (mic_path is not None and mic_path.is_file()) else sys_path
+        if source is None or not source.is_file():
+            return None
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(source),
                "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", str(out_path)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 or not out_path.is_file():
@@ -988,6 +1022,16 @@ def self_test(probe_seconds_arg: float, system_cands: List[Candidate], outputs: 
     return 1
 
 
+def resolve_recording_mode(system_only: bool, no_system: bool,
+                           default_mode: str = "both") -> str:
+    """Pure: CLI flags win over the configured default recording mode."""
+    if system_only:
+        return "system"
+    if no_system:
+        return "mic"
+    return default_mode if default_mode in ("both", "mic", "system") else "both"
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Robust Zoom + microphone recorder with health checks and failover.")
@@ -1000,6 +1044,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--system", default=os.environ.get("ZOOM_AUDIO_DEVICE"),
                         help="force the system/loopback input by name (or ZOOM_AUDIO_DEVICE)")
     parser.add_argument("--no-system", action="store_true", help="record microphone only")
+    parser.add_argument("--system-only", action="store_true",
+                        help="record the other party only (no microphone)")
     parser.add_argument("--chunk-seconds", type=float, default=5.0,
                         help="how often to test the active mic (default 5)")
     parser.add_argument("--fail-threshold", type=int, default=3,
@@ -1010,8 +1056,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="length of each signal probe (default 1.5)")
     parser.add_argument("--silence-db", type=float, default=-60.0,
                         help="max_volume below this counts as silence (default -60)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="whisper model path")
-    parser.add_argument("--basedir", default="~/ZoomRecordings", help="output base directory")
+    parser.add_argument("--model", default=None,
+                        help="whisper model path (default: from config, else "
+                             "~/.cache/whisper-cpp/ggml-base.en.bin)")
+    parser.add_argument("--basedir", default=None,
+                        help="output base directory (default: from config)")
     parser.add_argument("--no-transcribe", action="store_true", help="skip transcription")
     parser.add_argument("--list", action="store_true", help="list audio devices and exit")
     parser.add_argument("--self-test", action="store_true",
@@ -1204,25 +1253,30 @@ def fallback_tap_to_loopback(cfg: Config, rec: "Recorder", log: "Log",
     topo = load_topology(force=True) if load_topology is not None else None
     inputs, _outputs = list_devices()
     sys_cands = build_system_candidates(inputs, topo)
+    mic_device = rec.mic.device if rec.mic else None
     if use_system:
         system = choose_system(cfg, sys_cands, log)
         if system is None:
             log.warn("No loopback input available after fallback; recording microphone only.")
-            rec.start(rec.mic.device, None)
+            rec.start(mic_device, None)
         else:
-            rec.start(rec.mic.device, system.device)
+            rec.start(mic_device, system.device)
     else:
-        rec.start(rec.mic.device, None)
+        rec.start(mic_device, None)
     return sys_cands, inputs
 
 
-def wait_for_first_segment(rec: "Recorder", timeout: float = 6.0) -> bool:
-    """True once ffmpeg has written its first mic segment (capture actually
+def wait_for_first_segment(rec: "Recorder", timeout: float = 6.0,
+                           expect_mic: bool = True) -> bool:
+    """True once ffmpeg has written its first segment (capture actually
     flowing). A hung avfoundation open produces a live-but-silent ffmpeg that
     would otherwise go unnoticed until the end of the meeting."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if rec.segments_mic():
+        if expect_mic:
+            if rec.segments_mic():
+                return True
+        elif rec.segments_sys():
             return True
         if rec.proc is None or rec.proc.poll() is not None:
             return False
@@ -1295,10 +1349,39 @@ def main(argv: List[str]) -> int:
 
     minutes = args.minutes_opt if args.minutes_opt is not None else args.minutes
     segment_seconds = int((minutes if minutes else 5) * 60)
-    basedir = Path(os.path.expanduser(args.basedir))
 
-    mic_cands = build_mic_candidates(inputs, topo)
-    system_cands = build_system_candidates(inputs, topo)
+    # Recorder-side defaults from the config file (CLI flags still win).
+    try:
+        from hud.config import recorder_defaults
+        rdef = recorder_defaults()
+    except Exception:  # noqa: BLE001
+        rdef = None
+    if rdef is not None:
+        if args.basedir is None:
+            args.basedir = rdef.basedir
+        if args.model is None:
+            args.model = rdef.transcription_model
+        if args.mic is None:
+            args.mic = rdef.mic
+        if rdef.notifications is False:
+            set_notifications(False)
+        if rdef.offline and not args.offline:
+            args.offline = True
+            try:
+                from hud.llm import set_offline
+                set_offline(True)
+            except Exception:  # noqa: BLE001
+                pass
+    mode = resolve_recording_mode(
+        args.system_only, args.no_system,
+        rdef.mode if rdef is not None else "both")
+    record_mic = mode in ("both", "mic")
+    record_system = mode in ("both", "system")
+
+    basedir = Path(os.path.expanduser(args.basedir or "~/ZoomRecordings"))
+
+    mic_cands = build_mic_candidates(inputs, topo) if record_mic else []
+    system_cands = build_system_candidates(inputs, topo) if record_system else []
 
     if args.self_test or args.check_routing:
         # No recording happens, so no dated/session folder is created for it --
@@ -1341,29 +1424,34 @@ def main(argv: List[str]) -> int:
         silence_db=args.silence_db,
         mic_override=args.mic,
         system_override=args.system,
-        use_system=not args.no_system,
+        use_system=record_system,
         transcribe=not args.no_transcribe,
-        model=Path(os.path.expanduser(args.model)),
+        model=Path(os.path.expanduser(args.model or DEFAULT_MODEL)),
         basedir=basedir,
         outdir=outdir,
         workdir=workdir,
         system_capture=system_capture,
+        record_mic=record_mic,
     )
 
     log.info("zoom-recorder starting. Output: {}".format(outdir))
     log.info("Inputs detected: {}".format(", ".join(d.name for d in inputs) or "(none)"))
     log.info("Outputs detected: {}".format(", ".join(d.name for d in outputs) or "(none)"))
+    log.info("Recording mode: {}".format(
+        {"both": "microphone + other party", "mic": "microphone only",
+         "system": "other party only"}[mode]))
 
-    if not mic_cands:
-        log.error("No microphone inputs found.")
-        log.close()
-        return 1
-
-    mic = choose_mic(cfg, mic_cands, log, topo=topo)
-    if mic is None:
-        log.error("Could not select a usable microphone.")
-        log.close()
-        return 1
+    mic = None
+    if record_mic:
+        if not mic_cands:
+            log.error("No microphone inputs found.")
+            log.close()
+            return 1
+        mic = choose_mic(cfg, mic_cands, log, topo=topo)
+        if mic is None:
+            log.error("Could not select a usable microphone.")
+            log.close()
+            return 1
 
     system = None
     pcm_source = None
@@ -1408,20 +1496,18 @@ def main(argv: List[str]) -> int:
                 if advice:
                     log.warn(advice)
 
-    log.info("Selected mic: {} (priority {}, level {})".format(
-        mic.device.name, mic.priority,
-        fmt_db(mic.probe.max_db) if mic.probe and mic.probe.ok else "n/a"))
+    if mic is not None:
+        log.info("Selected mic: {} (priority {}, level {})".format(
+            mic.device.name, mic.priority,
+            fmt_db(mic.probe.max_db) if mic.probe and mic.probe.ok else "n/a"))
+    else:
+        log.info("No microphone selected (system-only recording).")
     if system is not None:
         log.info("Selected system input: {}".format(system.device.name))
-
-    rec = Recorder(cfg, log)
-    stop = threading.Event()
-
-    def handle_signal(signum, frame):
-        stop.set()
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    if mic is None and system is None:
+        log.error("No audio source available for the selected recording mode.")
+        log.close()
+        return 1
 
     rec = Recorder(cfg, log)
     stop = threading.Event()
@@ -1449,9 +1535,10 @@ def main(argv: List[str]) -> int:
             hud_cfg = build_hud_config(args)
             live = LiveSession(
                 hud_cfg, outdir, log.info,
-                mic.device.name,
+                mic.device.name if mic is not None else None,
                 system_name(),
                 cfg.model,
+                on_stop=stop.set,
             )
             live.start()
             rec.on_restart = lambda: live.update_devices(
@@ -1461,16 +1548,17 @@ def main(argv: List[str]) -> int:
             log.warn("Live HUD unavailable ({}); recording continues normally.".format(exc))
             live = None
 
-    rec.start(mic.device, system.device if system else None, pcm_source=pcm_source)
-    healthy = wait_for_first_segment(rec)
+    mic_device = mic.device if mic is not None else None
+    rec.start(mic_device, system.device if system else None, pcm_source=pcm_source)
+    healthy = wait_for_first_segment(rec, expect_mic=record_mic)
     if not healthy:
-        log.warn("No mic audio 6s after start; ffmpeg looks stuck. Restarting once.")
+        log.warn("No audio 6s after start; ffmpeg looks stuck. Restarting once.")
         log_ffmpeg_tail(rec, log)
-        rec.start(mic.device, system.device if system else None, pcm_source=pcm_source)
-        healthy = wait_for_first_segment(rec)
+        rec.start(mic_device, system.device if system else None, pcm_source=pcm_source)
+        healthy = wait_for_first_segment(rec, expect_mic=record_mic)
     if not healthy:
         log_ffmpeg_tail(rec, log)
-        if pcm_source is not None:
+        if pcm_source is not None and record_mic:
             # Tap mode wedges the mic open in some process contexts
             # (launchd/GUI-spawned python on macOS 15). Continue the
             # recording on the proven loopback path instead of failing.
@@ -1478,9 +1566,9 @@ def main(argv: List[str]) -> int:
                      "to loopback capture.")
             system_cands, inputs = fallback_tap_to_loopback(cfg, rec, log, cfg.use_system)
             system = None
-            healthy = wait_for_first_segment(rec)
+            healthy = wait_for_first_segment(rec, expect_mic=record_mic)
     if not healthy:
-        log.warn("Mic capture still not producing data; monitoring will keep "
+        log.warn("Capture still not producing data; monitoring will keep "
                  "watching it.")
     log.info("Recording. Press Ctrl+C to stop and merge.")
 
@@ -1519,36 +1607,53 @@ def main(argv: List[str]) -> int:
         mic_segments = rec.segments_mic()
         sys_segments = rec.segments_sys()
 
-        merged_mic = outdir / "recording_mic.wav"
-        mic_ok = merge_segments(mic_segments, merged_mic, workdir, log)
-        mic_duration = probe_duration(merged_mic) if mic_ok else None
-        if not mic_ok or (mic_duration is not None
-                          and mic_duration < MIN_VALID_RECORDING_S):
-            log.error("No usable mic audio was recorded{}.".format(
-                " (merged track is only {:.2f}s)".format(mic_duration)
-                if mic_duration is not None else ""))
+        merged_mic: Optional[Path] = None
+        if mic_segments:
+            candidate_mic = outdir / "recording_mic.wav"
+            mic_ok = merge_segments(mic_segments, candidate_mic, workdir, log)
+            mic_duration = probe_duration(candidate_mic) if mic_ok else None
+            if not mic_ok or (mic_duration is not None
+                              and mic_duration < MIN_VALID_RECORDING_S):
+                log.error("No usable mic audio was recorded{}.".format(
+                    " (merged track is only {:.2f}s)".format(mic_duration)
+                    if mic_duration is not None else ""))
+                log_ffmpeg_tail(rec, log)
+                preserve_session_diagnostics(rec, outdir, log)
+                shutil.rmtree(workdir, ignore_errors=True)
+                log.close()
+                return 1
+            merged_mic = candidate_mic
+
+        merged_sys: Optional[Path] = None
+        if sys_segments:
+            candidate_sys = outdir / "recording_sys.wav"
+            if merge_segments(sys_segments, candidate_sys, workdir, log):
+                sys_duration = probe_duration(candidate_sys)
+                if sys_duration is not None and sys_duration < MIN_VALID_RECORDING_S:
+                    log.error("No usable system audio was recorded (merged track "
+                              "is only {:.2f}s).".format(sys_duration))
+                else:
+                    merged_sys = candidate_sys
+            else:
+                log.warn("System track merge failed; continuing without it.")
+
+        if merged_mic is None and merged_sys is None:
+            log.error("No usable audio was recorded.")
             log_ffmpeg_tail(rec, log)
             preserve_session_diagnostics(rec, outdir, log)
             shutil.rmtree(workdir, ignore_errors=True)
             log.close()
             return 1
 
-        merged_sys: Optional[Path] = None
-        if sys_segments:
-            candidate_sys = outdir / "recording_sys.wav"
-            if merge_segments(sys_segments, candidate_sys, workdir, log):
-                merged_sys = candidate_sys
-            else:
-                log.warn("System track merge failed; continuing with mic-only original.")
-
         log.info("Verifying recording before archiving...")
-        verify_mic = verify_recording(merged_mic, mic_segments, log, "mic")
+        verify_mic = verify_recording(merged_mic, mic_segments, log, "mic") if merged_mic else None
         verify_sys = verify_recording(merged_sys, sys_segments, log, "system") if merged_sys else None
 
         # Gap 1: never delete segments -- move them to .segments/, and lock the
         # merged originals read-only so nothing (including a future run of
         # this script) can silently overwrite the only copy.
-        os.chmod(merged_mic, 0o444)
+        if merged_mic:
+            os.chmod(merged_mic, 0o444)
         if merged_sys:
             os.chmod(merged_sys, 0o444)
 
@@ -1561,16 +1666,17 @@ def main(argv: List[str]) -> int:
         log.info("Segments archived (not deleted) under {}".format(segments_dest))
 
         # Gap 4: append-only checksum manifest.
-        append_manifest(basedir, outdir, merged_mic, verify_mic, len(mic_segments), log)
+        if merged_mic:
+            append_manifest(basedir, outdir, merged_mic, verify_mic, len(mic_segments), log)
         if merged_sys:
             append_manifest(basedir, outdir, merged_sys, verify_sys, len(sys_segments), log)
 
-        log.info("Saved: {}{} ({} mic segments{})".format(
-            merged_mic, " + " + str(merged_sys) if merged_sys else "",
-            len(mic_segments),
-            ", {} system segments".format(len(sys_segments)) if sys_segments else ""))
+        log.info("Saved: {} ({} mic segments, {} system segments)".format(
+            " + ".join(str(p) for p in (merged_mic, merged_sys) if p),
+            len(mic_segments), len(sys_segments)))
 
-        mixed = build_mixed_copy(merged_mic, merged_sys, outdir / "derived" / "recording_mixed.wav", log)
+        mixed = build_mixed_copy(merged_mic, merged_sys,
+                                 outdir / "derived" / "recording_mixed.wav", log)
         if mixed is not None:
             transcribe(cfg, mixed, log)
 

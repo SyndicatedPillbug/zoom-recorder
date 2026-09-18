@@ -115,24 +115,33 @@
   .askbar input:focus { outline: none; border-color: var(--accent); }
   .copy { float: right; opacity: 0; border: none; background: none; color: var(--muted); cursor: pointer; font-size: 11px; }
   .point:hover .copy, .card:hover .copy { opacity: 1; }
-  .point.pinned { border-left: 2px solid var(--accent); padding-left: 10px; }
-  .pinned-head { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .8px; margin: 4px 0 8px; }
+.point.pinned { border-left: 2px solid var(--accent); padding-left: 10px; }
+.pinned-head { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .8px; margin: 4px 0 8px; }
+.details { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+.details[hidden] { display: none; }
+.footerbar { position: sticky; bottom: 0; display: flex; justify-content: flex-end;
+  padding: 8px 20px; background: var(--panel); border-top: 1px solid var(--border); }
 </style>
 </head>
 <body>
 <header>
   <span class="dot" id="dot"></span>
-  <h1>zoom-recorder HUD</h1>
+  <h1>zoom-recorder</h1>
   <span class="pill" id="status">connecting…</span>
+  <div class="spacer"></div>
+  <button class="mini secondary" id="detailsBtn" title="Show technical details">Details</button>
+  <button class="mini" id="stopBtn">Stop recording</button>
+</header>
+<div class="details" id="details" hidden>
   <span class="pill egress" id="egress" title="Only transcript text leaves this Mac when answers are enabled.">answers: unknown</span>
   <span class="pill" id="lag" title="How far the live transcription is behind the audio">lag —</span>
   <span class="pill" id="level" title="Current input level vs the speech threshold (dBFS)">lvl —</span>
   <span class="pill" id="devices" title="Microphone / system audio source">mic — · sys —</span>
-  <div class="spacer"></div>
   <button class="mini" id="pauseBtn" title="Pause AI answers (transcript keeps running)">Pause answers</button>
   <span class="pill" id="budgetLabel">budget —</span>
   <div class="budget" title="Daily token budget used"><span id="budgetBar"></span></div>
-</header>
+</div>
 <div class="warnbar" id="warnbar" hidden></div>
 <main>
   <section>
@@ -141,11 +150,11 @@
   </section>
   <section class="right">
     <div class="pane">
-      <div class="col-head">Talking points</div>
-      <div class="scroll" id="points"><p class="empty">Talking points will accumulate here.</p></div>
+      <div class="col-head">Suggestions</div>
+      <div class="scroll" id="points"><p class="empty">Suggestions will appear here during the call.</p></div>
     </div>
     <div class="pane">
-      <div class="col-head">Q&amp;A</div>
+      <div class="col-head">Ask about the call</div>
       <div class="scroll" id="answers"><p class="empty">Answers will appear here.</p></div>
       <form class="askbar" id="askForm">
         <input id="askInput" type="text" placeholder="Ask a question…" autocomplete="off" />
@@ -154,6 +163,9 @@
     </div>
   </section>
 </main>
+<div class="footerbar">
+  <button class="mini secondary" id="openRecordings">Open recordings folder</button>
+</div>
 <script>
 (function () {
   const transcriptEl = document.getElementById('transcript');
@@ -170,6 +182,21 @@
   const budgetLabel = document.getElementById('budgetLabel');
   const pauseBtn = document.getElementById('pauseBtn');
   const askForm = document.getElementById('askForm');
+  const detailsBtn = document.getElementById('detailsBtn');
+  const detailsEl = document.getElementById('details');
+  const stopBtn = document.getElementById('stopBtn');
+  const openRecordingsBtn = document.getElementById('openRecordings');
+  if (detailsBtn) detailsBtn.onclick = () => {
+    detailsEl.hidden = !detailsEl.hidden;
+    detailsBtn.textContent = detailsEl.hidden ? 'Details' : 'Hide details';
+  };
+  if (stopBtn) stopBtn.onclick = async () => {
+    stopBtn.disabled = true;
+    stopBtn.textContent = 'Stopping…';
+    await api('/stop', 'POST', {});
+    stopBtn.textContent = 'Saved';
+  };
+  if (openRecordingsBtn) openRecordingsBtn.onclick = () => api('/open-recordings', 'POST', {});
   const askInput = document.getElementById('askInput');
   const TOKEN = new URLSearchParams(location.search).get('token') || '';
   const PINS_KEY = 'hud.pins';
@@ -237,7 +264,7 @@
     const stick = atBottom(pointsEl);
     pointsEl.innerHTML = '';
     if (!pointItems.length) {
-      pointsEl.innerHTML = '<p class="empty">Talking points will accumulate here.</p>';
+      pointsEl.innerHTML = '<p class="empty">Suggestions will appear here during the call.</p>';
       return;
     }
     const pinned = pointItems.filter(p => pins.has(p.text));

@@ -144,6 +144,19 @@ class _Handler(BaseHTTPRequestHandler):
             if self.on_pause:
                 self.on_pause(paused)
             self._send_json({"ok": True, "paused": paused})
+        elif parsed.path == "/stop":
+            if self.on_stop:
+                self.on_stop()
+            self._send_json({"ok": True})
+        elif parsed.path == "/open-recordings":
+            import subprocess
+            try:
+                from .config import recorder_defaults
+                path = os.path.expanduser(recorder_defaults().basedir)
+                subprocess.Popen(["open", path])
+                self._send_json({"ok": True, "path": path})
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)})
         else:
             self.send_error(404, "not found")
 
@@ -191,7 +204,8 @@ class HudServer:
     def __init__(self, state: LiveState, host: str = "127.0.0.1", port: int = 0,
                  log: Optional[Callable[[str], None]] = None, token: str = "",
                  on_ask: Optional[Callable[[str, bool], bool]] = None,
-                 on_pause: Optional[Callable[[bool], None]] = None) -> None:
+                 on_pause: Optional[Callable[[bool], None]] = None,
+                 on_stop: Optional[Callable[[], None]] = None) -> None:
         self.state = state
         self.host = host
         self.port = port
@@ -199,6 +213,7 @@ class HudServer:
         self.token = token
         self.on_ask = on_ask
         self.on_pause = on_pause
+        self.on_stop = on_stop
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -211,6 +226,7 @@ class HudServer:
             "token": self.token,
             "on_ask": staticmethod(self.on_ask) if self.on_ask else None,
             "on_pause": staticmethod(self.on_pause) if self.on_pause else None,
+            "on_stop": staticmethod(self.on_stop) if self.on_stop else None,
         })
         self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self._httpd.daemon_threads = True

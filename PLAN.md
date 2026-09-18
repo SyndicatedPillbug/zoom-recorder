@@ -506,3 +506,22 @@ and accepted any loopback that merely *opened*, even a silent one.
   `install.sh`/`uninstall.sh` wrap setup/removal (`--dry-run`, `--install-deps`),
   and `SECURITY.md` + `INSTALL.md` give reviewers and colleagues the full
   access/write/network inventory.
+- **Non-technical UI (`v2.0-ui`)**: designed so a colleague with no technical
+  skill can operate it without a terminal. A local **Control Center**
+  (`hud/control.py`, loopback + per-run token, same security model as the
+  settings GUI) with four tabs: **Setup** (wraps `hud/doctor.py` with
+  one-click fixes, a live microphone test, an output picker, a ten-second test
+  recording that is played back and verified, and transcription setup for
+  both local whisper.cpp and online providers), **Recordings**
+  (`hud/recordings.py` lists sessions with transcript/summary/play/Finder
+  actions), **Settings** (plain-language Basics plus a button to the existing
+  advanced form), and **Help** (FAQ + `QUICKSTART.md`). The menu bar is
+  rewritten in plain language with a top-level live **Volume**, a recording
+  timer, and items that open the Control Center; the transcript window gains a
+  **Stop recording** button (`HudServer.on_stop` -> recorder stop event) and a
+  **Details** toggle hiding the technical pills. Recording modes are now a
+  first-class setting (`both`/`mic`/`system`, `--system-only`), the recorder
+  reads a new `recorder` config section (basedir, mic, mode, notifications,
+  offline, transcription model) so the GUI can control it, and
+  `install.sh`/`install-launch-agent.sh` gained whisper.cpp + model setup and
+  a `--disable` login toggle.

@@ -17,6 +17,7 @@ import platform
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 try:
@@ -143,6 +144,26 @@ def check_microphone(seconds: float = 1.5) -> Check:
     return Check("microphone", True, "{} ({})".format(device.name, level))
 
 
+def check_transcription() -> Check:
+    """Local transcription readiness (whisper-server + a model file)."""
+    try:
+        from .config import recorder_defaults
+    except ImportError:
+        from hud.config import recorder_defaults  # type: ignore
+    server = shutil.which("whisper-server") or shutil.which("whisper-cli")
+    model = Path(recorder_defaults().transcription_model).expanduser()
+    if not server:
+        return Check("transcription (local)", False, "whisper.cpp not installed",
+                     "brew install whisper.cpp", critical=False)
+    if not model.is_file():
+        return Check("transcription (local)", False,
+                     "model not downloaded ({})".format(model.name),
+                     "Download it from the Setup tab (about 150 MB)",
+                     critical=False)
+    return Check("transcription (local)", True,
+                 "{} + {}".format(Path(server).name, model.name))
+
+
 def check_tap() -> Check:
     try:
         from .system_tap import available, usable_in_this_context
@@ -164,7 +185,8 @@ def run_doctor(probe_seconds: float = 1.5) -> bool:
     checks: List[Check] = [check_macos(), check_python()]
     checks += check_tools()
     checks += [check_rumps(), check_blackhole(), check_routing(),
-               check_output_volume(), check_microphone(probe_seconds), check_tap()]
+               check_output_volume(), check_microphone(probe_seconds),
+               check_transcription(), check_tap()]
 
     print("zoom-recorder doctor")
     print("====================")

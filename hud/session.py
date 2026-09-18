@@ -30,13 +30,15 @@ HUD_URLFILE = Path.home() / ".zoom_recorder_hud.url"
 class LiveSession:
     def __init__(self, cfg: HudConfig, outdir: Path, log: Callable[[str], None],
                  mic_name: Optional[str], system_name: Optional[str] = None,
-                 model_path: Optional[Path] = None) -> None:
+                 model_path: Optional[Path] = None,
+                 on_stop: Optional[Callable[[], None]] = None) -> None:
         self.cfg = cfg
         self.outdir = Path(outdir)
         self.log = log
         self.mic_name = mic_name
         self.system_name = system_name
         self.model_path = model_path
+        self.on_stop = on_stop
 
         self.state = LiveState()
         self.budget = BudgetGovernor(cfg.budget_tpm, cfg.budget_tpd)
@@ -63,7 +65,8 @@ class LiveSession:
         try:
             self.server = HudServer(self.state, self.cfg.host, self.cfg.port, self.log,
                                     token=self.token, on_ask=self._on_ask,
-                                    on_pause=self._on_pause)
+                                    on_pause=self._on_pause,
+                                    on_stop=self.on_stop)
             self._port = self.server.start()
         except Exception as exc:  # noqa: BLE001
             self.log("live HUD: HTTP server failed ({}); continuing without HUD".format(exc))

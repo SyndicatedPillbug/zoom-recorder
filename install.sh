@@ -103,6 +103,33 @@ else
   fi
 fi
 
+# --- whisper.cpp + model (transcripts; fully local) -----------------------
+if command -v whisper-server >/dev/null 2>&1 || command -v whisper-cli >/dev/null 2>&1; then
+  say "whisper.cpp: installed"
+else
+  missing=1
+  say "whisper.cpp: MISSING (transcription)"
+  if [[ "$INSTALL_DEPS" == "1" ]]; then
+    run brew install whisper.cpp
+  else
+    say "  install: brew install whisper.cpp"
+  fi
+fi
+MODEL="$HOME/.cache/whisper-cpp/ggml-base.en.bin"
+if [[ -f "$MODEL" ]]; then
+  say "transcription model: $(basename "$MODEL")"
+else
+  missing=1
+  say "transcription model: MISSING (~150 MB, downloaded once)"
+  if [[ "$INSTALL_DEPS" == "1" ]]; then
+    run mkdir -p "$(dirname "$MODEL")"
+    run curl -L --fail -o "$MODEL" \
+      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+  else
+    say "  download: curl -L -o $MODEL https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+  fi
+fi
+
 say ""
 if [[ "$missing" == "1" && "$INSTALL_DEPS" == "0" ]]; then
   say "Some dependencies are missing. Re-run with --install-deps to install them,"

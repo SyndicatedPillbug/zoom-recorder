@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>zoom-recorder</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#161a21; --panel-2:#1c222b; --border:#262d38;
+    --text:#e6e9ef; --muted:#8b94a3; --accent:#5ea0ff; --ok:#7ee0a8;
+    --warn:#ffcc66; --danger:#ff6b6b;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:12px;
+    padding:12px 20px; border-bottom:1px solid var(--border); background:var(--panel); }
+  header h1 { font-size:16px; margin:0; font-weight:650; }
+  .spacer { flex:1; }
+  .pill { font-size:12px; color:var(--muted); border:1px solid var(--border);
+    border-radius:999px; padding:2px 10px; }
+  .tabs { display:flex; gap:6px; padding:12px 20px 0; max-width:920px; margin:0 auto; }
+  .tabs button { background:transparent; color:var(--muted); border:1px solid var(--border);
+    border-radius:8px; padding:7px 14px; font-weight:600; cursor:pointer; }
+  .tabs button.active { color:var(--text); border-color:var(--accent); background:var(--panel-2); }
+  main { max-width:920px; margin:0 auto; padding:16px 20px 60px; display:grid; gap:16px; }
+  section { background:var(--panel-2); border:1px solid var(--border); border-radius:12px;
+    padding:16px 18px; }
+  section h2 { font-size:15px; margin:0 0 4px; }
+  section .sub { color:var(--muted); font-size:13px; margin:0 0 12px; }
+  .row { display:flex; align-items:center; gap:10px; margin:0 0 10px; flex-wrap:wrap; }
+  .row label { flex:0 0 170px; color:var(--muted); font-size:13px; }
+  .row .ctl { flex:1; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input[type=text], input[type=password], input[type=number], select {
+    background:var(--bg); color:var(--text); border:1px solid var(--border);
+    border-radius:7px; padding:7px 9px; font:inherit; min-width:180px; }
+  input[type=checkbox]{ width:auto; }
+  button { background:var(--accent); color:#06121f; border:0; border-radius:8px;
+    padding:8px 15px; font-weight:650; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--text); border:1px solid var(--border); }
+  button.mini { padding:4px 10px; font-size:12px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .check { display:flex; align-items:center; gap:10px; padding:7px 0; border-top:1px solid var(--border); }
+  .check:first-child { border-top:0; }
+  .check .mark { width:20px; text-align:center; }
+  .check .name { flex:0 0 210px; font-size:13px; color:var(--muted); }
+  .check .detail { flex:1; font-size:13px; }
+  .ok { color:var(--ok); } .bad { color:var(--danger); } .warn { color:var(--warn); }
+  .muted { color:var(--muted); }
+  .status { font-size:13px; }
+  .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; margin:0 0 10px;
+    background:var(--bg); }
+  .card .top { display:flex; align-items:center; gap:10px; }
+  .card .when { font-weight:650; }
+  .badge { font-size:11px; border:1px solid var(--border); border-radius:999px; padding:1px 8px;
+    color:var(--muted); }
+  .card .actions { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .bar { height:10px; background:var(--bg); border:1px solid var(--border); border-radius:999px;
+    overflow:hidden; min-width:160px; flex:1; }
+  .bar > span { display:block; height:100%; background:var(--ok); width:0%; }
+  .hidden { display:none; }
+  a { color:var(--accent); }
+  .note { font-size:12px; color:var(--muted); }
+  code { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1px 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>zoom-recorder</h1>
+  <span class="pill" id="statePill">connecting…</span>
+  <div class="spacer"></div>
+  <button class="mini secondary" id="openRecordings">Show recordings folder</button>
+</header>
+
+<div class="tabs">
+  <button data-tab="setup" class="active">Setup</button>
+  <button data-tab="recordings">Recordings</button>
+  <button data-tab="settings">Settings</button>
+  <button data-tab="help">Help</button>
+</div>
+
+<main>
+  <!-- ---------------------------------------------------------------- Setup -->
+  <div id="tab-setup">
+    <section>
+      <h2>Set up zoom-recorder</h2>
+      <p class="sub">It records your microphone and the other person's audio, and can
+        save a transcript. It never records your screen. Works with Zoom, Teams,
+        Discord, Slack, or any call in your browser.</p>
+      <div class="row"><div class="ctl">
+        <button id="runChecks">Check my audio</button>
+        <span class="status muted" id="checksStatus"></span>
+      </div></div>
+      <div id="checks"></div>
+    </section>
+
+    <section>
+      <h2>1. Test your microphone</h2>
+      <p class="sub">Say a few words out loud, then press Test.</p>
+      <div class="row">
+        <button id="micTest">Test microphone</button>
+        <div class="bar"><span id="micBar"></span></div>
+        <span class="status" id="micStatus"></span>
+      </div>
+      <div class="row hidden" id="micHelp">
+        <span class="bad">Your microphone isn't being heard.</span>
+        <button class="secondary mini" id="openMic">Open Microphone settings</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Where should the sound play?</h2>
+      <p class="sub">Pick what you listen with (speakers or headphones). Recording needs a
+        special audio setup, so macOS's own volume keys won't work during calls — use the
+        <b>Volume</b> menu in the menu bar instead.</p>
+      <div class="row">
+        <select id="outputSelect"></select>
+        <button id="useOutput">Use this</button>
+        <span class="status" id="outputStatus"></span>
+      </div>
+    </section>
+
+    <section>
+      <h2>3. Try a short recording</h2>
+      <p class="sub">We'll record about ten seconds and play it back so you can hear both sides.</p>
+      <div class="row">
+        <label>What to record</label>
+        <div class="ctl">
+          <select id="testMode">
+            <option value="both">Me and the other person</option>
+            <option value="mic">Only me</option>
+            <option value="system">Only the other person</option>
+          </select>
+          <button id="testRecord">Record 10 seconds</button>
+          <span class="status" id="testStatus"></span>
+        </div>
+      </div>
+      <div class="card hidden" id="testResult">
+        <div id="testSummary"></div>
+        <div class="actions">
+          <button class="mini" id="playTest">Play it back</button>
+          <button class="mini secondary" id="heardYes">I heard both people</button>
+          <button class="mini secondary" id="heardNo">Something's missing</button>
+        </div>
+        <div class="note hidden" id="testTips"></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>4. Live transcript (optional)</h2>
+      <p class="sub">Shows what's being said while the call is happening.</p>
+      <div class="row">
+        <label><input type="radio" name="live" value="off" checked /> Off</label>
+        <label><input type="radio" name="live" value="local" /> On this Mac (no account)</label>
+        <label><input type="radio" name="live" value="online" /> Online (best accuracy)</label>
+      </div>
+      <div id="liveLocal" class="hidden">
+        <div class="row">
+          <label>Language</label>
+          <div class="ctl">
+            <select id="modelChoice">
+              <option value="ggml-base.en.bin">English only (recommended)</option>
+              <option value="ggml-base.bin">All languages</option>
+            </select>
+            <button class="secondary mini" id="installWhisper">Install transcriber</button>
+            <button class="secondary mini" id="downloadModel">Download model</button>
+            <span class="status" id="localStatus"></span>
+          </div>
+        </div>
+        <p class="note">Runs entirely on this Mac. The model is about 150 MB and is
+          downloaded once.</p>
+      </div>
+      <div id="liveOnline" class="hidden">
+        <div class="row">
+          <label>Service</label>
+          <div class="ctl">
+            <select id="provider">
+              <option value="groq">Groq (recommended)</option>
+              <option value="openai">OpenAI</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+            <input type="password" id="apiKey" placeholder="API key" />
+            <button class="secondary mini" id="testKey">Test key</button>
+            <span class="status" id="keyStatus"></span>
+          </div>
+        </div>
+        <p class="note">Audio is sent to this service while recording. You can turn it off
+          any time, or use Offline mode in Settings to block all network access.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Start automatically at login?</h2>
+      <p class="sub">Off by default. Turn it on so the 🎙 menu is always there after you log in.</p>
+      <div class="row">
+        <label><input type="checkbox" id="loginAgent" /> Start at login</label>
+        <span class="status" id="loginStatus"></span>
+      </div>
+    </section>
+
+    <section>
+      <div class="row">
+        <button id="finishSetup">Finish setup</button>
+        <span class="status" id="finishStatus"></span>
+      </div>
+    </section>
+  </div>
+
+  <!-- ----------------------------------------------------------- Recordings -->
+  <div id="tab-recordings" class="hidden">
+    <section>
+      <h2>My recordings</h2>
+      <p class="sub" id="recordingsPath"></p>
+      <div class="row"><button id="refreshRecordings" class="secondary mini">Refresh</button>
+        <button id="openFolder" class="secondary mini">Open recordings folder</button></div>
+      <div id="recordings"></div>
+    </section>
+  </div>
+
+  <!-- ------------------------------------------------------------- Settings -->
+  <div id="tab-settings" class="hidden">
+    <section>
+      <h2>Settings</h2>
+      <p class="sub">The essentials. For model and provider tuning, use Advanced settings.</p>
+      <div class="row"><label>Save recordings to</label>
+        <div class="ctl"><input type="text" id="basedir" />
+          <button class="secondary mini" id="pickDir">Choose…</button></div></div>
+      <div class="row"><label>Microphone</label>
+        <div class="ctl"><select id="micSelect"></select></div></div>
+      <div class="row"><label>Record</label>
+        <div class="ctl"><select id="modeSelect">
+          <option value="both">Me and the other person</option>
+          <option value="mic">Only me</option>
+          <option value="system">Only the other person</option>
+        </select></div></div>
+      <div class="row"><label>Transcription model</label>
+        <div class="ctl"><input type="text" id="modelPath" /></div></div>
+      <div class="row"><label>Notifications</label>
+        <div class="ctl"><input type="checkbox" id="notifications" /></div></div>
+      <div class="row"><label>Offline mode</label>
+        <div class="ctl"><input type="checkbox" id="offline" />
+          <span class="note">Blocks all internet access (local transcript only)</span></div></div>
+      <div class="row"><label>Start at login</label>
+        <div class="ctl"><input type="checkbox" id="loginAgent2" /></div></div>
+      <div class="row">
+        <button id="saveSettings">Save</button>
+        <button class="secondary" id="advancedSettings">Advanced settings…</button>
+        <span class="status" id="settingsStatus"></span>
+      </div>
+    </section>
+  </div>
+
+  <!-- ----------------------------------------------------------------- Help -->
+  <div id="tab-help" class="hidden">
+    <section>
+      <h2>Help</h2>
+      <p class="sub">Common questions.</p>
+      <p><b>How do I record a call?</b><br/>Click 🎙 in the menu bar → <i>Start recording</i>.
+        When you're done, click it again → <i>Stop recording</i>. Your recording and
+        transcript appear under <i>Recordings</i>.</p>
+      <p><b>Where are my recordings?</b><br/>In your recordings folder (see Settings), shown
+        under the Recordings tab.</p>
+      <p><b>Nobody can hear me / I can't hear them</b><br/>Run <i>Setup → Check my audio</i>.
+        If your microphone shows as silent, click <i>Open Microphone settings</i> and allow
+        access. If system audio is missing, click <i>Fix automatically</i>.</p>
+      <p><b>Volume keys don't work during calls</b><br/>That's macOS: the special audio
+        setup has no volume of its own. Use the <b>Volume</b> menu in the menu bar (or the
+        optional Karabiner mapping in <code>karabiner/</code>).</p>
+      <p><b>Does it record my screen?</b><br/>No. It records your microphone and the other
+        person's audio, and only sends audio to a service if you choose Online
+        transcription.</p>
+      <div class="row">
+        <button class="secondary mini" data-open="INSTALL.md">Install guide</button>
+        <button class="secondary mini" data-open="SECURITY.md">What it accesses</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+(function () {
+  const TOKEN = new URLSearchParams(location.search).get('token') || '';
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+
+  async function api(path, method, body) {
+    const opts = { method: method || 'GET', headers: { 'X-Auth-Token': TOKEN } };
+    if (body) { opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body); }
+    const resp = await fetch(path + '?token=' + encodeURIComponent(TOKEN), opts);
+    return resp.json().catch(() => ({ ok:false, error:'bad response' }));
+  }
+  function setStatus(el, text, cls) {
+    el.textContent = text || '';
+    el.className = 'status ' + (cls || 'muted');
+  }
+
+  // tabs
+  document.querySelectorAll('.tabs button').forEach(btn => btn.onclick = () => show(btn.dataset.tab));
+  function show(tab) {
+    document.querySelectorAll('.tabs button').forEach(b =>
+      b.classList.toggle('active', b.dataset.tab === tab));
+    ['setup','recordings','settings','help'].forEach(t =>
+      $('tab-' + t).classList.toggle('hidden', t !== tab));
+    if (tab === 'recordings') loadRecordings();
+    if (tab === 'settings') loadSettings();
+  }
+
+  // ---- status + checks -------------------------------------------------
+  async function refreshState() {
+    const s = await api('/api/status');
+    if (!s.ok) { setStatus($('statePill'), 'unavailable', 'bad'); return; }
+    setStatus($('statePill'),
+      (s.recording ? 'recording' : 'ready') + (s.offline ? ' · offline' : ''), 'muted');
+    renderChecks(s.checks || []);
+    if (!s.onboarded) { /* stay on setup */ }
+    if (s.checks) {
+      $('outputSelect').dataset.ready = '1';
+    }
+  }
+
+  function fixButton(check) {
+    const name = (check.name || '').toLowerCase();
+    if (name.includes('routing')) return { action:'routing', label:'Fix automatically' };
+    if (name.includes('blackhole')) return { action:'open-terminal',
+      command:'brew install blackhole-2ch', label:'Install BlackHole' };
+    if (name.includes('microphone')) return { action:'open-mic-settings', label:'Open Microphone settings' };
+    if (name.includes('transcription')) return { action:'install-whisper', label:'Install transcriber' };
+    return null;
+  }
+
+  function renderChecks(checks) {
+    const box = $('checks');
+    if (!checks.length) { box.innerHTML = ''; return; }
+    box.innerHTML = checks.map((c, i) => {
+      const mark = c.ok ? '<span class="ok">✓</span>' : (c.critical ? '<span class="bad">✗</span>' : '<span class="warn">!</span>');
+      return '<div class="check"><span class="mark">' + mark + '</span>' +
+        '<span class="name">' + esc(c.name) + '</span>' +
+        '<span class="detail">' + esc(c.detail) + '</span>' +
+        '<span data-fix="' + i + '"></span></div>';
+    }).join('');
+    checks.forEach((c, i) => {
+      if (c.ok) return;
+      const btn = fixButton(c);
+      if (!btn) return;
+      const slot = box.querySelector('[data-fix="' + i + '"]');
+      const b = document.createElement('button');
+      b.className = 'secondary mini';
+      b.textContent = btn.label;
+      b.onclick = async () => {
+        b.disabled = true;
+        if (btn.action === 'open-terminal') {
+          await api('/api/fix', 'POST', { action:'open-terminal', command: btn.command });
+        } else {
+          const r = await api('/api/fix', 'POST', { action: btn.action });
+          setStatus($('checksStatus'), r.message || (r.ok ? 'Done.' : r.error), r.ok ? 'ok' : 'bad');
+        }
+        setTimeout(refreshState, 800);
+        b.disabled = false;
+      };
+      slot.appendChild(b);
+    });
+  }
+
+  $('runChecks').onclick = async () => {
+    setStatus($('checksStatus'), 'Checking…');
+    await refreshState();
+    setStatus($('checksStatus'), '');
+  };
+
+  // ---- mic test --------------------------------------------------------
+  $('micTest').onclick = async () => {
+    setStatus($('micStatus'), 'Listening…');
+    $('micHelp').classList.add('hidden');
+    const r = await api('/api/mic-test', 'POST', {});
+    if (!r.ok && r.error) { setStatus($('micStatus'), r.error, 'bad'); return; }
+    const db = r.max_db == null ? -100 : r.max_db;
+    const pct = Math.max(0, Math.min(100, Math.round((db + 80) * 100 / 60)));
+    $('micBar').style.width = pct + '%';
+    if (r.silent) {
+      setStatus($('micStatus'), 'silent', 'bad');
+      $('micHelp').classList.remove('hidden');
+    } else {
+      setStatus($('micStatus'), r.device + ' · ' + db.toFixed(1) + ' dB', 'ok');
+    }
+  };
+  $('openMic').onclick = () => api('/api/fix', 'POST', { action:'open-mic-settings' });
+
+  // ---- output picker ---------------------------------------------------
+  async function loadDevices() {
+    const d = await api('/api/devices');
+    if (!d.ok) return;
+    $('outputSelect').innerHTML = (d.outputs || []).map(
+      n => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('');
+    const sel = $('micSelect');
+    sel.innerHTML = '<option value="">Automatic</option>' +
+      (d.microphones || []).map(n => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('');
+  }
+  $('useOutput').onclick = async () => {
+    setStatus($('outputStatus'), 'Setting up…');
+    const r = await api('/api/fix', 'POST',
+      { action:'routing', output: $('outputSelect').value });
+    setStatus($('outputStatus'), r.message || r.error, r.ok ? 'ok' : 'bad');
+  };
+
+  // ---- test recording --------------------------------------------------
+  $('testRecord').onclick = async () => {
+    const seconds = 10;
+    setStatus($('testStatus'), 'Recording for ' + seconds + 's… (play some call audio or speak)');
+    $('testResult').classList.add('hidden');
+    const r = await api('/api/test-recording', 'POST',
+      { seconds: seconds, mode: $('testMode').value });
+    if (!r.ok && r.error) { setStatus($('testStatus'), r.error, 'bad'); return; }
+    setStatus($('testStatus'), '');
+    $('testResult').classList.remove('hidden');
+    const parts = [];
+    if (r.mic_coverage != null) parts.push('microphone ' + r.mic_coverage + '%');
+    if (r.system_coverage != null) parts.push('other person ' + r.system_coverage + '%');
+    $('testSummary').innerHTML = '<b>' + (r.ok ? 'Captured' : 'Check this') + ':</b> ' +
+      esc(parts.join(' · ') || 'no audio');
+    $('testResult').dataset.mixed = r.mixed || '';
+  };
+  $('playTest').onclick = () => {
+    const p = $('testResult').dataset.mixed;
+    if (p) api('/api/play', 'POST', { path: p });
+  };
+  $('heardYes').onclick = () => {
+    setStatus($('testStatus'), 'Great — you\'re ready.', 'ok');
+    $('testResult').classList.add('hidden');
+  };
+  $('heardNo').onclick = () => {
+    const tips = $('testTips');
+    tips.classList.remove('hidden');
+    tips.innerHTML = 'Try: <b>Check my audio</b> above, make sure the microphone test is ' +
+      'not silent, and pick the right output under <b>Where should the sound play?</b>. ' +
+      'For a call app, also check that it is using your normal speakers (not "BlackHole").';
+  };
+
+  // ---- live transcript -------------------------------------------------
+  document.querySelectorAll('input[name=live]').forEach(r => r.onchange = () => {
+    const v = document.querySelector('input[name=live]:checked').value;
+    $('liveLocal').classList.toggle('hidden', v !== 'local');
+    $('liveOnline').classList.toggle('hidden', v !== 'online');
+  });
+  $('installWhisper').onclick = async () => {
+    setStatus($('localStatus'), 'Installing in Terminal…');
+    await api('/api/fix', 'POST', { action:'install-whisper' });
+  };
+  $('downloadModel').onclick = async () => {
+    setStatus($('localStatus'), 'Downloading…');
+    const r = await api('/api/fix', 'POST',
+      { action:'download-model', model: $('modelChoice').value });
+    setStatus($('localStatus'), r.message || r.error, r.ok ? 'ok' : 'bad');
+  };
+  $('testKey').onclick = async () => {
+    setStatus($('keyStatus'), 'Testing…');
+    const r = await api('/api/test-provider', 'POST',
+      { provider: $('provider').value, api_key: $('apiKey').value });
+    setStatus($('keyStatus'), r.ok ? 'Key works (' + r.count + ' models)' : r.error,
+      r.ok ? 'ok' : 'bad');
+  };
+
+  // ---- login agent -----------------------------------------------------
+  async function setLogin(enabled, statusEl) {
+    setStatus(statusEl, 'Updating…');
+    const r = await api('/api/login-agent', 'POST', { enabled: enabled });
+    setStatus(statusEl, r.ok ? (enabled ? 'Will start at login' : 'Will not start at login')
+      : (r.error || 'failed'), r.ok ? 'ok' : 'bad');
+  }
+  $('loginAgent').onchange = (e) => setLogin(e.target.checked, $('loginStatus'));
+  $('loginAgent2').onchange = (e) => setLogin(e.target.checked, $('settingsStatus'));
+
+  // ---- finish ----------------------------------------------------------
+  $('finishSetup').onclick = async () => {
+    // persist the chosen live-transcript mode first
+    const live = document.querySelector('input[name=live]:checked').value;
+    const cfg = { stt: {}, answers: {}, recorder: {} };
+    if (live === 'local') {
+      cfg.stt.backend = 'local';
+      cfg.answers.enabled = false;
+      cfg.recorder.transcription_model =
+        '~/.cache/whisper-cpp/' + $('modelChoice').value;
+    } else if (live === 'online') {
+      cfg.stt.backend = $('provider').value;
+      cfg.answers.backend = $('provider').value;
+      cfg.answers.enabled = true;
+    } else {
+      cfg.answers.enabled = false;
+    }
+    const keys = {};
+    if (live === 'online' && $('apiKey').value) keys[$('provider').value] = $('apiKey').value;
+    await api('/api/config', 'POST', { config: cfg, api_key_new: keys });
+    await api('/api/setup/complete', 'POST', {});
+    setStatus($('finishStatus'), 'All set. Use the 🎙 menu to start recording.', 'ok');
+    setTimeout(() => show('recordings'), 700);
+  };
+
+  // ---- recordings ------------------------------------------------------
+  async function loadRecordings() {
+    const r = await api('/api/recordings');
+    if (!r.ok) return;
+    $('recordingsPath').textContent = 'Saved in ' + r.basedir;
+    const box = $('recordings');
+    if (!r.items.length) {
+      box.innerHTML = '<p class="muted">No recordings yet. Use the 🎙 menu to record one.</p>';
+      return;
+    }
+    box.innerHTML = r.items.map((it, i) => {
+      const badges = [];
+      if (it.has_mic) badges.push('microphone');
+      if (it.has_system) badges.push('other person');
+      if (it.transcript) badges.push('transcript');
+      return '<div class="card"><div class="top"><span class="when">' + esc(it.started) +
+        '</span><span class="badge">' + esc(it.duration) + '</span>' +
+        badges.map(b => '<span class="badge">' + esc(b) + '</span>').join('') +
+        '</div><div class="actions" data-item="' + i + '"></div></div>';
+    }).join('');
+    r.items.forEach((it, i) => {
+      const slot = box.querySelector('[data-item="' + i + '"]');
+      const add = (label, fn) => { const b = document.createElement('button');
+        b.className = 'secondary mini'; b.textContent = label; b.onclick = fn;
+        slot.appendChild(b); };
+      if (it.transcript) add('Open transcript', () => api('/api/open','POST',{ path: it.transcript }));
+      if (it.summary) add('Open summary', () => api('/api/open','POST',{ path: it.summary }));
+      if (it.mixed) add('Play', () => api('/api/play','POST',{ path: it.mixed }));
+      add('Show in Finder', () => api('/api/open','POST',{ path: it.path }));
+    });
+  }
+  $('refreshRecordings').onclick = loadRecordings;
+  $('openFolder').onclick = () => api('/api/open','POST',{ target:'recordings' });
+  $('openRecordings').onclick = () => api('/api/open','POST',{ target:'recordings' });
+
+  // ---- settings --------------------------------------------------------
+  async function loadSettings() {
+    const r = await api('/api/config');
+    if (!r.ok) return;
+    const c = r.config, rec = c.recorder || {};
+    $('basedir').value = rec.basedir || '';
+    $('modelPath').value = rec.transcription_model || '';
+    $('modeSelect').value = rec.mode || 'both';
+    $('notifications').checked = !(c.privacy && c.privacy.notifications === false);
+    $('offline').checked = !!(c.privacy && c.privacy.offline);
+    $('micSelect').value = rec.mic || '';
+    await loadDevices();
+    $('micSelect').value = rec.mic || '';
+  }
+  $('pickDir').onclick = async () => {
+    const r = await api('/api/pick-dir', 'POST', {});
+    if (r.ok) $('basedir').value = r.path;
+  };
+  $('saveSettings').onclick = async () => {
+    const cfg = {
+      recorder: {
+        basedir: $('basedir').value,
+        mic: $('micSelect').value || null,
+        mode: $('modeSelect').value,
+        transcription_model: $('modelPath').value,
+      },
+      privacy: {
+        notifications: $('notifications').checked,
+        offline: $('offline').checked,
+      },
+    };
+    setStatus($('settingsStatus'), 'Saving…');
+    const r = await api('/api/config', 'POST', { config: cfg });
+    setStatus($('settingsStatus'), r.ok ? 'Saved' : r.error, r.ok ? 'ok' : 'bad');
+  };
+  $('advancedSettings').onclick = () => api('/api/fix','POST',{ action:'open-advanced' });
+
+  document.querySelectorAll('[data-open]').forEach(b => b.onclick = () => {
+    // repo docs live next to this app; the server only opens paths under home
+    api('/api/open', 'POST', { path: b.dataset.open });
+  });
+
+  // ---- boot ------------------------------------------------------------
+  refreshState();
+  loadDevices();
+  const initial = new URLSearchParams(location.search).get('tab');
+  if (initial) show(initial);
+  setInterval(refreshState, 15000);
+})();
+</script>
+</body>
+</html>

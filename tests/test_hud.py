@@ -673,8 +673,26 @@ class ServerTests(unittest.TestCase):
             with urllib.request.urlopen(
                     "http://127.0.0.1:{}/".format(port), timeout=5) as resp:
                 html = resp.read().decode("utf-8")
-                self.assertIn("Talking points", html)
+                self.assertIn("Suggestions", html)
                 self.assertIn("talking_point", html)
+                self.assertIn("Stop recording", html)
+        finally:
+            server.stop()
+
+    def test_stop_endpoint_calls_callback(self) -> None:
+        import urllib.request
+
+        state = LiveState()
+        called = {"n": 0}
+        server = HudServer(state, port=0, on_stop=lambda: called.__setitem__("n", called["n"] + 1))
+        port = server.start()
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:{}/stop".format(port), method="POST",
+                data=b"{}", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertTrue(json.loads(resp.read())["ok"])
+            self.assertEqual(called["n"], 1)
         finally:
             server.stop()
 
@@ -830,24 +848,34 @@ class HttpClientTests(unittest.TestCase):
 class MenuStateTests(unittest.TestCase):
     def test_idle(self) -> None:
         state = describe(recording=False, hud_active=False)
-        self.assertEqual(state["toggle_title"], "Start Recording")
-        self.assertEqual(state["live_title"], "Start with Live HUD")
+        self.assertEqual(state["toggle_title"], "Start recording")
+        self.assertEqual(state["live_title"], "Start with live transcript")
         self.assertTrue(state["live_enabled"])
         self.assertFalse(state["open_enabled"])
 
     def test_recording_without_hud(self) -> None:
-        state = describe(recording=True, hud_active=False)
-        self.assertEqual(state["toggle_title"], "Stop Recording")
-        # No duplicate "Stop Recording": the HUD item is a disabled starter.
+        state = describe(recording=True, hud_active=False, elapsed_s=754)
+        self.assertEqual(state["toggle_title"], "Stop recording (12:34)")
         self.assertFalse(state["live_enabled"])
-        self.assertNotEqual(state["live_title"], "Stop Recording")
         self.assertFalse(state["open_enabled"])
 
     def test_recording_with_hud(self) -> None:
         state = describe(recording=True, hud_active=True)
-        self.assertEqual(state["live_title"], "Live HUD active ✓")
+        self.assertEqual(state["live_title"], "Live transcript active ✓")
         self.assertFalse(state["live_enabled"])
         self.assertTrue(state["open_enabled"])
+
+    def test_live_unavailable(self) -> None:
+        state = describe(recording=False, hud_active=False, live_available=False)
+        self.assertFalse(state["live_enabled"])
+        self.assertIn("set up", state["live_title"])
+
+    def test_format_elapsed(self) -> None:
+        from hud.menu_state import format_elapsed
+
+        self.assertEqual(format_elapsed(0), "0:00")
+        self.assertEqual(format_elapsed(65), "1:05")
+        self.assertEqual(format_elapsed(3725), "1:02:05")
 
     def test_icons_differ(self) -> None:
         self.assertNotEqual(describe(False, False)["icon"], describe(True, False)["icon"])
@@ -1878,6 +1906,94 @@ class HardeningTests(unittest.TestCase):
                 mock.patch.object(doctor, "check_microphone", return_value=good), \
                 mock.patch.object(doctor, "check_tap", return_value=good):
             self.assertTrue(doctor.run_doctor())
+
+
+class RecordingModeTests(unittest.TestCase):
+    def test_build_capture_cmd_shapes(self) -> None:
+        from zoom_record import build_capture_cmd
+
+        class FakePCM:
+            read_fd = 9
+
+            def ffmpeg_args(self):
+                return ["-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "pipe:9"]
+
+        both, fds = build_capture_cmd("Mic", "BlackHole 2ch", None, Path("/tmp/s"), 60)
+        self.assertIn(":Mic", both)
+        self.assertIn(":BlackHole 2ch", both)
+        self.assertEqual(both.count("-map"), 2)
+        self.assertEqual(fds, ())
+
+        mic_only, _ = build_capture_cmd("Mic", None, None, Path("/tmp/s"), 60)
+        self.assertIn(":Mic", mic_only)
+        self.assertEqual(mic_only.count("-map"), 1)
+        self.assertIn("seg_%05d_mic.wav", mic_only[-1])
+
+        sys_only, _ = build_capture_cmd(None, "BlackHole 2ch", None, Path("/tmp/s"), 60)
+        self.assertNotIn(":Mic", sys_only)
+        self.assertEqual(sys_only.count("-map"), 1)
+        self.assertIn("seg_%05d_sys.wav", sys_only[-1])
+
+        sys_pcm, fds = build_capture_cmd(None, None, FakePCM(), Path("/tmp/s"), 60)
+        self.assertIn("pipe:9", sys_pcm)
+        self.assertEqual(fds, (9,))
+        self.assertEqual(sys_pcm.count("-map"), 1)
+        self.assertIn("seg_%05d_sys.wav", sys_pcm[-1])
+
+    def test_resolve_recording_mode(self) -> None:
+        from zoom_record import resolve_recording_mode
+
+        self.assertEqual(resolve_recording_mode(True, False, "both"), "system")
+        self.assertEqual(resolve_recording_mode(False, True, "both"), "mic")
+        self.assertEqual(resolve_recording_mode(False, False, "system"), "system")
+        self.assertEqual(resolve_recording_mode(False, False, "bogus"), "both")
+
+    def test_recorder_defaults_roundtrip(self) -> None:
+        from hud.config import (_defaults, config_from_dict, config_to_dict,
+                                recorder_defaults)
+
+        cfg = config_from_dict(_defaults())
+        out = config_to_dict(cfg)
+        self.assertEqual(out["recorder"]["mode"], "both")
+        self.assertFalse(out["onboarded"])
+
+        rec = recorder_defaults({"recorder": {"mode": "system",
+                                              "basedir": "~/Recs",
+                                              "transcription_model": "~/m.bin"}})
+        self.assertEqual(rec.mode, "system")
+        self.assertFalse(rec.record_mic())
+        self.assertTrue(rec.record_system())
+
+        # invalid mode falls back to both
+        self.assertEqual(recorder_defaults({"recorder": {"mode": "nope"}}).mode, "both")
+
+
+class RecordingsTests(unittest.TestCase):
+    def test_list_recordings(self) -> None:
+        from hud.recordings import format_duration, list_recordings
+
+        self.assertEqual(format_duration(None), "--:--")
+        self.assertEqual(format_duration(65), "1:05")
+        self.assertEqual(format_duration(3725), "1:02:05")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            day = Path(tmp) / "2026-09-18"
+            session = day / "17-27-11_ab12cd34"
+            (session / "derived").mkdir(parents=True)
+            (session / "recording_mic.wav").write_bytes(b"RIFF")
+            (session / "recording_sys.wav").write_bytes(b"RIFF")
+            (session / "transcript.txt").write_text("hello", encoding="utf-8")
+            (session / "derived" / "live_summary.md").write_text("# s", encoding="utf-8")
+            (day / "not-a-session").mkdir()
+            items = list_recordings(tmp, probe=False)
+            self.assertEqual(len(items), 1)
+            rec = items[0]
+            self.assertEqual(rec.started, "2026-09-18 17:27:11")
+            self.assertTrue(rec.has_mic)
+            self.assertTrue(rec.has_system)
+            self.assertTrue(rec.transcript)
+            self.assertTrue(rec.summary)
+            self.assertEqual(rec.as_dict()["duration"], "--:--")  # no probe
 
 
 if __name__ == "__main__":

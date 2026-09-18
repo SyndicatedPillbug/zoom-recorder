@@ -3,10 +3,10 @@
 Records Zoom meeting audio (speaker + microphone) with automatic device
 selection, continuous capture verification, dynamic failover, and transcription.
 
-> New here? **INSTALL.md** has the five-minute setup. **SECURITY.md** documents
+> New here? **QUICKSTART.md** is the no-terminal guide for non-technical users,
+> **INSTALL.md** has the five-minute setup, and **SECURITY.md** documents
 > exactly what the tool accesses, writes and (optionally) sends over the
-> network — written for a security reviewer. `./zoom_record.py --doctor`
-> checks the environment and prints fixes.
+> network. `./zoom_record.py --doctor` checks the environment and prints fixes.
 
 ## Requirements
 
@@ -149,19 +149,30 @@ One-keystroke-equivalent start/stop with no background daemon: the menu-bar
 icon only spawns the recorder subprocess while you're actually recording, so
 there's never a persistent, silent mic-access process for an EDR to flag or
 that could record something by accident. The icon shows three states —
-🎙 idle, 🔴 recording, 🧠 recording with the live window up — and the
-menu gives the HUD its own options, separate from the plain recording toggle:
+🎙 idle, 🔴 recording, 🧠 recording with the transcript window up:
 
 ```
-Start Recording        ↔ Stop Recording
-Start with Live HUD    → Live HUD active ✓   (disabled while recording)
-Open Live HUD…                                (enabled only while the HUD runs)
-Settings…                                     (config GUI)
+Volume 44%                                   (top-level: slider, ±5%, mute, presets)
+Start recording      ↔ Stop recording (12:34)
+Start with live transcript → Live transcript active ✓   (disabled while recording)
+Open transcript window                                   (enabled while it runs)
+My recordings…                                           (Control Center → Recordings)
+Check my audio setup…                                    (Control Center → Setup)
+Settings…                                                (Control Center → Settings)
+Help                                                     (Control Center → Help)
+Play sound through ▸                                     (device pairing, Reset audio)
 Quit
 ```
 
-Click "Stop Recording" to send the same clean-shutdown signal Ctrl+C would;
-**Open Live HUD…** re-opens the window in the browser.
+The **Control Center** (`hud/control.py`) is a local, loopback-only page with
+four tabs — Setup (guided checks, microphone test, output picker, a ten-second
+test recording, transcription setup), Recordings (past sessions with
+transcript/summary/play/Show-in-Finder), Settings (Basics + Advanced), and
+Help. The first run opens Setup once.
+
+Click "Stop recording" to send the same clean-shutdown signal Ctrl+C would;
+**Open transcript window** re-opens the window in the browser (you can also
+stop the recording from that window's **Stop recording** button).
 
 The status icon is intentionally a **single glyph** (🎙 / 🔴 / 🧠) to keep it
 narrow. On MacBooks with a notch, macOS hides menu-bar items that don't fit,
@@ -564,5 +575,6 @@ Annotated tags mark each milestone (`git tag -n` for the full messages):
 | `v1.7-system-tap` | Core Audio process-tap capture (`--system-capture auto|tap|loopback`): system audio recorded directly where permitted (Terminal context), loopback+volume-slider mode for the menu bar, `--restore-routing`, one-time System Audio Recording permission, wedge recovery, preserved failure diagnostics |
 | `v1.8-volume` | First-class top-level **Volume** menu (live level in the title, slider, ±5%, mute, presets), CLI volume/mute actions, Karabiner key mapping for loopback mode, mute leaves the recording intact, default output auto-restored when a recording stops (native keys return between calls) |
 | `v1.9-hardening` | Shareable/EDR-friendly install: unsigned `.app` wrapper removed, login autostart opt-in, tap capture opt-in (loopback default), `--doctor`, `--offline` hard network kill-switch, notification toggle, `install.sh`/`uninstall.sh`, `SECURITY.md`/`INSTALL.md` |
+| `v2.0-ui` | Non-technical UI pass: Control Center (Setup wizard with one-click fixes, Recordings list, Basics/Advanced settings, Help), menu bar rewritten in plain language with a recording timer, Stop button and Details toggle in the transcript window, recording modes (`both`/`mic`/`system`), recorder settings in the config file, local *and* online transcription setup in the wizard, `QUICKSTART.md` |
 
 Running the tests: `python3 -m unittest discover -s tests`.

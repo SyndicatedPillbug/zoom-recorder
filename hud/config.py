@@ -22,6 +22,51 @@ from typing import Any, Dict, List, Optional
 
 CONFIG_PATH = Path.home() / ".config" / "zoom-recorder" / "config.json"
 
+DEFAULT_TRANSCRIPTION_MODEL = "~/.cache/whisper-cpp/ggml-base.en.bin"
+RECORDING_MODES = ("both", "mic", "system")
+
+
+@dataclass
+class RecorderDefaults:
+    """Recorder-side settings the GUI can control (zoom_record.py reads
+    these as defaults; CLI flags still win)."""
+
+    basedir: str = "~/ZoomRecordings"
+    mic: Optional[str] = None
+    mode: str = "both"                       # both | mic | system
+    notifications: bool = True
+    offline: bool = False
+    transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
+
+    def record_mic(self) -> bool:
+        return self.mode in ("both", "mic")
+
+    def record_system(self) -> bool:
+        return self.mode in ("both", "system")
+
+
+def recorder_defaults(data: Optional[Dict[str, Any]] = None) -> RecorderDefaults:
+    """Build RecorderDefaults from a config dict (already merged with
+    defaults) or from the config file on disk."""
+    if data is None:
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+    rec = (data or {}).get("recorder") or {}
+    mode = str(rec.get("mode") or "both").strip().lower()
+    if mode not in RECORDING_MODES:
+        mode = "both"
+    return RecorderDefaults(
+        basedir=str(rec.get("basedir") or "~/ZoomRecordings"),
+        mic=(rec.get("mic") or None),
+        mode=mode,
+        notifications=bool(rec.get("notifications", True)),
+        offline=bool(rec.get("offline", False)),
+        transcription_model=str(rec.get("transcription_model")
+                                or DEFAULT_TRANSCRIPTION_MODEL),
+    )
+
 
 @dataclass
 class Provider:
@@ -166,6 +211,12 @@ class HudConfig:
     offline: bool = False
     notifications: bool = True
 
+    # Recorder-side settings (basedir, mic, recording mode, model).
+    recorder: RecorderDefaults = field(default_factory=RecorderDefaults)
+
+    # Set once the setup wizard has been completed.
+    onboarded: bool = False
+
     # Provider credentials loaded from the config file (env always wins)
     api_keys: Dict[str, str] = field(default_factory=dict)
 
@@ -276,6 +327,15 @@ def _defaults() -> Dict[str, Any]:
         "speakers": {"enabled": True, "self_name": "You", "remote_name": "Others"},
         "budget": {"tpm": 0, "tpd": 0},
         "privacy": {"offline": False, "notifications": True},
+        "recorder": {
+            "basedir": "~/ZoomRecordings",
+            "mic": None,
+            "mode": "both",
+            "notifications": True,
+            "offline": False,
+            "transcription_model": DEFAULT_TRANSCRIPTION_MODEL,
+        },
+        "onboarded": False,
         "api_keys": {},
     }
 
@@ -374,6 +434,8 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         budget_tpd=_as_int(budget.get("tpd"), 0),
         offline=bool(privacy.get("offline", False)),
         notifications=bool(privacy.get("notifications", True)),
+        recorder=recorder_defaults(data),
+        onboarded=bool(data.get("onboarded", False)),
         api_keys={str(k): str(v) for k, v in (data.get("api_keys") or {}).items()},
     )
 
@@ -450,7 +512,16 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
     })
     out["budget"].update({"tpm": cfg.budget_tpm, "tpd": cfg.budget_tpd})
     out["privacy"].update({"offline": cfg.offline, "notifications": cfg.notifications})
+    out["recorder"] = {
+        "basedir": cfg.recorder.basedir,
+        "mic": cfg.recorder.mic,
+        "mode": cfg.recorder.mode,
+        "notifications": cfg.recorder.notifications,
+        "offline": cfg.recorder.offline,
+        "transcription_model": cfg.recorder.transcription_model,
+    }
     out["api_keys"] = dict(cfg.api_keys) if include_keys else {}
+    out["onboarded"] = cfg.onboarded
     return out
 
 

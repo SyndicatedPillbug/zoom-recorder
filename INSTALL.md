@@ -25,19 +25,26 @@ anything.
 ./run-menubar.command
 ```
 
-Look for 🎙 in the menu bar. From there:
+Look for 🎙 in the menu bar. Everything a non-technical user needs is there:
 
-- **Start Recording** — records mic + system audio, transcribes at the end.
-- **Start with Live HUD** — the live transcript window (needs an API key; see
-  below).
-- **Volume** — top-level volume control (slider, ±5%, mute, presets) for the
-  Multi-Output Device macOS gives no volume control at all.
-- **Audio Out** — which physical output to pair with the loopback, and
-  *Restore Normal Routing*.
+- **Volume 44%** — top-level volume (slider, ±5%, mute, presets).
+- **Start recording** / **Stop recording (mm:ss)**.
+- **Open transcript window** — while a live transcript is running.
+- **My recordings…** — the Control Center's list of past recordings.
+- **Check my audio setup…** — guided checks with one-click fixes.
+- **Settings…** — the essentials (advanced form behind one button).
+- **Help** — plain-language FAQ.
+- **Play sound through ▸** — which speakers/headphones to use, and *Reset audio*.
+
+The **Control Center** is a local page (no internet) opened from those menu
+items. The first time you run it, follow **Setup** end to end: it checks the
+audio, tests the microphone, picks your output, records ten seconds and plays
+it back so you can hear both sides.
 
 Optional: `./install.sh --autostart` enables login autostart (a per-user
 LaunchAgent). Without it, nothing starts at login and `./run-menubar.command`
-is how you launch the app.
+is how you launch the app. The same switch exists in the Setup screen and
+Settings.
 
 ## 3. The one-time microphone grant
 
@@ -48,9 +55,9 @@ that launched it.
 - If a prompt appears, click **Allow**.
 - If it does not (background contexts sometimes skip the prompt), open
   **System Settings → Privacy & Security → Microphone** and enable the entry
-  for the Python/menu-bar app. `./zoom_record.py --doctor` prints the exact
-  pane link and tells you when the microphone is being read as digital
-  silence.
+  for the Python/menu-bar app — the Setup screen's *Open Microphone settings*
+  button takes you straight there and tells you when the microphone reads as
+  digital silence.
 
 No Screen Recording or System Audio Recording permission is needed for the
 normal (loopback) path. `--system-capture tap` is the only mode that needs
@@ -58,14 +65,15 @@ it, and it is opt-in.
 
 ## 4. Optional: live transcript + answers
 
-```bash
-export GROQ_API_KEY=...      # or put it in ~/.config/zoom-recorder/config.json
-./run-menubar.command        # then "Start with Live HUD"
-```
+Open **Setup** (menu: *Check my audio setup…*) and choose step 4:
 
-To keep everything on the machine, run with `--offline` (no network at all)
-or configure the local backends described in `README.md`. See `SECURITY.md`
-for exactly what is sent where.
+- **On this Mac** — free and private: `whisper.cpp` (installed by
+  `./install.sh --install-deps`) plus a one-time ~150 MB model. No account.
+- **Online** — Groq / OpenAI / OpenRouter with an API key for the best
+  accuracy and for Suggestions/answers.
+
+To keep everything on the machine, use **Settings → Offline mode** (blocks
+all internet access). See `SECURITY.md` for exactly what is sent where.
 
 ## 5. Optional: hardware volume keys in loopback mode
 
