@@ -430,6 +430,7 @@ to the **next** recording, since the HUD reads config at session start.
 | `--mic NAME` | auto | Force a microphone by name (env `MIC_AUDIO_DEVICE`) |
 | `--system NAME` | auto | Force the system/loopback input (env `ZOOM_AUDIO_DEVICE`) |
 | `--no-system` | off | Record the microphone only |
+| `--system-only` | off | Record the other party only (no microphone) |
 | `--list` | — | List audio devices (transport, defaults, loopback advice), then exit |
 | `--self-test` | off | Play a tone and verify the output→loopback capture path |
 | `--check-routing` | off | Verify system audio reaches a loopback, then exit |

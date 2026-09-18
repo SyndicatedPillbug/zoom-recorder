@@ -47,9 +47,16 @@ and it is strictly opt-in.
 - Recordings: `~/ZoomRecordings/<date>/<time>_<id>/` (never deleted by the
   tool; `uninstall.sh` leaves them untouched).
 - Small runtime state: `~/.zoom_recorder.pid`, `~/.zoom_recorder_hud.url`,
-  `~/.zoom_recorder_settings.*`, `~/.zoom_recorder_routing.json`.
+  `~/.zoom_recorder_settings.*`, `~/.zoom_recorder_control.*`,
+  `~/.zoom_recorder_routing.json`.
 - Optional KB cache: `~/.cache/zoom-recorder/kb`.
 - Menu-bar log: `~/Library/Logs/zoom-recorder-menubar.log`.
+
+The **Control Center** (Setup / Recordings / Settings / Help) is a local web
+page served on `127.0.0.1` with a random per-run token, exactly like the
+settings GUI; it shuts itself down when idle, sends no data anywhere, and
+never exposes stored API keys to the browser. See `QUICKSTART.md` for the
+non-technical walkthrough.
 
 ## Network
 
