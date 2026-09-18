@@ -222,32 +222,17 @@ class RecorderApp(rumps.App):
         # changed (this runs on the 5s poll; CoreAudio reads are cheap but
         # rebuilding menu items every tick would reset their callbacks).
         try:
-            from hud.system_tap import usable_in_this_context
             from hud.routing_fix import list_real_outputs, load_state
-            # Whether *this* process context will use tap capture, exactly as
-            # the recorder decides it -- capability alone would hide the
-            # loopback pairing items in the menu bar even though recordings
-            # run in loopback mode here.
-            tap_ok = usable_in_this_context()
-            outputs = [] if tap_ok else list_real_outputs()
-            paired = None if tap_ok else load_state().get("physical_name")
+            outputs = list_real_outputs()
+            paired = load_state().get("physical_name")
         except Exception:
-            tap_ok = True  # conservative: assume nothing to switch
             outputs, paired = [], None
-        sig = (tuple(outputs), paired, tap_ok)
+        sig = (tuple(outputs), paired)
         if sig == self._audio_sig:
             return
         self._audio_sig = sig
-        if tap_ok:
-            # Tap capture needs no routing changes at all: the tap follows
-            # whatever the default output is. Only offer the undo switch.
-            populate_submenu(self.audio_item, [
-                rumps.MenuItem("(direct capture: routing untouched)", callback=None),
-                rumps.MenuItem("Restore Normal Routing…", callback=self.restore_routing),
-            ])
-            return
-        # Loopback (Multi-Output) mode: volume keys do not work for it, so
-        # provide the volume control macOS omits.
+        # Recordings use loopback capture, so the pairing controls are always
+        # relevant here; Restore Normal Routing undoes the routing entirely.
         entries = []
         for label, name in audio_menu_specs(outputs, paired):
             if label is None:
@@ -256,6 +241,9 @@ class RecorderApp(rumps.App):
                 entries.append(rumps.MenuItem(label, callback=self.fix_routing))
             else:
                 entries.append(rumps.MenuItem(label, callback=self._pair_output))
+        entries.append(None)
+        entries.append(rumps.MenuItem("Restore Normal Routing…",
+                                      callback=self.restore_routing))
         populate_submenu(self.audio_item, entries)
 
     def _volume_changed(self, sender) -> None:

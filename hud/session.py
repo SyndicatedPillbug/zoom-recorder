@@ -51,6 +51,15 @@ class LiveSession:
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> Optional[int]:
+        # Enforce the privacy switch before any network-capable component
+        # starts: offline blocks every non-loopback HTTP call in the process.
+        try:
+            from .llm import set_offline
+            set_offline(self.cfg.offline)
+        except Exception:  # noqa: BLE001
+            pass
+        if self.cfg.offline:
+            self.log("offline mode: network access disabled (loopback only)")
         try:
             self.server = HudServer(self.state, self.cfg.host, self.cfg.port, self.log,
                                     token=self.token, on_ask=self._on_ask,

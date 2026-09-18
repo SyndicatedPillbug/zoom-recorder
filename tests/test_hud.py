@@ -1609,13 +1609,16 @@ class SystemTapTests(unittest.TestCase):
         self.assertEqual(resolve_system_capture(self._args(capture="loopback")),
                          "loopback")
 
-    def test_resolve_system_capture_requires_tap_support(self) -> None:
+    def test_resolve_system_capture_is_loopback_by_default(self) -> None:
         import zoom_record as zr
 
-        with mock.patch("hud.system_tap.usable_in_this_context", return_value=True):
-            self.assertEqual(zr.resolve_system_capture(self._args()), "tap")
-        with mock.patch("hud.system_tap.usable_in_this_context", return_value=False):
-            self.assertEqual(zr.resolve_system_capture(self._args()), "loopback")
+        # Auto is loopback: the tap is strictly opt-in so a shared install
+        # never touches the audio-capture permission path by surprise.
+        self.assertEqual(zr.resolve_system_capture(self._args()), "loopback")
+        self.assertEqual(zr.resolve_system_capture(
+            self._args(capture="auto", system="BlackHole 2ch")), "loopback")
+        self.assertEqual(zr.resolve_system_capture(self._args(capture="loopback")),
+                         "loopback")
         self.assertEqual(zr.resolve_system_capture(self._args(capture="tap")), "tap")
 
     def test_usable_in_this_context_needs_terminal(self) -> None:
@@ -1788,6 +1791,93 @@ class VolumeControlTests(unittest.TestCase):
                                 self._topo(MULTI_OUTPUT_NAME),
                                 physical_output="MacBook Air Speakers")
         self.assertEqual(target.name, "MacBook Air Speakers")
+
+
+class HardeningTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        from hud import llm
+        import zoom_record
+        llm.set_offline(False)
+        zoom_record.set_notifications(True)
+
+    def test_offline_blocks_remote_and_allows_loopback(self) -> None:
+        from hud.llm import LLMClient, LLMError, set_offline
+
+        set_offline(True)
+        remote = LLMClient("https://api.example.invalid/v1", "k")
+        with self.assertRaises(LLMError) as ctx:
+            remote._request("/chat", b"{}", "application/json")
+        self.assertIn("offline mode", str(ctx.exception))
+
+        local = LLMClient("http://127.0.0.1:1/v1", None)
+        try:
+            local._request("/x", b"{}", "application/json")
+        except LLMError as exc:
+            # Nothing is listening on port 1, so a network error is expected;
+            # what matters is that the offline guard did not block loopback.
+            self.assertNotIn("offline mode", str(exc))
+
+    def test_privacy_config_roundtrip(self) -> None:
+        from hud.config import config_from_dict, config_to_dict
+
+        cfg = config_from_dict({"privacy": {"offline": True, "notifications": False}})
+        self.assertTrue(cfg.offline)
+        self.assertFalse(cfg.notifications)
+        out = config_to_dict(cfg)
+        self.assertEqual(out["privacy"], {"offline": True, "notifications": False})
+
+    def test_notifications_gated(self) -> None:
+        import zoom_record
+
+        with mock.patch("zoom_record.subprocess.run") as run:
+            zoom_record.set_notifications(False)
+            zoom_record.notify_user("hidden")
+            run.assert_not_called()
+            zoom_record.set_notifications(True)
+            zoom_record.notify_user("shown")
+            run.assert_called_once()
+
+    def test_doctor_reports_and_fails_on_critical(self) -> None:
+        from hud import doctor
+
+        good = doctor.Check("thing", True, "fine")
+        bad = doctor.Check("thing", False, "broken", "do the fix")
+        with mock.patch.object(doctor, "check_macos", return_value=good), \
+                mock.patch.object(doctor, "check_python", return_value=good), \
+                mock.patch.object(doctor, "check_tools", return_value=[good]), \
+                mock.patch.object(doctor, "check_rumps", return_value=good), \
+                mock.patch.object(doctor, "check_blackhole", return_value=good), \
+                mock.patch.object(doctor, "check_routing", return_value=good), \
+                mock.patch.object(doctor, "check_output_volume", return_value=good), \
+                mock.patch.object(doctor, "check_microphone", return_value=good), \
+                mock.patch.object(doctor, "check_tap", return_value=good):
+            self.assertTrue(doctor.run_doctor())
+        with mock.patch.object(doctor, "check_macos", return_value=bad), \
+                mock.patch.object(doctor, "check_python", return_value=good), \
+                mock.patch.object(doctor, "check_tools", return_value=[]), \
+                mock.patch.object(doctor, "check_rumps", return_value=good), \
+                mock.patch.object(doctor, "check_blackhole", return_value=good), \
+                mock.patch.object(doctor, "check_routing", return_value=good), \
+                mock.patch.object(doctor, "check_output_volume", return_value=good), \
+                mock.patch.object(doctor, "check_microphone", return_value=good), \
+                mock.patch.object(doctor, "check_tap", return_value=good):
+            self.assertFalse(doctor.run_doctor())
+
+    def test_doctor_non_critical_failure_still_ok(self) -> None:
+        from hud import doctor
+
+        good = doctor.Check("thing", True, "fine")
+        warn = doctor.Check("thing", False, "missing", "optional", critical=False)
+        with mock.patch.object(doctor, "check_macos", return_value=good), \
+                mock.patch.object(doctor, "check_python", return_value=good), \
+                mock.patch.object(doctor, "check_tools", return_value=[good]), \
+                mock.patch.object(doctor, "check_rumps", return_value=warn), \
+                mock.patch.object(doctor, "check_blackhole", return_value=good), \
+                mock.patch.object(doctor, "check_routing", return_value=good), \
+                mock.patch.object(doctor, "check_output_volume", return_value=good), \
+                mock.patch.object(doctor, "check_microphone", return_value=good), \
+                mock.patch.object(doctor, "check_tap", return_value=good):
+            self.assertTrue(doctor.run_doctor())
 
 
 if __name__ == "__main__":

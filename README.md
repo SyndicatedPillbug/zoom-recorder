@@ -3,6 +3,11 @@
 Records Zoom meeting audio (speaker + microphone) with automatic device
 selection, continuous capture verification, dynamic failover, and transcription.
 
+> New here? **INSTALL.md** has the five-minute setup. **SECURITY.md** documents
+> exactly what the tool accesses, writes and (optionally) sends over the
+> network — written for a security reviewer. `./zoom_record.py --doctor`
+> checks the environment and prints fixes.
+
 ## Requirements
 
 - macOS
@@ -14,17 +19,27 @@ selection, continuous capture verification, dynamic failover, and transcription.
 ## Setup
 
 ```bash
+git clone <this repo> ~/zoom-recorder
+cd ~/zoom-recorder
+./install.sh --install-deps   # checks/installs ffmpeg, BlackHole, rumps
+./run-menubar.command         # start the menu bar
+```
+
+`./install.sh` on its own only checks and reports; `--dry-run` changes
+nothing. See **INSTALL.md** for the one-time microphone grant and
+troubleshooting, and **SECURITY.md** for exactly what this tool accesses,
+writes and (optionally) sends over the network.
+
+Manual equivalent of `--install-deps`:
+
+```bash
 brew install ffmpeg whisper-cpp
 mkdir -p ~/.cache/whisper-cpp
 curl -L -o ~/.cache/whisper-cpp/ggml-base.en.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 
-# optional: menu-bar start/stop toggle
-pip3 install --user rumps
-
-# optional: capture the other party's audio (see "Capturing the other party's
-# audio" below -- you also need a Multi-Output Device)
-brew install blackhole-2ch
+pip3 install --user rumps        # menu-bar UI
+brew install blackhole-2ch       # system-audio loopback (asks for admin)
 ```
 
 ### Optional: live HUD
@@ -159,16 +174,18 @@ icon disappears.
 launchd (as opposed to one you run from Terminal, which already has its own
 granted access) gets silently denied trying to even read the script.
 
-#### Auto-start at login
+#### Auto-start at login (optional)
 
 ```bash
-./install-launch-agent.sh     # installs a LaunchAgent, starts it now, and
-                               # makes it start automatically at every login
-./uninstall-launch-agent.sh   # removes it
+./install.sh --autostart      # installs the LaunchAgent and starts it now
+./uninstall.sh                # removes it (and other state)
 ```
 
-This only registers `menubar.py` (the always-visible toggle) to start at
-login -- never the recorder itself. Logs go to
+Autostart is opt-in: without it, nothing runs at login and you launch the
+menu bar with `./run-menubar.command`. The agent only registers
+`menubar.py` (the always-visible toggle) to start at login -- never the
+recorder itself, and it runs `/usr/bin/python3 <repo>/menubar.py` directly
+(no bundle, no wrapper). Logs go to
 `~/Library/Logs/zoom-recorder-menubar.log`. If it ever crashes, launchd
 restarts it automatically (`KeepAlive` on non-zero exit only, so quitting it
 yourself via the menu doesn't trigger an immediate respawn).
@@ -273,46 +290,33 @@ isn't appearing, that pill tells you why:
   filter, and check the log for `dropped likely hallucination` lines.
 
 **Capturing the other party's audio (macOS).** macOS cannot capture arbitrary
-system audio out of the box; the recorder has two ways, picked automatically:
+system audio out of the box; the recorder has two capture paths:
 
-1. **Capturing the other party's audio (macOS).** macOS cannot capture arbitrary
-system audio out of the box; the recorder picks one of two capture paths
-automatically:
-
-1. **Core Audio process tap (macOS 14.2+, Terminal context).** When launched
-   from an app context that holds the **System Audio Recording** permission
-   (e.g. Apple Terminal — the grant is per app context and Terminal's covers
-   its child processes), `hud/system_tap.py` creates a *private, observe-only*
-   tap that mirrors every playing process. Your default output and input are
-   untouched — volume keys work, and the recording level does not follow the
-   volume slider. First run only: macOS prompts once. `--system-capture tap`
-   forces this path; `python3 -m hud.system_tap` self-tests it.
-2. **Loopback / Multi-Output (the default elsewhere — menu bar, launchd,
-   older macOS).** A Multi-Output Device (BlackHole + your real output) is
-   created and selected automatically at recording start (idempotent; the
-   pairing lives in `~/.zoom_recorder_routing.json`), and the default output
-   is handed back to your real device when the recording stops, so the
-   normal volume keys work between calls. Because macOS gives Multi-Output
-   Devices no volume control at all, the menu bar has a top-level **Volume**
-   menu (its title always shows the current level): a slider, `Volume +5%` /
-   `Volume −5%`, `Mute`/`Unmute`, and 25/50/75/100% presets. The same
-   controls are available from the CLI:
+1. **Loopback / Multi-Output (default).** A Multi-Output Device (BlackHole +
+   your real output) is created and selected automatically at recording start
+   (idempotent; the pairing lives in `~/.zoom_recorder_routing.json`), and the
+   default output is handed back to your real device when the recording stops,
+   so the normal volume keys work between calls. This path needs no privacy
+   permission beyond the microphone. Because macOS gives Multi-Output Devices
+   no volume control at all, the menu bar has a top-level **Volume** menu (its
+   title always shows the current level): a slider, `Volume +5%` /
+   `Volume −5%`, `Mute`/`Unmute`, and 25/50/75/100% presets. The same controls
+   are available from the CLI:
    `python3 -m hud.routing_fix --volume 40 | --volume-up | --volume-down |
    --mute | --unmute | --toggle-mute`. To put the volume keys back on the
    hardware keys, import `karabiner/zoom-recorder-volume.json` in Karabiner
    Elements (Complex Modifications → Add rule → Import more rules from a
    file); it maps volume up/down/mute to those CLI actions in both modes.
    Muting silences your speakers/headphones only — the recording keeps
-   capturing system audio.
-   `--restore-routing` (also in the `Audio Out ▸` menu) returns your Mac to
-   normal when you stop using loopback mode.
-2. **Loopback fallback (older macOS, or `--system-capture loopback`).**
-   Install BlackHole (`brew install blackhole-2ch`), then run
-   `./zoom_record.py --fix-routing` to create a Multi-Output Device
-   (BlackHole + your real output) and select it as the default output — or
-   use the menu-bar **Audio Out ▸** dropdown to switch the paired output.
-   Note this macOS legacy: a Multi-Output Device has **no volume control**,
-   which is why tap capture is preferred whenever it is available.
+   capturing system audio. `--restore-routing` (also in the `Audio Out ▸`
+   menu) removes the routing entirely when you are done with loopback mode.
+2. **Core Audio process tap (`--system-capture tap`, opt-in).** Where the
+   calling app context holds the **System Audio Recording** permission (e.g.
+   Apple Terminal), `hud/system_tap.py` creates a *private, observe-only* tap
+   that mirrors every playing process. Output routing is completely untouched
+   and the recording level is independent of the volume slider. It is never
+   chosen automatically — the audio-capture permission path stays opt-in — and
+   `python3 -m hud.system_tap` self-tests it.
 
 `./zoom_record.py --list` prints every device with its transport, the current
 defaults, the capture mode, and exactly what to fix; `--self-test` plays a
@@ -419,8 +423,11 @@ to the **next** recording, since the HUD reads config at session start.
 | `--self-test` | off | Play a tone and verify the output→loopback capture path |
 | `--check-routing` | off | Verify system audio reaches a loopback, then exit |
 | `--fix-routing` | off | Loopback mode only: create/rebuild the Multi-Output Device and select it as default output, then exit |
-| `--system-capture MODE` | auto | `tap` (Core Audio tap, no routing changes), `loopback` (BlackHole/Multi-Output), or `auto` |
+| `--system-capture MODE` | loopback | `loopback` (BlackHole/Multi-Output, default) or `tap` (Core Audio process tap; opt-in, needs the System Audio Recording permission) |
 | `--restore-routing` | off | Undo everything: real default output/input, remove the Multi-Output Device, then exit |
+| `--doctor` | off | Check tools, BlackHole, routing, output volume and the microphone (with fixes), then exit |
+| `--offline` | off | Privacy: block every non-loopback network call (live STT/answers/KB) and turn notifications off |
+| `--no-notifications` | off | Do not post desktop notifications |
 | `--fix-output NAME` | stored | With `--fix-routing`/`--restore-routing`: which real output device |
 | `--fix-input NAME` | auto | With `--restore-routing`: which microphone to select |
 | `--volume PCT` | — | Set the audible output's volume (loopback member, else the default output) |
@@ -556,5 +563,6 @@ Annotated tags mark each milestone (`git tag -n` for the full messages):
 | `v1.6-routing-fix` | One-command automated routing fix (`--fix-routing`, menu-bar item), bare-BlackHole misroute advice, click-by-click fallback; `Audio Out` menu-bar dropdown to switch the passthrough output mid-call, stored pairing preference (`~/.zoom_recorder_routing.json`), stale-device rebuilds |
 | `v1.7-system-tap` | Core Audio process-tap capture (`--system-capture auto|tap|loopback`): system audio recorded directly where permitted (Terminal context), loopback+volume-slider mode for the menu bar, `--restore-routing`, one-time System Audio Recording permission, wedge recovery, preserved failure diagnostics |
 | `v1.8-volume` | First-class top-level **Volume** menu (live level in the title, slider, ±5%, mute, presets), CLI volume/mute actions, Karabiner key mapping for loopback mode, mute leaves the recording intact, default output auto-restored when a recording stops (native keys return between calls) |
+| `v1.9-hardening` | Shareable/EDR-friendly install: unsigned `.app` wrapper removed, login autostart opt-in, tap capture opt-in (loopback default), `--doctor`, `--offline` hard network kill-switch, notification toggle, `install.sh`/`uninstall.sh`, `SECURITY.md`/`INSTALL.md` |
 
 Running the tests: `python3 -m unittest discover -s tests`.

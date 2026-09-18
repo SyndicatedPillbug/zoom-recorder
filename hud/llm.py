@@ -30,6 +30,21 @@ class LLMError(Exception):
         self.body = body
 
 
+# Global kill-switch for egress (`--offline` / privacy.offline). Loopback
+# addresses stay allowed so a local Ollama server keeps working offline.
+_OFFLINE = False
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def set_offline(value: bool) -> None:
+    global _OFFLINE
+    _OFFLINE = bool(value)
+
+
+def is_offline() -> bool:
+    return _OFFLINE
+
+
 @dataclass
 class LLMResult:
     text: str
@@ -129,6 +144,10 @@ class LLMClient:
                      headers: Dict[str, str],
                      timeout: Optional[float]) -> Tuple[int, bytes, Dict[str, str]]:
         """POST/GET over a reusable connection, retrying once on a dropped socket."""
+        if _OFFLINE and self._host not in _LOCAL_HOSTS:
+            raise LLMError(
+                "offline mode: network access is disabled (blocked {})".format(
+                    self.base_url))
         url = "{}{}".format(self._prefix, path)
         last_exc: Optional[BaseException] = None
         for attempt in range(2):

@@ -445,7 +445,8 @@ and accepted any loopback that merely *opened*, even a silent one.
   the menu bar gains a **volume slider** (`routing_fix.set_output_volume`)
   because macOS volume keys do nothing for Multi-Output Devices. The menu-bar
   app now runs from `zoom-recorder.app` (bundle identity + audio usage
-  descriptions for future macOS releases).
+  descriptions for future macOS releases; **removed in v1.9-hardening** --
+  see below).
 - **ScreenCaptureKit evaluated and rejected (2026-09-18)**: an SCK audio-only
   helper (Swift, `NSAudioCaptureUsageDescription` embedded, ad-hoc signed,
   bundled in the .app) was built and exhaustively tested: screen samples flow
@@ -485,3 +486,23 @@ and accepted any loopback that merely *opened*, even a silent one.
   (volume math, labels, target selection) and `SystemTapTests` (mode
   resolution, capture command assembly, stall watchdog, tap format parsing,
   feature detection).
+- **Hardening for sharing (`v1.9-hardening`)**: an InfoSec alert on the
+  original setup traced to EDR-visible patterns, so the tool is now
+  deployable to a colleague without re-raising them. Removed the unsigned
+  `zoom-recorder.app` (a bash script inside a fake bundle, launched by a
+  `RunAtLoad`/`KeepAlive` agent) -- the agent now runs `/usr/bin/python3
+  menubar.py` directly and login autostart is opt-in (`install.sh
+  --autostart`); the default launch is `run-menubar.command`, so a stock
+  install has no persistence. Capture defaults to loopback (microphone is
+  the only TCC permission needed); the Core Audio tap is strictly opt-in
+  (`--system-capture tap`), keeping the System Audio Recording path out of
+  normal operation, and ScreenCaptureKit was already rejected. `--offline`
+  is a hard egress kill-switch in the HTTP client (loopback addresses such
+  as a local Ollama stay allowed) that also disables answers/KB and forces
+  local STT; `--no-notifications` (implied by `--offline`) gates the
+  `osascript` notifications; the self-test tone uses a temp dir. New
+  `--doctor` (backed by `hud/doctor.py`) checks tools, BlackHole, routing,
+  output volume and a real-microphone probe, printing actionable fixes.
+  `install.sh`/`uninstall.sh` wrap setup/removal (`--dry-run`, `--install-deps`),
+  and `SECURITY.md` + `INSTALL.md` give reviewers and colleagues the full
+  access/write/network inventory.

@@ -66,6 +66,14 @@ LONG_SILENCE_S = 60.0
 # Below this, a merged track is a failed capture, not a quiet recording.
 MIN_VALID_RECORDING_S = 2.0
 
+# Desktop notifications (--no-notifications / --offline disable them).
+_NOTIFICATIONS = True
+
+
+def set_notifications(enabled: bool) -> None:
+    global _NOTIFICATIONS
+    _NOTIFICATIONS = bool(enabled)
+
 LOOPBACK_RE = re.compile(
     r"zoom\s*audio\s*device|blackhole|black\s*hole|loopback|soundflower|"
     r"multi-?output|aggregate|virtual",
@@ -744,7 +752,10 @@ def probe_duration(path: Path) -> Optional[float]:
 
 def notify_user(message: str, title: str = "zoom-recorder") -> None:
     """macOS notification from the recorder process (capture.log alone is too
-    easy to miss when the window is not being watched)."""
+    easy to miss when the window is not being watched). Disabled by
+    --offline / --no-notifications."""
+    if not _NOTIFICATIONS:
+        return
     try:
         subprocess.run(
             ["osascript", "-e",
@@ -764,6 +775,8 @@ def alert(label: str, coverage: float) -> None:
         sys.stdout.flush()
     except Exception:
         pass
+    if not _NOTIFICATIONS:
+        return
     try:
         message = "{} track coverage: {:.0f}% (below {:.0f}% threshold)".format(
             label, coverage, LOW_COVERAGE_PCT)
@@ -1015,11 +1028,19 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--restore-routing", action="store_true",
                         help="undo everything: real default output/input, remove the "
                              "Multi-Output Device, then exit")
+    parser.add_argument("--doctor", action="store_true",
+                        help="check the environment (tools, BlackHole, routing, mic) "
+                             "and print fixes, then exit")
     parser.add_argument("--system-capture", default=os.environ.get("ZOOM_SYSTEM_CAPTURE", "auto"),
                         choices=["auto", "tap", "loopback"],
-                        help="how to capture system audio: auto (macOS 14.2+: Core Audio tap; "
-                             "loopback otherwise), tap (direct capture, no routing changes, "
-                             "volume keys keep working), loopback (BlackHole/Multi-Output)")
+                        help="how to capture system audio: loopback (BlackHole/Multi-Output, "
+                             "the default and the only automatic path) or tap (Core Audio "
+                             "process tap; explicit opt-in, needs capture permission)")
+    parser.add_argument("--offline", action="store_true",
+                        help="privacy: block every non-loopback network call (live STT/"
+                             "answers/KB embeddings) and turn notifications off")
+    parser.add_argument("--no-notifications", action="store_true",
+                        help="do not post desktop notifications")
 
     # -- live HUD (opt-in; recording is unchanged when these are not used) ---
     parser.add_argument("--live", action="store_true",
@@ -1115,22 +1136,30 @@ def build_hud_config(args: argparse.Namespace):
         cfg.remote_name = args.remote_name
     if args.no_speaker_labels:
         cfg.speakers_enabled = False
+    if getattr(args, "offline", False):
+        # Offline is a hard privacy switch: no answers, no KB embeddings, and
+        # STT only through a local backend (remote providers would be blocked
+        # by the HTTP client anyway; this makes the intent explicit).
+        from hud.config import LOCAL_STT_BACKENDS
+        cfg.offline = True
+        cfg.notifications = False
+        cfg.answers_enabled = False
+        cfg.kb_enabled = False
+        if (cfg.stt_backend or "").lower() not in LOCAL_STT_BACKENDS:
+            cfg.stt_backend = "local"
     return cfg
 
 
 def resolve_system_capture(args: argparse.Namespace) -> str:
-    """Decide how system audio is captured: tap or loopback."""
-    if args.system_capture == "loopback" or args.system:
-        return "loopback"
-    if args.system_capture == "tap":
+    """Decide how system audio is captured.
+
+    Loopback is the automatic path: it needs no privacy permissions beyond the
+    microphone. The Core Audio tap is the better mode where it works (Terminal
+    context, routing untouched) but is strictly opt-in, so a shared install
+    never trips the audio-capture permission path by surprise.
+    """
+    if args.system_capture == "tap" and not args.system:
         return "tap"
-    if not args.no_system:
-        try:
-            from hud.system_tap import usable_in_this_context
-            if usable_in_this_context():
-                return "tap"
-        except Exception:  # noqa: BLE001
-            pass
     return "loopback"
 
 
@@ -1203,6 +1232,22 @@ def wait_for_first_segment(rec: "Recorder", timeout: float = 6.0) -> bool:
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+    # Privacy switches first: they must be in force before anything can talk
+    # to the network or pop a notification.
+    set_notifications(not (args.offline or args.no_notifications))
+    if args.offline:
+        try:
+            from hud.llm import set_offline
+            set_offline(True)
+        except Exception:  # noqa: BLE001
+            pass
+    if args.doctor:
+        try:
+            from hud.doctor import run_doctor
+        except Exception as exc:  # noqa: BLE001
+            print("ERROR: doctor unavailable: {}".format(exc), file=sys.stderr)
+            return 1
+        return 0 if run_doctor(args.probe_seconds) else 1
     if args.fix_routing or args.restore_routing:
         return run_routing_fix(args)
     if not shutil.which("ffmpeg"):

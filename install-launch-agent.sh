@@ -1,8 +1,14 @@
 #!/bin/bash
-# Installs menubar.py as a per-user LaunchAgent so it starts automatically at
-# login. No background recording daemon is installed -- only the menu-bar
-# toggle app itself; the recorder subprocess still only exists while you're
-# actually recording (see menubar.py's docstring for why that matters).
+# Enables login autostart for the menu-bar app (OPTIONAL).
+#
+# The default way to use the menu bar is ./run-menubar.command, which starts
+# nothing at login and leaves no persistence. This script is the explicit
+# opt-in: it installs a per-user LaunchAgent that starts the menu bar when you
+# log in. No recording daemon is installed -- the recorder subprocess still
+# only exists while you are actually recording.
+#
+# Usage:
+#   ./install-launch-agent.sh [--dry-run]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,6 +17,14 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 PYTHON3="$(command -v python3)"
 LOG_DIR="$HOME/Library/Logs"
 UID_NUM="$(id -u)"
+DRY_RUN=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 
 if [[ ! -x "$PYTHON3" ]]; then
   echo "ERROR: python3 not found on PATH." >&2
@@ -21,9 +35,7 @@ if ! "$PYTHON3" -c "import rumps" 2>/dev/null; then
   exit 1
 fi
 
-mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
-
-cat > "$PLIST" <<PLIST_EOF
+PLIST_CONTENT="$(cat <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -32,7 +44,8 @@ cat > "$PLIST" <<PLIST_EOF
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$SCRIPT_DIR/zoom-recorder.app/Contents/MacOS/zoom-recorder</string>
+        <string>$PYTHON3</string>
+        <string>$SCRIPT_DIR/menubar.py</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
@@ -57,9 +70,20 @@ cat > "$PLIST" <<PLIST_EOF
 </dict>
 </plist>
 PLIST_EOF
+)"
 
-# Unload any previous copy first so re-running this script picks up changes
-# (path moved, python upgraded, etc.) instead of silently keeping stale config.
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "Would write $PLIST:"
+  echo "$PLIST_CONTENT"
+  echo "(dry run: nothing installed)"
+  exit 0
+fi
+
+mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+printf '%s\n' "$PLIST_CONTENT" > "$PLIST"
+
+# Unload any previous copy first so re-running picks up changes (path moved,
+# python upgraded, etc.) instead of silently keeping stale config.
 launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 
 launchctl bootstrap "gui/$UID_NUM" "$PLIST"
@@ -71,3 +95,4 @@ echo "  plist:  $PLIST"
 echo "  log:    $LOG_DIR/zoom-recorder-menubar.log"
 echo "It will now also start automatically at login."
 echo "Look for 🎙 in the menu bar. If you don't see it, check the log above."
+echo "Remove it any time with ./uninstall.sh"

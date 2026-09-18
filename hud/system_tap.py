@@ -502,11 +502,13 @@ def system_tap_self_test(probe_seconds: float = 4.0,
     say = log or (lambda m: None)
     import select
     import subprocess
+    import tempfile
 
     tap = SystemTap(log=say)
     tap.start()
+    tmpdir = tempfile.mkdtemp(prefix="zoomrec_tap_")
     try:
-        tmp = "/tmp/zoomtap_tone.wav"
+        tmp = os.path.join(tmpdir, "tone.wav")
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                         "-f", "lavfi",
                         "-i", "sine=frequency=1000:duration={:.1f}".format(probe_seconds),
@@ -549,6 +551,9 @@ def system_tap_self_test(probe_seconds: float = 4.0,
             pass
         say("System tap FAILED: {}".format(exc))
         return False
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

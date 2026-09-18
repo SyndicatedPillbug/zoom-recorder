@@ -11,5 +11,3 @@ config.local.json
 # HUD caches
 .hud_index/
 
-# macOS bundle signature artifacts (regenerated locally, never committed)
-zoom-recorder.app/Contents/_CodeSignature/

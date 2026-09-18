@@ -161,6 +161,11 @@ class HudConfig:
     budget_tpm: int = 0
     budget_tpd: int = 0
 
+    # Privacy: offline hard-disables all non-loopback network access;
+    # notifications turns the recorder's desktop notifications on/off.
+    offline: bool = False
+    notifications: bool = True
+
     # Provider credentials loaded from the config file (env always wins)
     api_keys: Dict[str, str] = field(default_factory=dict)
 
@@ -270,6 +275,7 @@ def _defaults() -> Dict[str, Any]:
         "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1", "persist_seconds": 20.0},
         "speakers": {"enabled": True, "self_name": "You", "remote_name": "Others"},
         "budget": {"tpm": 0, "tpd": 0},
+        "privacy": {"offline": False, "notifications": True},
         "api_keys": {},
     }
 
@@ -304,6 +310,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
     hud = data.get("hud") or {}
     speakers = data.get("speakers") or {}
     budget = data.get("budget") or {}
+    privacy = data.get("privacy") or {}
 
     return HudConfig(
         stt_backend=str(stt.get("backend") or "groq"),
@@ -365,6 +372,8 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         persist_seconds=_as_float(hud.get("persist_seconds"), 20.0),
         budget_tpm=_as_int(budget.get("tpm"), 0),
         budget_tpd=_as_int(budget.get("tpd"), 0),
+        offline=bool(privacy.get("offline", False)),
+        notifications=bool(privacy.get("notifications", True)),
         api_keys={str(k): str(v) for k, v in (data.get("api_keys") or {}).items()},
     )
 
@@ -440,6 +449,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "persist_seconds": cfg.persist_seconds,
     })
     out["budget"].update({"tpm": cfg.budget_tpm, "tpd": cfg.budget_tpd})
+    out["privacy"].update({"offline": cfg.offline, "notifications": cfg.notifications})
     out["api_keys"] = dict(cfg.api_keys) if include_keys else {}
     return out
 
