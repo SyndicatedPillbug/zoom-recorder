@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.zoomrecorder.app</string>
+    <key>CFBundleName</key>
+    <string>zoom-recorder</string>
+    <key>CFBundleDisplayName</key>
+    <string>zoom-recorder</string>
+    <key>CFBundleExecutable</key>
+    <string>zoom-recorder</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.7</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>zoom-recorder records the other party's call audio. macOS asks once per permission context; granting it lets the recorder capture system audio directly without changing your output routing.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>zoom-recorder records your side of the call with the microphone you select.</string>
+</dict>
+</plist>

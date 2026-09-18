@@ -173,14 +173,23 @@ class LiveSession:
                        "the other party will not be captured.")
         else:
             try:
-                from .devices import system_advice, system_priority
-                warning = system_advice() or ""
-                if not warning and system_priority(self.system_name) <= 20:
-                    warning = ("'{}' only carries Zoom's own audio, not general system "
-                               "output; the other party may not be captured. Install "
-                               "BlackHole and use a Multi-Output Device.").format(self.system_name)
-            except Exception:  # noqa: BLE001
+                from .system_tap import SOURCE_NAME as TAP_SOURCE
+            except ImportError:
+                TAP_SOURCE = None
+            if TAP_SOURCE is not None and self.system_name == TAP_SOURCE:
+                # Tap capture does not change any routing; the loopback
+                # advice does not apply and would only mislead.
                 warning = ""
+            else:
+                try:
+                    from .devices import system_advice, system_priority
+                    warning = system_advice() or ""
+                    if not warning and system_priority(self.system_name) <= 20:
+                        warning = ("'{}' only carries Zoom's own audio, not general system "
+                                   "output; the other party may not be captured. Install "
+                                   "BlackHole and use a Multi-Output Device.").format(self.system_name)
+                except Exception:  # noqa: BLE001
+                    warning = ""
         self.state.set_meta(mic_device=self.mic_name or "",
                             system_device=self.system_name or "",
                             system_audio_warning=warning)

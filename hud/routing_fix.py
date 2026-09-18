@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import json
 import re
-import subprocess
+import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 try:
     from .devices import AudioDevice, Topology, read_system_profiler, system_priority
@@ -41,6 +43,10 @@ except ImportError:  # run as a plain script from the repo root
 # The multi-output device this module creates/owns (stable name -> we can
 # find and update it on later runs).
 MULTI_OUTPUT_NAME = "zoom-recorder Multi-Output"
+
+# Where the last successful pairing is remembered (so rebuilds track the
+# device you actually listen on instead of re-guessing).
+STATE_PATH = Path.home() / ".zoom_recorder_routing.json"
 
 # Real output devices, best first (this is what plays to your ears).
 PHYSICAL_OUTPUT_PRIORITY = [
@@ -55,7 +61,9 @@ _DEVICE_LIST = int.from_bytes(b"dev#", "big")
 _DEVICE_NAME = int.from_bytes(b"lnam", "big")
 _DEVICE_UID = int.from_bytes(b"uid ", "big")
 _DEFAULT_OUTPUT = int.from_bytes(b"dOut", "big")
-_AGG_SUBDEVICE_LIST = int.from_bytes(b"slst", "big")
+_DEFAULT_INPUT = int.from_bytes(b"dIn ", "big")
+_VOLUME_SCALAR = int.from_bytes(b"volm", "big")
+_OUTPUT_SCOPE = int.from_bytes(b"outp", "big")
 _SYSTEM_OBJECT = 1
 
 
@@ -86,37 +94,6 @@ def physical_output_priority(name: str) -> int:
     return 10
 
 
-def choose_physical_output(topo: Topology,
-                           override: Optional[str] = None) -> Optional[AudioDevice]:
-    """Pick the real (non-virtual) output device to pair with the loopback.
-
-    When the current default output is a loopback-only misroute (e.g. plain
-    BlackHole, so nothing is audible), we still want a real device in the
-    multi-output, so the choice is made by ranking instead of the default.
-    """
-    real = [d for d in topo.devices if d.output_channels > 0
-            and not d.is_virtual and not d.is_aggregate]
-    if override:
-        for dev in real:
-            if dev.name == override:
-                return dev
-        return None
-    if not real:
-        return None
-    current = topo.device(topo.default_output)
-    if current is not None and current in real:
-        return current
-    return max(real, key=lambda d: (physical_output_priority(d.name), d.name))
-
-
-def needs_fix(topo: Topology) -> bool:
-    """True when the default output is not an aggregate/multi-output."""
-    out = topo.device(topo.default_output)
-    if out is None:
-        return bool(topo.devices) and not topo.system_in_output_path
-    return not out.is_aggregate
-
-
 def walkthrough(loopback: str, physical: str, multi: str) -> str:
     return """\
 Click-by-click manual setup (only needed if automation failed):
@@ -139,8 +116,9 @@ Click-by-click manual setup (only needed if automation failed):
 
 Note: a Multi-Output Device plays to BOTH devices but the volume keys
 usually stop working for it; set levels once in Audio MIDI Setup. If you
-switch between headphones and speakers, re-run the fix so the multi-output
-tracks the device you actually listen on.""".format(loopback=loopback, physical=physical, multi=multi)
+switch between headphones and speakers, re-run this fix (or use the
+menu-bar "Audio Out" dropdown) to rebuild the multi-output around the
+device you actually listen on.""".format(loopback=loopback, physical=physical, multi=multi)
 
 
 # ------------------------------------------------------- CoreAudio (ctypes)
@@ -267,6 +245,60 @@ class _CoreAudio:
         if err != 0:
             raise RoutingError("SetPropertyData(dOut) failed: {}".format(err))
 
+    def set_default_input(self, device_id: int) -> None:
+        class _Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32),
+                        ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        addr = _Addr(_DEFAULT_INPUT, self.GLOB, 0)
+        val = ctypes.c_uint32(device_id)
+        err = self.ca.AudioObjectSetPropertyData(
+            _SYSTEM_OBJECT, ctypes.byref(addr), 0, None, 4, ctypes.byref(val))
+        if err != 0:
+            raise RoutingError("SetPropertyData(dIn) failed: {}".format(err))
+
+    def default_input_id(self) -> int:
+        return self.get_u32(_SYSTEM_OBJECT, _DEFAULT_INPUT)
+
+    def set_device_volume(self, device_id: int, percent: float) -> None:
+        """Set a device's output volume (0-100). This is the only way to
+        control loudness for a Multi-Output Device: macOS routes volume keys
+        to the default output, and an aggregate has no master volume."""
+        class _Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32),
+                        ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        addr = _Addr(_VOLUME_SCALAR, _OUTPUT_SCOPE, 0)
+        scalar = ctypes.c_float(max(0.0, min(1.0, percent / 100.0)))
+        err = self.ca.AudioObjectSetPropertyData(
+            device_id, ctypes.byref(addr), 0, None,
+            ctypes.sizeof(ctypes.c_float), ctypes.byref(scalar))
+        if err != 0:
+            raise RoutingError("SetPropertyData(volume) failed: {}".format(err))
+
+    def get_device_volume(self, device_id: int) -> float:
+        class _Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32),
+                        ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        addr = _Addr(_VOLUME_SCALAR, _OUTPUT_SCOPE, 0)
+        size = ctypes.c_uint32(0)
+        err = self.ca.AudioObjectGetPropertyDataSize(
+            device_id, ctypes.byref(addr), 0, None, ctypes.byref(size))
+        if err != 0:
+            raise RoutingError("volume is not settable on this device ({})".format(err))
+        buf = ctypes.create_string_buffer(size.value)
+        n = ctypes.c_uint32(size.value)
+        err = self.ca.AudioObjectGetPropertyData(
+            device_id, ctypes.byref(addr), 0, None, ctypes.byref(n), buf)
+        if err != 0:
+            raise RoutingError("GetPropertyData(volume) failed: {}".format(err))
+        scalar = ctypes.cast(buf, ctypes.POINTER(ctypes.c_float)).contents.value
+        return round(scalar * 100.0)
+
     def default_output_id(self) -> int:
         return self.get_u32(_SYSTEM_OBJECT, _DEFAULT_OUTPUT)
 
@@ -314,18 +346,6 @@ class _CoreAudio:
         if err != 0:
             raise RoutingError("AudioHardwareDestroyAggregateDevice failed: {}".format(err))
 
-    def aggregate_subdevice_uids(self, device_id: int) -> Optional[List[str]]:
-        try:
-            ref = self.get_ref(device_id, _AGG_SUBDEVICE_LIST)
-        except RoutingError:
-            return None
-        uids = []
-        count = self.cf.CFArrayGetCount(ref)
-        for i in range(count):
-            d = self.cf.CFArrayGetValueAtIndex(ref, i)
-            uids.append(self.pystr(self.cf.CFDictionaryGetValue(d, self.cfstr("uid"))))
-        return uids
-
 
 _BACKEND: Optional[_CoreAudio] = None
 
@@ -339,8 +359,213 @@ def backend() -> _CoreAudio:
 
 # ------------------------------------------------------------------ the fix
 
+def load_state(path: Path = STATE_PATH) -> Dict[str, str]:
+    """Last successful pairing; empty dict when missing/corrupt."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+
+
+def save_state(loopback_uid: str, loopback_name: str,
+               physical_uid: str, physical_name: str,
+               path: Path = STATE_PATH) -> None:
+    data = {
+        "multi_output_name": MULTI_OUTPUT_NAME,
+        "loopback_uid": loopback_uid,
+        "loopback_name": loopback_name,
+        "physical_uid": physical_uid,
+        "physical_name": physical_name,
+    }
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # preference is a nicety; the routing itself is already applied
+
+
+def decide_action(state: Dict[str, str], existing_name: Optional[str],
+                  loop_uid: str, phys_uid: str) -> str:
+    """Return "reuse" when the existing multi-output is known-good, else "rebuild".
+
+    macOS will not report an aggregate's subdevice list for stacked devices,
+    so the persisted pairing (not the HAL) is the source of truth: rebuild
+    whenever the state disagrees with what we want or no device exists.
+    """
+    if existing_name != MULTI_OUTPUT_NAME:
+        return "rebuild"
+    if state.get("multi_output_name") != MULTI_OUTPUT_NAME:
+        return "rebuild"
+    if state.get("loopback_uid") != loop_uid or state.get("physical_uid") != phys_uid:
+        return "rebuild"
+    return "reuse"
+
+
+def real_outputs(topo: Topology) -> List[AudioDevice]:
+    """Real (non-virtual, non-aggregate) output devices, best first."""
+    real = [d for d in topo.devices if d.output_channels > 0
+            and not d.is_virtual and not d.is_aggregate]
+    return sorted(real, key=lambda d: (physical_output_priority(d.name), d.name),
+                  reverse=True)
+
+
+def choose_physical_output(topo: Topology,
+                           override: Optional[str] = None,
+                           state: Optional[Dict[str, str]] = None) -> Optional[AudioDevice]:
+    """Pick the real (non-virtual) output device to pair with the loopback.
+
+    Priority: explicit --output override > remembered preference (when that
+    device is still present) > ranked choice. When the remembered device is
+    unplugged we fall back to the best available so sound always works, but
+    the preference stays stored so it wins again the moment it reappears.
+    """
+    options = real_outputs(topo)
+    if override:
+        for dev in options:
+            if dev.name == override:
+                return dev
+        return None
+    if not options:
+        return None
+    if state:
+        for dev in options:
+            if dev.name == state.get("physical_name"):
+                return dev
+    return options[0]
+
+
+def needs_fix(topo: Topology) -> bool:
+    """True when the default output is not an aggregate/multi-output."""
+    out = topo.device(topo.default_output)
+    if out is None:
+        return bool(topo.devices) and not topo.system_in_output_path
+    return not out.is_aggregate
+
+
+def restore_routing(topo: Optional[Topology] = None,
+                    output: Optional[str] = None,
+                    input_device: Optional[str] = None) -> FixResult:
+    """Undo everything this tool changed: real default output, real default
+    input, and remove the tool-owned Multi-Output Device.
+
+    Used when switching to tap capture (which needs no routing at all) or
+    when the user simply wants their Mac back to normal.
+    """
+    topo = topo or read_system_profiler()
+    try:
+        ca = backend()
+        ca_devices = ca.devices()
+    except RoutingError as exc:
+        return FixResult(False, False, str(exc))
+
+    out = choose_physical_output(topo, output)
+    if out is None or out.name not in {d.name for d in ca_devices}:
+        return FixResult(False, False,
+                         "Could not find a real output device to restore.\n\n"
+                         + walkthrough("BlackHole 2ch", "(your speakers)", MULTI_OUTPUT_NAME))
+    out_id = next(d.object_id for d in ca_devices if d.name == out.name)
+
+    mics = topo.mics()
+    in_name = None
+    if input_device:
+        in_name = input_device
+    else:
+        current = topo.device(topo.default_input)
+        if current is not None and current in mics:
+            in_name = current.name
+        else:
+            builtins = [m for m in mics if re.search(r"built-?in|macbook", m.name, re.I)]
+            in_name = (builtins or mics or [None])[0].name if (builtins or mics) else None
+    if in_name is None or in_name not in {d.name for d in ca_devices}:
+        return FixResult(False, False, "Could not find a real microphone to select as "
+                                       "the default input{}".format(
+                                           " ('{}' not found)".format(input_device)
+                                           if input_device else "") + ".")
+    in_id = next(d.object_id for d in ca_devices if d.name == in_name)
+
+    removed = False
+    try:
+        ca.set_default_output(out_id)
+        ca.set_default_input(in_id)
+        by_name = {d.name: d for d in ca.devices()}
+        if MULTI_OUTPUT_NAME in by_name:
+            ca.destroy_aggregate(by_name[MULTI_OUTPUT_NAME].object_id)
+            removed = True
+        try:
+            STATE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+    except RoutingError as exc:
+        return FixResult(False, False, "macOS refused the restore ({}).".format(exc))
+
+    deadline = time.time() + 3.0
+    verified = ""
+    while time.time() < deadline and not verified:
+        try:
+            if ca.default_output_id() == out_id and ca.default_input_id() == in_id:
+                verified = " Verified: default output '{}' and default input '{}'.".format(
+                    out.name, in_name)
+        except RoutingError:
+            pass
+        time.sleep(0.2)
+    return FixResult(True, True,
+                     "Default output -> '{}', default input -> '{}'.{}{}"
+                     .format(out.name, in_name,
+                             " Removed '{}'.".format(MULTI_OUTPUT_NAME) if removed else "",
+                             verified or ""))
+
+
+def set_output_volume(percent: float, topo: Optional[Topology] = None,
+                      physical_output: Optional[str] = None) -> FixResult:
+    """Volume for loopback (Multi-Output) mode: macOS volume keys do nothing
+    for an aggregate, so the real output device's volume is set directly."""
+    topo = topo or read_system_profiler()
+    try:
+        ca = backend()
+        ca_devices = ca.devices()
+    except RoutingError as exc:
+        return FixResult(False, False, str(exc))
+    physical = choose_physical_output(topo, physical_output, load_state())
+    if physical is None or physical.name not in {d.name for d in ca_devices}:
+        return FixResult(False, False, "No real output device found for volume control.")
+    dev_id = next(d.object_id for d in ca_devices if d.name == physical.name)
+    try:
+        ca.set_device_volume(dev_id, percent)
+        return FixResult(True, True, "'{}' volume -> {:.0f}%".format(physical.name, percent))
+    except RoutingError as exc:
+        return FixResult(False, False, str(exc))
+
+
+def get_output_volume(topo: Optional[Topology] = None,
+                      physical_output: Optional[str] = None) -> Optional[float]:
+    topo = topo or read_system_profiler()
+    try:
+        ca = backend()
+        ca_devices = ca.devices()
+    except RoutingError:
+        return None
+    physical = choose_physical_output(topo, physical_output, load_state())
+    if physical is None or physical.name not in {d.name for d in ca_devices}:
+        return None
+    dev_id = next((d.object_id for d in ca_devices if d.name == physical.name), None)
+    if dev_id is None:
+        return None
+    try:
+        return ca.get_device_volume(dev_id)
+    except RoutingError:
+        return None
+
+
+def list_real_outputs(topo: Optional[Topology] = None) -> List[str]:
+    """Names of real output devices, best first (read-only; for menus/CLI)."""
+    return [d.name for d in real_outputs(topo or read_system_profiler())]
+
+
 def fix_routing(topo: Optional[Topology] = None,
-                physical_output: Optional[str] = None) -> FixResult:
+                physical_output: Optional[str] = None,
+                assume_yes: bool = False) -> FixResult:
     """Create the Multi-Output Device and select it as default output.
 
     Returns a FixResult; on failure the message contains the click-by-click
@@ -360,12 +585,8 @@ def fix_routing(topo: Optional[Topology] = None,
                                                       MULTI_OUTPUT_NAME))
 
     loopback = loopbacks[0]
-    if not needs_fix(topo) and not physical_output:
-        return FixResult(True, False,
-                         "System audio is routed through '{}' -- nothing to do."
-                         .format(topo.default_output))
-
-    physical = choose_physical_output(topo, physical_output)
+    state = load_state()
+    physical = choose_physical_output(topo, physical_output, state)
     if physical is None:
         return FixResult(
             False, False,
@@ -375,6 +596,12 @@ def fix_routing(topo: Optional[Topology] = None,
                 " '{}' was requested but not found.".format(physical_output)
                 if physical_output else "",
                 walkthrough(loopback.name, "(your speakers/headphones)", MULTI_OUTPUT_NAME)))
+
+    if not physical_output and not state and not assume_yes:
+        picked = _prompt_for_output(topo, physical)
+        if picked is None:
+            return FixResult(False, False, "No output device selected; nothing changed.")
+        physical = picked
 
     try:
         ca = backend()
@@ -388,40 +615,60 @@ def fix_routing(topo: Optional[Topology] = None,
 
     loop_uid = by_name[loopback.name].uid
     phys_uid = by_name[physical.name].uid
-    wanted = {loop_uid, phys_uid}
     existing = by_name.get(MULTI_OUTPUT_NAME)
+    action = decide_action(state, MULTI_OUTPUT_NAME if existing else None,
+                           loop_uid, phys_uid)
 
     try:
-        if existing is not None:
-            current_uids = ca.aggregate_subdevice_uids(existing.object_id)
-            if current_uids is not None and set(current_uids) == wanted:
-                ca.set_default_output(existing.object_id)
-                return _verified_multi_output(ca, existing.object_id, changed=False,
-                                              detail="Existing '{}' is already correct; selected it as the default output.".format(MULTI_OUTPUT_NAME))
-            if current_uids is not None and set(current_uids) != wanted:
-                ca.destroy_aggregate(existing.object_id)
-                existing = None
-        if existing is None:
+        if action == "rebuild" and existing is not None:
+            ca.destroy_aggregate(existing.object_id)
+        if action == "rebuild":
             new_id = ca.create_multi_output(MULTI_OUTPUT_NAME, [loop_uid, phys_uid], phys_uid)
             ca.set_default_output(new_id)
+            save_state(loop_uid, loopback.name, phys_uid, physical.name)
             return _verified_multi_output(
                 ca, new_id, changed=True,
-                detail="Created '{}' ({} + {}) and set it as the default output.".format(
+                detail="Rebuilt '{}' ({} + {}) and set it as the default output.".format(
                     MULTI_OUTPUT_NAME, loopback.name, physical.name))
-        # Subdevice list unreadable: trust the existing device.
+        # Reuse: make sure the multi-output is the system default output.
         ca.set_default_output(existing.object_id)
         return _verified_multi_output(
             ca, existing.object_id, changed=False,
-            detail="Selected existing '{}' as the default output.".format(MULTI_OUTPUT_NAME))
+            detail="'{}' ({} + {}) is already correct; selected it as the default output.".format(
+                MULTI_OUTPUT_NAME, loopback.name, physical.name))
     except RoutingError as exc:
-        return FixResult(False, False, "macOS refused the automatic fix ({}).{}\n\n{}".format(
-            exc, _reused_or_destroyed_note(loopback, physical),
-            walkthrough(loopback.name, physical.name, MULTI_OUTPUT_NAME)))
+        return FixResult(False, False, "macOS refused the automatic fix ({}). Any partially "
+                                       "created device may still exist in Audio MIDI Setup under "
+                                       "'{}'.\n\n{}".format(exc, MULTI_OUTPUT_NAME,
+                                                            walkthrough(loopback.name, physical.name, MULTI_OUTPUT_NAME)))
 
 
-def _reused_or_destroyed_note(loopback: AudioDevice, physical: AudioDevice) -> str:
-    return (" Any partially created device may still exist in Audio MIDI Setup under "
-            "'{}'.".format(MULTI_OUTPUT_NAME))
+def _prompt_for_output(topo: Topology, default: AudioDevice) -> Optional[AudioDevice]:
+    """Interactive pick of the passthrough output (only when stdin is a TTY)."""
+    try:
+        if not sys.stdin.isatty():
+            return default
+    except Exception:  # noqa: BLE001
+        return default
+    options = real_outputs(topo)
+    if len(options) <= 1:
+        return default
+    print("Which output device should play audio alongside the loopback?")
+    for i, dev in enumerate(options, 1):
+        marker = " (default)" if dev is default else ""
+        print("  [{}] {}{}".format(i, dev.name, marker))
+    try:
+        answer = input("Pick 1-{} [{}]: ".format(len(options), options.index(default) + 1))
+    except (EOFError, KeyboardInterrupt):
+        return default
+    answer = answer.strip()
+    if not answer:
+        return default
+    try:
+        return options[int(answer) - 1]
+    except (ValueError, IndexError):
+        print("Unrecognized choice '{}'; using {}.".format(answer, default.name))
+        return default
 
 
 def _walkthrough_or_empty(loopback: AudioDevice, physical: AudioDevice) -> str:
@@ -454,9 +701,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Fix macOS system-audio routing for loopback capture "
                     "(create a Multi-Output Device and select it as default output).")
     parser.add_argument("--output", default=None, metavar="NAME",
-                        help="real output device to include (default: ranked choice)")
+                        help="real output device to include (default: stored preference, "
+                             "else ranked choice; prompts interactively when unset)")
+    parser.add_argument("--list-outputs", action="store_true",
+                        help="list real output devices (pairing candidates) and exit")
+    parser.add_argument("--restore-routing", action="store_true",
+                        help="undo everything: real default output/input and remove "
+                             "the tool-owned Multi-Output Device")
+    parser.add_argument("--input", default=None, metavar="NAME",
+                        help="with --restore-routing: which microphone to select")
+    parser.add_argument("--yes", action="store_true",
+                        help="never prompt; accept the chosen/default output")
     args = parser.parse_args(argv)
-    result = fix_routing(physical_output=args.output)
+
+    if args.list_outputs:
+        state = load_state()
+        current = state.get("physical_name")
+        for name in list_real_outputs():
+            print("{}{}".format(name, "  (paired)" if name == current else ""))
+        return 0
+
+    if args.restore_routing:
+        result = restore_routing(output=args.output, input_device=args.input)
+        print(result.message)
+        print("RESULT: {}".format("OK" if result.ok else "MANUAL"))
+        return 0 if result.ok else 1
+
+    result = fix_routing(physical_output=args.output, assume_yes=args.yes)
     print(result.message)
     print("RESULT: {}".format("OK" if result.ok else "MANUAL"))
     return 0 if result.ok else 1

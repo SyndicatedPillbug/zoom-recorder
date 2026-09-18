@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import ctypes
 import queue
 import struct
 import sys
@@ -1395,10 +1396,303 @@ class RoutingFixTests(unittest.TestCase):
 
         text = walkthrough("BlackHole 2ch", "External Headphones", "zoom-recorder Multi-Output")
         for step in ["Audio MIDI Setup", "Create Multi-Output Device",
-                     "Drift Correction", "self-test"]:
+                     "Drift Correction", "self-test", "Audio Out"]:
             self.assertIn(step, text)
         self.assertIn("BlackHole 2ch", text)
         self.assertIn("External Headphones", text)
+
+    def test_real_outputs_filters_virtual_and_sorts(self) -> None:
+        from hud.routing_fix import real_outputs
+
+        topo = self._topology([
+            {"name": "BlackHole 2ch", "transport": "virtual", "output_channels": 2},
+            {"name": "CU34G2XP", "transport": "displayport", "output_channels": 2},
+            {"name": "External Headphones", "transport": "builtin", "output_channels": 2},
+            {"name": "MacBook Air Speakers", "transport": "builtin", "output_channels": 2},
+        ])
+        self.assertEqual([d.name for d in real_outputs(topo)],
+                         ["External Headphones", "MacBook Air Speakers", "CU34G2XP"])
+
+    def test_decide_action_matrix(self) -> None:
+        from hud.routing_fix import MULTI_OUTPUT_NAME, decide_action
+
+        state = {"multi_output_name": MULTI_OUTPUT_NAME,
+                 "loopback_uid": "lb", "physical_uid": "ph"}
+        self.assertEqual(decide_action(state, MULTI_OUTPUT_NAME, "lb", "ph"), "reuse")
+        # stored pairing no longer matches the desired pairing
+        self.assertEqual(decide_action(state, MULTI_OUTPUT_NAME, "lb", "other"), "rebuild")
+        # device with our name missing / foreign name
+        self.assertEqual(decide_action(state, None, "lb", "ph"), "rebuild")
+        self.assertEqual(decide_action(state, "Someone Else's Aggregate", "lb", "ph"),
+                         "rebuild")
+        # corrupt/missing state
+        self.assertEqual(decide_action({}, MULTI_OUTPUT_NAME, "lb", "ph"), "rebuild")
+
+    def test_state_roundtrip(self) -> None:
+        from hud.routing_fix import load_state, save_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            self.assertEqual(load_state(path), {})
+            save_state("lb", "BlackHole 2ch", "ph", "External Headphones", path)
+            self.assertEqual(load_state(path),
+                             {"multi_output_name": "zoom-recorder Multi-Output",
+                              "loopback_uid": "lb", "loopback_name": "BlackHole 2ch",
+                              "physical_uid": "ph", "physical_name": "External Headphones"})
+            path.write_text("not json", encoding="utf-8")
+            self.assertEqual(load_state(path), {})
+
+    def test_choose_physical_output_prefers_stored_and_falls_back(self) -> None:
+        from hud.routing_fix import choose_physical_output
+
+        topo = self._broken_topo()
+        # Stored preference wins over the ranked choice.
+        self.assertEqual(
+            choose_physical_output(topo, None,
+                                   {"physical_name": "MacBook Air Speakers"}).name,
+            "MacBook Air Speakers")
+        # Stored device unplugged -> best available (preference not deleted).
+        self.assertEqual(
+            choose_physical_output(topo, None,
+                                   {"physical_name": "USB Studio Monitors"}).name,
+            "External Headphones")
+        # Explicit override beats the stored preference.
+        self.assertEqual(
+            choose_physical_output(topo, "MacBook Air Speakers",
+                                   {"physical_name": "External Headphones"}).name,
+            "MacBook Air Speakers")
+
+    def test_fix_routing_rebuilds_when_state_mismatches(self) -> None:
+        from hud import routing_fix
+
+        # BlackHole + a multi-output already exists as default output, but the
+        # stored pairing names a device that is no longer present -> must
+        # rebuild, not just re-select the stale device.
+        topo = self._topology([
+            {"name": "BlackHole 2ch", "transport": "coreaudio_device_type_virtual",
+             "input_channels": 2, "output_channels": 2},
+            {"name": "MacBook Air Speakers", "transport": "builtin",
+             "output_channels": 2},
+            {"name": routing_fix.MULTI_OUTPUT_NAME, "transport": "aggregate",
+             "input_channels": 2, "output_channels": 2, "default_output": True},
+        ])
+        state = {"multi_output_name": routing_fix.MULTI_OUTPUT_NAME,
+                 "loopback_uid": "BlackHole2ch_UID",
+                 "physical_uid": "BuiltInHeadphoneOutputDevice",
+                 "physical_name": "External Headphones"}
+
+        calls = []
+
+        class FakeCA:
+            def devices(self):
+                return [routing_fix.CaDevice(1, "BlackHole 2ch", "BlackHole2ch_UID"),
+                        routing_fix.CaDevice(2, "MacBook Air Speakers",
+                                             "BuiltInSpeakerDevice"),
+                        routing_fix.CaDevice(3, routing_fix.MULTI_OUTPUT_NAME,
+                                             "zoom-recorder-multi-output")]
+
+            def destroy_aggregate(self, did):
+                calls.append(("destroy", did))
+
+            def create_multi_output(self, name, sub_uids, master_uid):
+                calls.append(("create", name, tuple(sub_uids), master_uid))
+                return 42
+
+            def set_default_output(self, did):
+                calls.append(("default", did))
+
+        with mock.patch.object(routing_fix, "load_state", return_value=state), \
+                mock.patch.object(routing_fix, "backend", return_value=FakeCA()), \
+                mock.patch.object(routing_fix, "_verified_multi_output",
+                                  side_effect=lambda _ca, did, changed, detail:
+                                  routing_fix.FixResult(True, changed, detail)):
+            result = routing_fix.fix_routing(topo, assume_yes=True)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.changed)
+        self.assertIn(("destroy", 3), calls)
+        self.assertIn(("create", routing_fix.MULTI_OUTPUT_NAME,
+                       ("BlackHole2ch_UID", "BuiltInSpeakerDevice"),
+                       "BuiltInSpeakerDevice"), calls)
+
+    def test_fix_routing_reuse_when_state_matches(self) -> None:
+        from hud import routing_fix
+
+        topo = self._topology([
+            {"name": "BlackHole 2ch", "transport": "coreaudio_device_type_virtual",
+             "input_channels": 2, "output_channels": 2},
+            {"name": "MacBook Air Speakers", "transport": "builtin",
+             "output_channels": 2},
+            {"name": routing_fix.MULTI_OUTPUT_NAME, "transport": "aggregate",
+             "input_channels": 2, "output_channels": 2, "default_output": True},
+        ])
+        state = {"multi_output_name": routing_fix.MULTI_OUTPUT_NAME,
+                 "loopback_uid": "BlackHole2ch_UID",
+                 "physical_uid": "BuiltInSpeakerDevice",
+                 "physical_name": "MacBook Air Speakers"}
+        calls = []
+
+        class FakeCA:
+            def devices(self):
+                return [routing_fix.CaDevice(1, "BlackHole 2ch", "BlackHole2ch_UID"),
+                        routing_fix.CaDevice(2, "MacBook Air Speakers",
+                                             "BuiltInSpeakerDevice"),
+                        routing_fix.CaDevice(3, routing_fix.MULTI_OUTPUT_NAME,
+                                             "zoom-recorder-multi-output")]
+
+            def destroy_aggregate(self, did):
+                calls.append(("destroy", did))
+
+            def create_multi_output(self, *args):
+                calls.append(("create",))
+                return 42
+
+            def set_default_output(self, did):
+                calls.append(("default", did))
+
+        with mock.patch.object(routing_fix, "load_state", return_value=state), \
+                mock.patch.object(routing_fix, "backend", return_value=FakeCA()), \
+                mock.patch.object(routing_fix, "_verified_multi_output",
+                                  side_effect=lambda _ca, did, changed, detail:
+                                  routing_fix.FixResult(True, changed, detail)):
+            result = routing_fix.fix_routing(topo, assume_yes=True)
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.changed)
+        self.assertNotIn(("create", 42), calls)
+        self.assertNotIn(("destroy", 3), calls)
+        self.assertIn(("default", 3), calls)
+
+
+class AudioMenuTests(unittest.TestCase):
+    def test_specs_mark_current_pairing(self) -> None:
+        from menubar import audio_menu_specs
+
+        specs = audio_menu_specs(["MacBook Air Speakers", "External Headphones"],
+                                 "External Headphones")
+        self.assertEqual(specs[0], ("MacBook Air Speakers", "MacBook Air Speakers"))
+        self.assertEqual(specs[1], ("✓ External Headphones", "External Headphones"))
+        self.assertEqual(specs[-2], (None, None))  # separator
+        self.assertEqual(specs[-1], ("Rebuild Routing", None))
+
+
+class SystemTapTests(unittest.TestCase):
+    def _args(self, capture="auto", system=None, no_system=False):
+        import argparse
+
+        return argparse.Namespace(system_capture=capture, system=system,
+                                  no_system=no_system)
+
+    def test_resolve_loopback_when_system_override(self) -> None:
+        from zoom_record import resolve_system_capture
+
+        self.assertEqual(resolve_system_capture(
+            self._args(capture="auto", system="BlackHole 2ch")), "loopback")
+        self.assertEqual(resolve_system_capture(self._args(capture="loopback")),
+                         "loopback")
+
+    def test_resolve_system_capture_requires_tap_support(self) -> None:
+        import zoom_record as zr
+
+        with mock.patch("hud.system_tap.available", return_value=True):
+            self.assertEqual(zr.resolve_system_capture(self._args()), "tap")
+        with mock.patch("hud.system_tap.available", return_value=False):
+            self.assertEqual(zr.resolve_system_capture(self._args()), "loopback")
+        self.assertEqual(zr.resolve_system_capture(self._args(capture="tap")), "tap")
+
+    def test_capture_cmd_with_pcm_pipe(self) -> None:
+        from zoom_record import build_capture_cmd
+
+        class FakePCM:
+            read_fd = 7
+
+            def ffmpeg_args(self):
+                return ["-thread_queue_size", "4096", "-f", "f32le",
+                        "-ar", "48000", "-ac", "2", "-i", "pipe:7"]
+
+            def name(self):
+                return "System Tap (macOS)"
+
+        cmd, pass_fds = build_capture_cmd(
+            "MacBook Air Microphone", None, FakePCM(), Path("/tmp/s"), 60)
+        self.assertIn("pipe:7", cmd)
+        self.assertIn("-map", cmd)
+        self.assertEqual(cmd[cmd.index("-map") + 1], "0:a")
+        self.assertEqual(pass_fds, (7,))
+        # mic + system device path must not request the pipe fd
+        cmd2, fds2 = build_capture_cmd(
+            "Mic", "BlackHole 2ch", None, Path("/tmp/s"), 60)
+        self.assertIn(":BlackHole 2ch", cmd2)
+        self.assertEqual(fds2, ())
+
+    def test_tap_stall_detection_pure(self) -> None:
+        from hud.system_tap import SystemTap
+
+        tap = SystemTap()
+        tap._started = True
+        tap._last_bytes_at = time.time() - 10
+        tap.bytes_total = 1000
+        self.assertTrue(tap.stalled_after(5.0))
+        tap._last_bytes_at = time.time()
+        self.assertFalse(tap.stalled_after(5.0))
+        # never-started tap never reports stalled
+        tap2 = SystemTap()
+        tap2.bytes_total = 0
+        self.assertFalse(tap2.stalled_after(0.0))
+
+    def test_tap_format_parsing(self) -> None:
+        from hud.system_tap import _read_tap_format
+
+        asbd = struct.pack("<dIIIIIIII", 48000.0, 0x6C70636D, 0x29, 8, 1, 8, 2, 32, 0)
+
+        class FakeCA:
+            def AudioObjectGetPropertyDataSize(self, obj, addr, q, qual, size):
+                size._obj.value = len(asbd)  # CArgObject wraps the real buffer
+                return 0
+
+            def AudioObjectGetPropertyData(self, obj, addr, q, qual, n, buf):
+                buf.raw = asbd  # buffer is passed by value (not byref)
+                n._obj.value = len(asbd)
+                return 0
+
+        fmt = _read_tap_format(FakeCA(), 1)
+        self.assertEqual(fmt.sample_rate, 48000)
+        self.assertEqual(fmt.channels, 2)
+        self.assertTrue(fmt.is_float)
+
+    def test_tap_feature_detection(self) -> None:
+        from hud.system_tap import available, _macos_version
+
+        import platform as _platform
+        with mock.patch.object(_platform_module(), "mac_ver", return_value=("15.7.8", "", "")):
+            self.assertTrue(available())
+        with mock.patch.object(_platform_module(), "mac_ver", return_value=("13.6.0", "", "")):
+            self.assertFalse(available())
+
+    def test_available_on_non_darwin(self) -> None:
+        from hud.system_tap import available
+
+        with mock.patch.object(_platform_module(), "system", return_value="Linux"):
+            self.assertFalse(available())
+
+    def test_hud_suppresses_loopback_advice_in_tap_mode(self) -> None:
+        from hud.session import LiveSession
+        from hud.system_tap import SOURCE_NAME
+        from hud.config import HudConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = LiveSession(HudConfig(), Path(tmp), lambda _m: None, "Mic", SOURCE_NAME)
+            session._publish_devices()
+            self.assertEqual(session.state.meta.get("system_audio_warning"), "")
+            session.update_devices("Mic", "BlackHole 2ch")
+            # loopback source still gets real advice when routing is wrong
+            warning = session.state.meta.get("system_audio_warning")
+            self.assertIsInstance(warning, str)
+
+
+def _platform_module():
+    import hud.system_tap as st
+    return st.platform
 
 
 if __name__ == "__main__":

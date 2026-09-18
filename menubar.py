@@ -42,6 +42,17 @@ SETTINGS_URLFILE = Path.home() / ".zoom_recorder_settings.url"
 IDLE_TITLE = "🎙"
 
 
+def audio_menu_specs(outputs, paired):
+    """Pure spec for the "Audio Out" dropdown: [(label, device_name_or_None)].
+
+    label None means a separator; device_name None means "Rebuild Routing".
+    """
+    specs = [(("✓ " if name == paired else "") + name, name) for name in outputs]
+    specs.append((None, None))
+    specs.append(("Rebuild Routing", None))
+    return specs
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -73,9 +84,10 @@ class RecorderApp(rumps.App):
         self.live_item = rumps.MenuItem("Start with Live HUD", callback=self.start_live)
         self.open_hud_item = rumps.MenuItem("Open Live HUD…", callback=self.open_hud)
         self.settings_item = rumps.MenuItem("Settings…", callback=self.open_settings)
-        self.fix_routing_item = rumps.MenuItem("Fix Audio Routing…", callback=self.fix_routing)
+        self.audio_item = rumps.MenuItem("Audio Out")
         self.menu = [self.toggle_item, self.live_item, None,
-                     self.open_hud_item, self.settings_item, self.fix_routing_item]
+                     self.open_hud_item, self.settings_item, self.audio_item]
+        self._audio_sig = None
         self._sync_ui()
 
     def _hud_active(self) -> bool:
@@ -91,6 +103,71 @@ class RecorderApp(rumps.App):
         self.live_item.title = state["live_title"]
         self.live_item.set_callback(self.start_live if state["live_enabled"] else None)
         self.open_hud_item.set_callback(self.open_hud if state["open_enabled"] else None)
+        self._sync_audio_menu()
+
+    def _sync_audio_menu(self) -> None:
+        # Rebuild the "Audio Out" submenu only when the device set actually
+        # changed (this runs on the 5s poll; CoreAudio reads are cheap but
+        # rebuilding menu items every tick would reset their callbacks).
+        try:
+            from hud.system_tap import available as tap_available
+            from hud.routing_fix import list_real_outputs, load_state, get_output_volume
+            tap_ok = tap_available()
+            outputs = [] if tap_ok else list_real_outputs()
+            paired = None if tap_ok else load_state().get("physical_name")
+            volume = None if tap_ok else get_output_volume()
+        except Exception:
+            tap_ok = True  # conservative: assume nothing to switch
+            outputs, paired, volume = [], None, None
+        sig = (tuple(outputs), paired, tap_ok)
+        if sig == self._audio_sig:
+            return
+        self._audio_sig = sig
+        if tap_ok:
+            # Tap capture needs no routing changes at all: the tap follows
+            # whatever the default output is. Only offer the undo switch.
+            self.audio_item.menu = [
+                rumps.MenuItem("(direct capture: routing untouched)", callback=None),
+                rumps.MenuItem("Restore Normal Routing…", callback=self.restore_routing),
+            ]
+            return
+        # Loopback (Multi-Output) mode: volume keys do not work for it, so
+        # provide the volume control macOS omits.
+        items = []
+        for label, name in audio_menu_specs(outputs, paired):
+            if label is None:
+                items.append(None)
+            elif name is None:
+                items.append(rumps.MenuItem(label, callback=self.fix_routing))
+            else:
+                items.append(rumps.MenuItem(label, callback=self._pair_output))
+        if volume is not None:
+            items.append(None)
+            items.append(rumps.SliderMenuItem(
+                value=volume, callback=self._volume_changed))
+            items.append(rumps.MenuItem("Volume: {:.0f}% (loopback mode)".format(volume),
+                                        callback=None))
+        self.audio_item.menu = items
+
+    def _volume_changed(self, sender) -> None:
+        value = sender.value if hasattr(sender, "value") else sender
+        # Debounce: the slider fires continuously while dragging.
+        timer = getattr(self, "_vol_timer", None)
+        if timer is not None:
+            timer.cancel()
+        self._vol_timer = threading.Timer(0.25, self._set_volume_worker,
+                                          args=(float(value),))
+        self._vol_timer.daemon = True
+        self._vol_timer.start()
+
+    def _set_volume_worker(self, percent: float) -> None:
+        try:
+            from hud.routing_fix import set_output_volume
+            result = set_output_volume(percent)
+            if not result.ok:
+                rumps.notification("zoom-recorder", "Volume", result.message)
+        except Exception as exc:
+            rumps.notification("zoom-recorder", "Volume", str(exc))
 
     def toggle(self, _sender) -> None:
         pid = _read_pidfile()
@@ -117,21 +194,50 @@ class RecorderApp(rumps.App):
 
     def fix_routing(self, _sender) -> None:
         # Runs the routing fixer as a subprocess (never the app process);
-        # it creates the Multi-Output Device and switches the default output.
-        self.fix_routing_item.title = "Fixing Audio Routing…"
+        # it rebuilds the Multi-Output Device from the stored preference.
+        threading.Thread(target=self._run_routing_fix, daemon=True).start()
+
+    def _pair_output(self, sender) -> None:
+        name = sender.title.lstrip("✓").strip()
+        if not name:
+            return
+        threading.Thread(target=self._run_routing_fix, args=(name,), daemon=True).start()
+
+    def restore_routing(self, _sender) -> None:
+        threading.Thread(target=self._run_routing_restore, daemon=True).start()
+
+    def _run_routing_restore(self) -> None:
         try:
             proc = subprocess.run(
-                [sys.executable, "-m", "hud.routing_fix"],
+                [sys.executable, "-m", "hud.routing_fix", "--restore-routing", "--yes"],
                 cwd=str(SCRIPT_DIR), capture_output=True, text=True, timeout=90)
             out = (proc.stdout or "") + (proc.stderr or "")
         except Exception as exc:
             out = str(exc)
-        self.fix_routing_item.title = "Fix Audio Routing…"
+        lines = [ln for ln in out.splitlines()
+                 if ln.strip() and not ln.startswith("RESULT: ")]
+        detail = lines[0] if lines else "Restore finished."
+        if "RESULT: MANUAL" in out:
+            detail = "Restore failed; run ./zoom_record.py --restore-routing in Terminal."
+        rumps.notification("zoom-recorder", "Audio routing", detail)
+
+    def _run_routing_fix(self, output: "str | None" = None) -> None:
+        args = [sys.executable, "-m", "hud.routing_fix", "--yes"]
+        if output:
+            args += ["--output", output]
+        try:
+            proc = subprocess.run(args, cwd=str(SCRIPT_DIR),
+                                  capture_output=True, text=True, timeout=90)
+            out = (proc.stdout or "") + (proc.stderr or "")
+        except Exception as exc:
+            out = str(exc)
         lines = [ln for ln in out.splitlines()
                  if ln.strip() and not ln.startswith("RESULT: ")]
         detail = "Fix unavailable; run ./zoom_record.py --fix-routing in Terminal."
         if "RESULT: OK" in out:
             detail = lines[0] if lines else detail
+            if _read_pidfile() is not None:
+                detail += " (recording unaffected)"
         elif "RESULT: MANUAL" in out:
             detail = ("Could not set it up automatically. Audio MIDI Setup opened; "
                       "follow the click-by-click steps (README: audio routing).")

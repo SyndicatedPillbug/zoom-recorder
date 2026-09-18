@@ -63,6 +63,8 @@ LOW_COVERAGE_PCT = 50.0
 DURATION_TOLERANCE_PCT = 0.02
 DURATION_TOLERANCE_MIN_S = 2.0
 LONG_SILENCE_S = 60.0
+# Below this, a merged track is a failed capture, not a quiet recording.
+MIN_VALID_RECORDING_S = 2.0
 
 LOOPBACK_RE = re.compile(
     r"zoom\s*audio\s*device|blackhole|black\s*hole|loopback|soundflower|"
@@ -175,6 +177,7 @@ class Config:
     basedir: Path
     outdir: Path
     workdir: Path
+    system_capture: str = "auto"  # resolved: "tap" | "loopback"
 
 
 def fmt_db(value: Optional[float]) -> str:
@@ -214,7 +217,7 @@ def list_devices() -> Tuple[List[Device], List[Device]]:
     return inputs, outputs
 
 
-def probe_level(device: Device, seconds: float) -> Probe:
+def probe_level(device: Device, seconds: float, max_wait: Optional[float] = None) -> Probe:
     cmd = [
         "ffmpeg", "-hide_banner", "-nostdin",
         "-f", "avfoundation", "-i", ":{}".format(device.name),
@@ -222,10 +225,14 @@ def probe_level(device: Device, seconds: float) -> Probe:
         "-af", "volumedetect",
         "-f", "null", "-",
     ]
+    if max_wait is None:
+        max_wait = seconds + 12
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds + 12)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max_wait)
     except subprocess.TimeoutExpired:
-        return Probe(False, None, None, "probe timed out")
+        # A wedged avfoundation open hangs forever; a busy device errors out
+        # in a couple of seconds, so a timeout means the open is stuck.
+        return Probe(False, None, None, "open timed out after {:.0f}s".format(max_wait))
     err = proc.stderr
     mean_m = MEAN_RE.search(err)
     max_m = MAX_RE.search(err)
@@ -373,6 +380,40 @@ def _warn_system(log: Log, chosen: Optional[Candidate]) -> None:
                      "(or use the menu-bar app: Fix Audio Routing).")
 
 
+def build_capture_cmd(mic_name: str, system_name: Optional[str], pcm_source,
+                      sdir: Path, segment_seconds: int) -> Tuple[List[str], tuple]:
+    """Pure ffmpeg command assembly for one recording session.
+
+    Returns (cmd, pass_fds). ``pcm_source`` feeds raw PCM via a pipe fd
+    (SystemTap); ``system_name`` selects an avfoundation input device.
+    """
+    mic_pattern = str(sdir / "seg_%05d_mic.wav")
+    sys_pattern = str(sdir / "seg_%05d_sys.wav")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-thread_queue_size", "1024",
+        "-f", "avfoundation", "-i", ":{}".format(mic_name),
+    ]
+    pass_fds: tuple = ()
+    if system_name is not None:
+        cmd += [
+            "-thread_queue_size", "1024",
+            "-f", "avfoundation", "-i", ":{}".format(system_name),
+        ]
+    elif pcm_source is not None:
+        cmd += pcm_source.ffmpeg_args()
+        pass_fds = (pcm_source.read_fd,)
+    segment_opts = [
+        "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
+        "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        "-reset_timestamps", "1",
+    ]
+    cmd += ["-map", "0:a"] + segment_opts + [mic_pattern]
+    if system_name is not None or pcm_source is not None:
+        cmd += ["-map", "1:a"] + segment_opts + [sys_pattern]
+    return cmd, pass_fds
+
+
 class Recorder:
     """Records mic and system audio as separate mono tracks (never mixed) so
     each source can be archived, verified, and later processed independently.
@@ -384,6 +425,7 @@ class Recorder:
         self.proc: Optional[subprocess.Popen] = None
         self.mic: Optional[Candidate] = None
         self.system: Optional[Candidate] = None
+        self.pcm_source = None  # SystemTap in tap mode
         self.sessions: List[Path] = []
         self._session = 0
         self._stderr_fh = None
@@ -392,43 +434,34 @@ class Recorder:
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, mic: Device, system: Optional[Device]) -> None:
+    def start(self, mic: Device, system: Optional[Device],
+              pcm_source=None) -> None:
+        """pcm_source: a SystemTap (or similar) feeding PCM via a pipe fd
+        instead of an avfoundation device."""
         self.stop()
         self._session += 1
         sdir = self.cfg.workdir / "session_{:04d}".format(self._session)
         sdir.mkdir(parents=True, exist_ok=True)
         self.sessions.append(sdir)
-        mic_pattern = str(sdir / "seg_%05d_mic.wav")
-        sys_pattern = str(sdir / "seg_%05d_sys.wav")
 
-        cmd = [
-            "ffmpeg", "-hide_banner", "-thread_queue_size", "1024",
-            "-f", "avfoundation", "-i", ":{}".format(mic.name),
-        ]
-        if system is not None:
-            cmd += [
-                "-thread_queue_size", "1024",
-                "-f", "avfoundation", "-i", ":{}".format(system.name),
-            ]
-        segment_opts = [
-            "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
-            "-f", "segment",
-            "-segment_time", str(int(self.cfg.segment_seconds)),
-            "-reset_timestamps", "1",
-        ]
-        cmd += ["-map", "0:a"] + segment_opts + [mic_pattern]
-        if system is not None:
-            cmd += ["-map", "1:a"] + segment_opts + [sys_pattern]
+        cmd, pass_fds = build_capture_cmd(
+            mic.name,
+            system.name if system is not None else None,
+            pcm_source, sdir, int(self.cfg.segment_seconds))
 
         self._stderr_fh = open(sdir / "ffmpeg.log", "ab")
         self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._stderr_fh
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._stderr_fh,
+            pass_fds=pass_fds,
         )
+        self.pcm_source = pcm_source
         self.mic = Candidate(mic, mic_priority(mic.name))
         self.system = Candidate(system, 0) if system else None
         src = "{}".format(mic.name)
         if system is not None:
             src += " + {} (separate tracks)".format(system.name)
+        elif pcm_source is not None:
+            src += " + {} (separate tracks)".format(pcm_source.name())
         self.log.info("Recording session {} -> {}".format(self._session, src))
         if self.on_restart is not None:
             try:
@@ -514,11 +547,17 @@ def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
             mic_cands: List[Candidate], system_cands: List[Candidate],
             stop: threading.Event, log: Log) -> None:
     silent = 0
+    open_failures = 0
+    restarted_for_wedge = False
+    warned_tap_silent = False
     last_cycle = time.monotonic()
     last_route: Optional[Tuple[Optional[str], Optional[str]]] = None
+    tap_mode = cfg.system_capture == "tap"
     while not stop.wait(cfg.chunk_seconds):
         # Track the default input/output: headphones or a Bluetooth switch
         # change the routing mid-call, and the system loopback can drop out.
+        # (In tap mode the tap follows the default output automatically, so
+        # only the mic needs re-resolving.)
         if load_topology is not None:
             topo = load_topology()
             route = (topo.default_input, topo.default_output)
@@ -526,23 +565,26 @@ def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
                 log.warn("Audio route changed: input='{}' output='{}'".format(
                     route[0] or "?", route[1] or "?"))
                 mic_cands = build_mic_candidates(inputs, topo) or mic_cands
-                system_cands = build_system_candidates(inputs, topo) or system_cands
-                if cfg.use_system and route[1] != last_route[1]:
+                if not tap_mode:
+                    system_cands = build_system_candidates(inputs, topo) or system_cands
+                if cfg.use_system and not tap_mode and route[1] != last_route[1]:
                     new_sys = choose_system(cfg, system_cands, log)
                     cur = rec.system.device.name if rec.system else None
                     if new_sys is not None and new_sys.device.name != cur:
                         log.warn("Switching system input: '{}' -> '{}'".format(
                             cur or "(none)", new_sys.device.name))
-                        rec.start(rec.mic.device, new_sys.device)
+                        rec.start(rec.mic.device, new_sys.device,
+                                  pcm_source=rec.pcm_source)
                     elif new_sys is None and cur is not None:
                         log.warn("No loopback in the new output path; recording microphone only.")
-                        rec.start(rec.mic.device, None)
+                        rec.start(rec.mic.device, None, pcm_source=None)
                 if route[0] != last_route[0]:
                     new_mic = choose_mic(cfg, mic_cands, log, topo=topo)
                     if new_mic is not None and new_mic.device.name != rec.mic.device.name:
                         log.warn("Switching mic: '{}' -> '{}'".format(
                             rec.mic.device.name, new_mic.device.name))
-                        rec.start(new_mic.device, rec.system.device if rec.system else None)
+                        rec.start(new_mic.device, rec.system.device if rec.system else None,
+                                  pcm_source=rec.pcm_source)
             last_route = route
 
         if not rec.is_alive():
@@ -553,27 +595,49 @@ def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
                 stop.set()
                 break
             new_system = rec.system.device if rec.system else None
-            rec.start(new_mic.device, new_system)
+            rec.start(new_mic.device, new_system, pcm_source=rec.pcm_source)
             silent = 0
             continue
 
-        mic_probe = probe_level(rec.mic.device, cfg.probe_seconds)
+        mic_probe = probe_level(rec.mic.device, cfg.probe_seconds,
+                                max_wait=cfg.probe_seconds + 2.5)
         if has_signal(mic_probe, cfg.silence_db):
             if silent:
                 log.info("Mic '{}' recovered.".format(rec.mic.device.name))
             silent = 0
+            open_failures = 0
+            restarted_for_wedge = False
         else:
             silent += 1
+            if mic_probe.ok:
+                detail = fmt_db(mic_probe.max_db)
+            else:
+                open_failures += 1
+                detail = "probe failed: {}".format(
+                    mic_probe.error or "unknown") if mic_probe.error else "open failed"
             log.warn("Mic '{}' silent ({}) — {}/{} before failover.".format(
-                rec.mic.device.name, fmt_db(mic_probe.max_db) if mic_probe.ok else "open failed",
-                silent, cfg.fail_threshold))
+                rec.mic.device.name, detail, silent, cfg.fail_threshold))
 
         if silent >= cfg.fail_threshold:
+            if open_failures >= cfg.fail_threshold and not restarted_for_wedge:
+                # Repeated open failures are NOT silence: the avfoundation
+                # open itself is stuck (device wedged by a hung capture).
+                # A wedged ffmpeg never recovers, so restart it once.
+                log.warn("Mic probes keep failing to open; restarting the capture "
+                         "(device may be wedged by the current ffmpeg).")
+                log_ffmpeg_tail(rec, log)
+                rec.start(rec.mic.device, rec.system.device if rec.system else None,
+                          pcm_source=rec.pcm_source)
+                silent = 0
+                open_failures = 0
+                restarted_for_wedge = True
+                continue
             log.warn("Mic failed health checks; cycling all inputs for signal...")
             best = hunt_mic(cfg, mic_cands, rec.mic.device.name, log)
             if best is not None:
                 log.warn("Switching mic: '{}' -> '{}'".format(rec.mic.device.name, best.name))
-                rec.start(best, rec.system.device if rec.system else None)
+                rec.start(best, rec.system.device if rec.system else None,
+                          pcm_source=rec.pcm_source)
                 silent = 0
             else:
                 log.warn("No candidate produced signal; keeping capture running "
@@ -588,17 +652,65 @@ def monitor(cfg: Config, rec: Recorder, inputs: List[Device],
                 if new_sys is not None:
                     log.warn("Switching system input: '{}' -> '{}'".format(
                         rec.system.device.name, new_sys.device.name))
-                    rec.start(rec.mic.device, new_sys.device)
+                    rec.start(rec.mic.device, new_sys.device, pcm_source=rec.pcm_source)
                 else:
                     log.warn("No replacement system input available; continuing without it.")
-                    rec.start(rec.mic.device, None)
+                    rec.start(rec.mic.device, None, pcm_source=None)
+        elif tap_mode and rec.pcm_source is not None:
+            if rec.pcm_source.stalled_after(5.0):
+                log.warn("System tap stalled (no data for 5s); it follows the default "
+                         "output automatically and should recover on the next sound.")
+            if (rec.pcm_source.running_seconds() > 10.0
+                    and rec.pcm_source.silent_seconds() > 10.0
+                    and not warned_tap_silent):
+                log.warn("System tap has delivered only silence so far. If system "
+                         "audio should be audible now, grant System Audio Recording "
+                         "access: System Settings > Privacy & Security > Screen & "
+                         "System Audio Recording.")
+                notify_user("System audio tap is capturing silence — grant System "
+                            "Audio Recording access in Privacy settings.",
+                            title="zoom-recorder: no system audio")
+                warned_tap_silent = True
+        elif tap_mode and cfg.use_system and rec.pcm_source is None:
+            log.warn("No system capture source; recording microphone only.")
 
         now = time.monotonic()
         if now - last_cycle >= cfg.cycle_seconds:
             last_cycle = now
+            if tap_mode and rec.pcm_source is not None:
+                log.info("System tap: {}".format(rec.pcm_source.health_line()))
             cycle_probe(cfg, mic_cands, system_cands,
                         rec.mic.device.name if rec.mic else None,
                         rec.system.device.name if rec.system else None, log)
+
+
+def log_ffmpeg_tail(rec: "Recorder", log: "Log", lines: int = 15) -> None:
+    """Surface the running ffmpeg's stderr into capture.log -- on a wedged
+    capture this is the only evidence of where it is stuck."""
+    try:
+        sdir = rec.sessions[-1]
+        with open(sdir / "ffmpeg.log", "r", errors="replace") as fh:
+            tail = fh.readlines()[-lines:]
+    except (OSError, IndexError):
+        return
+    if tail:
+        log.warn("ffmpeg.log tail (session {}):".format(len(rec.sessions)))
+        for line in tail:
+            log.error("  | {}".format(line.rstrip()))
+
+
+def preserve_session_diagnostics(rec: "Recorder", outdir: Path, log: "Log") -> None:
+    """Keep ffmpeg's stderr and the (possibly still useful) segments when the
+    recording is being abandoned: the old failure path rmtree'd the whole
+    workdir, destroying the evidence needed to diagnose the failure."""
+    dest = outdir / ".segments"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for sdir in rec.sessions:
+            if sdir.is_dir():
+                shutil.move(str(sdir), str(dest / sdir.name))
+    except OSError as exc:
+        log.warn("Could not archive failing-session segments: {}".format(exc))
 
 
 def merge_segments(segments: List[Path], out_path: Path, workdir: Path, log: Log) -> bool:
@@ -628,6 +740,20 @@ def probe_duration(path: Path) -> Optional[float]:
         return float(proc.stdout.strip())
     except (ValueError, TypeError):
         return None
+
+
+def notify_user(message: str, title: str = "zoom-recorder") -> None:
+    """macOS notification from the recorder process (capture.log alone is too
+    easy to miss when the window is not being watched)."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'display notification "{}" with title "{}"'.format(
+                 message.replace('"', "'"), title)],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def alert(label: str, coverage: float) -> None:
@@ -701,9 +827,18 @@ def verify_recording(merged: Path, segments: List[Path], log: Log, label: str) -
     coverage = 100.0 * (1.0 - (total_silence / duration)) if duration > 0 else 0.0
     long_silences = [(s, d) for s, d in silences if d > LONG_SILENCE_S]
 
+    # A merge of ~zero duration must never read as "100% coverage": a wedged
+    # capture that produced only the first frames would look perfect.
+    failed_capture = duration < MIN_VALID_RECORDING_S
+
     log.info("[{}] Coverage: {:.0f}% of recording has signal above -60dB ({:.0f}s / {:.0f}s). "
              "mean={} max={}".format(label, coverage, max(duration - total_silence, 0.0), duration,
                                       fmt_db(mean_db), fmt_db(max_db)))
+    if failed_capture:
+        log.error("[{}] merged recording is only {:.2f}s -- this was a failed capture, "
+                  "not a quiet one.".format(label, duration))
+        coverage = 0.0
+        alert(label, coverage)
     if long_silences:
         log.info("[{}] {} stretch(es) >{:.0f}s below threshold: {}".format(
             label, len(long_silences), LONG_SILENCE_S,
@@ -874,7 +1009,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="create the Multi-Output Device (loopback + real output) "
                              "and select it as the default output, then exit")
     parser.add_argument("--fix-output", default=None, metavar="NAME",
-                        help="with --fix-routing: which real output device to include")
+                        help="with --fix-routing/--restore-routing: which real output device")
+    parser.add_argument("--fix-input", default=None, metavar="NAME",
+                        help="with --restore-routing: which microphone to select")
+    parser.add_argument("--restore-routing", action="store_true",
+                        help="undo everything: real default output/input, remove the "
+                             "Multi-Output Device, then exit")
+    parser.add_argument("--system-capture", default=os.environ.get("ZOOM_SYSTEM_CAPTURE", "auto"),
+                        choices=["auto", "tap", "loopback"],
+                        help="how to capture system audio: auto (macOS 14.2+: Core Audio tap; "
+                             "loopback otherwise), tap (direct capture, no routing changes, "
+                             "volume keys keep working), loopback (BlackHole/Multi-Output)")
 
     # -- live HUD (opt-in; recording is unchanged when these are not used) ---
     parser.add_argument("--live", action="store_true",
@@ -973,23 +1118,103 @@ def build_hud_config(args: argparse.Namespace):
     return cfg
 
 
+def in_granted_terminal() -> bool:
+    """True when the recorder runs under Apple Terminal.
+
+    macOS attributes audio-capture permission to the responsible app: a
+    process spawned from Terminal inherits Terminal's grants, while a
+    launchd/GUI-spawned process (menu bar) is attributed to its own context,
+    where the System Audio Recording grant cannot be created on macOS 15
+    (the tap starts but delivers silence, and wedges mic opens)."""
+    return os.environ.get("TERM_PROGRAM") == "Apple_Terminal"
+
+
+def resolve_system_capture(args: argparse.Namespace) -> str:
+    """Decide how system audio is captured: tap or loopback."""
+    if args.system_capture == "loopback" or args.system:
+        return "loopback"
+    if args.system_capture == "tap":
+        return "tap"
+    if not args.no_system and in_granted_terminal():
+        try:
+            from hud.system_tap import available
+            if available():
+                return "tap"
+        except Exception:  # noqa: BLE001
+            pass
+    return "loopback"
+
+
 def run_routing_fix(args: argparse.Namespace) -> int:
     try:
-        from hud.routing_fix import fix_routing
+        from hud.routing_fix import fix_routing, restore_routing
     except Exception as exc:  # noqa: BLE001
         print("ERROR: routing fix unavailable: {}".format(exc), file=sys.stderr)
         return 1
     topo = load_topology(force=True) if load_topology is not None else None
-    result = fix_routing(topo, physical_output=args.fix_output)
+    if args.restore_routing:
+        result = restore_routing(topo, output=args.fix_output, input_device=args.fix_input)
+    else:
+        result = fix_routing(topo, physical_output=args.fix_output)
     print(result.message)
     if result.ok and result.changed:
         print("Verify the capture path: ./zoom_record.py --self-test")
     return 0 if result.ok else 1
 
 
+def fallback_tap_to_loopback(cfg: Config, rec: "Recorder", log: "Log",
+                             use_system: bool) -> Tuple[List[Candidate], List[Device]]:
+    """Abandon tap capture for this session and continue with the proven
+    loopback path. Returns (system_candidates, inputs) for the monitor loop."""
+    if rec.pcm_source is not None:
+        try:
+            rec.pcm_source.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        rec.pcm_source = None
+    cfg.system_capture = "loopback"
+    log.warn("Tap capture abandoned for this session; switching to loopback mode.")
+    try:
+        from hud.routing_fix import fix_routing
+        result = fix_routing(topo=None, assume_yes=True)
+        first = result.message.splitlines()[0] if result.message else ""
+        log.warn("Loopback routing: {}".format(first or ("OK" if result.ok else "failed")))
+        if not result.ok:
+            log.warn(result.message)
+    except Exception as exc:  # noqa: BLE001
+        log.warn("Loopback routing setup failed ({}); continuing without system audio.".format(exc))
+    topo = load_topology(force=True) if load_topology is not None else None
+    inputs, _outputs = list_devices()
+    sys_cands = build_system_candidates(inputs, topo)
+    if use_system:
+        system = choose_system(cfg, sys_cands, log)
+        if system is None:
+            log.warn("No loopback input available after fallback; recording microphone only.")
+            rec.start(rec.mic.device, None)
+        else:
+            rec.start(rec.mic.device, system.device)
+    else:
+        rec.start(rec.mic.device, None)
+    return sys_cands, inputs
+
+
+def wait_for_first_segment(rec: "Recorder", timeout: float = 6.0) -> bool:
+    """True once ffmpeg has written its first mic segment (capture actually
+    flowing). A hung avfoundation open produces a live-but-silent ffmpeg that
+    would otherwise go unnoticed until the end of the meeting."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if rec.segments_mic():
+            return True
+        if rec.proc is None or rec.proc.poll() is not None:
+            return False
+        time.sleep(0.25)
+    return False
+
+
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
-    if args.fix_routing:
+    if args.fix_routing or args.restore_routing:
         return run_routing_fix(args)
     if not shutil.which("ffmpeg"):
         print("ERROR: ffmpeg not found. Install it: brew install ffmpeg", file=sys.stderr)
@@ -1000,6 +1225,7 @@ def main(argv: List[str]) -> int:
 
     inputs, outputs = list_devices()
     topo = load_topology(force=True) if load_topology is not None else None
+    system_capture = resolve_system_capture(args)
 
     if args.list:
         def _annotate(name: str) -> str:
@@ -1024,8 +1250,11 @@ def main(argv: List[str]) -> int:
         if topo is not None:
             print("Default input:  {}".format(topo.default_input or "(unknown)"))
             print("Default output: {}".format(topo.default_output or "(unknown)"))
+        print("System capture: {}".format(
+            "Core Audio tap (direct, no routing changes)" if system_capture == "tap"
+            else "loopback device (Multi-Output route)"))
         advice = system_advice(topo)
-        if advice:
+        if advice and system_capture == "loopback":
             print("System audio:   {}".format(advice))
             print("                Fix automatically: ./zoom_record.py --fix-routing")
         return 0
@@ -1040,6 +1269,10 @@ def main(argv: List[str]) -> int:
     if args.self_test or args.check_routing:
         # No recording happens, so no dated/session folder is created for it --
         # just log to the console.
+        if system_capture == "tap":
+            from hud.system_tap import system_tap_self_test
+            code = 0 if system_tap_self_test(args.probe_seconds, log=Log(None).info) else 1
+            return code
         code = self_test(args.probe_seconds, system_cands, outputs, Log(None))
         return code
 
@@ -1080,6 +1313,7 @@ def main(argv: List[str]) -> int:
         basedir=basedir,
         outdir=outdir,
         workdir=workdir,
+        system_capture=system_capture,
     )
 
     log.info("zoom-recorder starting. Output: {}".format(outdir))
@@ -1098,13 +1332,47 @@ def main(argv: List[str]) -> int:
         return 1
 
     system = None
+    pcm_source = None
     if cfg.use_system:
-        system = choose_system(cfg, system_cands, log)
-        if system is None:
-            log.warn("No usable system/loopback input; recording microphone only.")
-            advice = system_advice(topo)
-            if advice:
-                log.warn(advice)
+        if cfg.system_capture == "tap":
+            try:
+                from hud.system_tap import SystemTap
+                pcm_source = SystemTap(log=log.info)
+                # Start the tap's IO BEFORE ffmpeg opens the mic: starting
+                # tap IO while an avfoundation mic open is in flight can
+                # wedge the open (macOS 15), and starting it afterwards can
+                # kill the running mic stream. Settled-first avoids both.
+                pcm_source.start()
+                time.sleep(0.5)
+                log.info("System audio: macOS process tap (output routing untouched; "
+                         "volume keys keep working and recording level does not "
+                         "follow the volume slider).")
+            except Exception as exc:  # noqa: BLE001
+                log.warn("System tap unavailable ({}); falling back to loopback capture.".format(exc))
+                pcm_source = None
+                cfg.system_capture = "loopback"
+        if pcm_source is None:
+            # Loopback capture needs the multi-output route in place; set it
+            # up (idempotent) unless the user pinned a specific device.
+            if not args.system and load_topology is not None:
+                try:
+                    from hud.routing_fix import fix_routing
+                    result = fix_routing(topo, assume_yes=True)
+                    if result.changed:
+                        log.info("Routing: {}".format(result.message.splitlines()[0]))
+                        topo = load_topology(force=True)
+                except Exception as exc:  # noqa: BLE001
+                    log.warn("Loopback routing setup skipped ({})".format(exc))
+                if topo is not None:
+                    advice = system_advice(topo)
+                    if advice:
+                        log.warn(advice)
+            system = choose_system(cfg, system_cands, log)
+            if system is None:
+                log.warn("No usable system/loopback input; recording microphone only.")
+                advice = system_advice(topo)
+                if advice:
+                    log.warn(advice)
 
     log.info("Selected mic: {} (priority {}, level {})".format(
         mic.device.name, mic.priority,
@@ -1121,9 +1389,24 @@ def main(argv: List[str]) -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    rec.start(mic.device, system.device if system else None)
-    log.info("Recording. Press Ctrl+C to stop and merge.")
+    rec = Recorder(cfg, log)
+    stop = threading.Event()
 
+    def handle_signal(signum, frame):
+        stop.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    def system_name():
+        if system is not None:
+            return system.device.name
+        if pcm_source is not None:
+            return pcm_source.name()
+        return None
+
+    # Start the HUD first so the browser URL is ready in ~2s; the transcript
+    # begins flowing as soon as the capture produces segments.
     live = None
     if args.live:
         try:
@@ -1133,16 +1416,39 @@ def main(argv: List[str]) -> int:
             live = LiveSession(
                 hud_cfg, outdir, log.info,
                 mic.device.name,
-                system.device.name if system else None,
+                system_name(),
                 cfg.model,
             )
             live.start()
             rec.on_restart = lambda: live.update_devices(
                 rec.mic.device.name if rec.mic else None,
-                rec.system.device.name if rec.system else None)
+                system_name())
         except Exception as exc:  # noqa: BLE001
             log.warn("Live HUD unavailable ({}); recording continues normally.".format(exc))
             live = None
+
+    rec.start(mic.device, system.device if system else None, pcm_source=pcm_source)
+    healthy = wait_for_first_segment(rec)
+    if not healthy:
+        log.warn("No mic audio 6s after start; ffmpeg looks stuck. Restarting once.")
+        log_ffmpeg_tail(rec, log)
+        rec.start(mic.device, system.device if system else None, pcm_source=pcm_source)
+        healthy = wait_for_first_segment(rec)
+    if not healthy:
+        log_ffmpeg_tail(rec, log)
+        if pcm_source is not None:
+            # Tap mode wedges the mic open in some process contexts
+            # (launchd/GUI-spawned python on macOS 15). Continue the
+            # recording on the proven loopback path instead of failing.
+            log.warn("Mic capture wedged even after a restart; falling back "
+                     "to loopback capture.")
+            system_cands, inputs = fallback_tap_to_loopback(cfg, rec, log, cfg.use_system)
+            system = None
+            healthy = wait_for_first_segment(rec)
+    if not healthy:
+        log.warn("Mic capture still not producing data; monitoring will keep "
+                 "watching it.")
+    log.info("Recording. Press Ctrl+C to stop and merge.")
 
     try:
         monitor(cfg, rec, inputs, mic_cands, system_cands, stop, log)
@@ -1151,6 +1457,11 @@ def main(argv: List[str]) -> int:
     finally:
         log.info("Stopping recording...")
         rec.stop()
+        if pcm_source is not None:
+            try:
+                pcm_source.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.warn("System tap shutdown error: {}".format(exc))
         if live is not None:
             try:
                 live.stop()
@@ -1162,8 +1473,14 @@ def main(argv: List[str]) -> int:
 
         merged_mic = outdir / "recording_mic.wav"
         mic_ok = merge_segments(mic_segments, merged_mic, workdir, log)
-        if not mic_ok:
-            log.error("No mic audio was recorded.")
+        mic_duration = probe_duration(merged_mic) if mic_ok else None
+        if not mic_ok or (mic_duration is not None
+                          and mic_duration < MIN_VALID_RECORDING_S):
+            log.error("No usable mic audio was recorded{}.".format(
+                " (merged track is only {:.2f}s)".format(mic_duration)
+                if mic_duration is not None else ""))
+            log_ffmpeg_tail(rec, log)
+            preserve_session_diagnostics(rec, outdir, log)
             shutil.rmtree(workdir, ignore_errors=True)
             log.close()
             return 1

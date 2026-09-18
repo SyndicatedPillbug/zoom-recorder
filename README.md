@@ -273,35 +273,43 @@ isn't appearing, that pill tells you why:
   filter, and check the log for `dropped likely hallucination` lines.
 
 **Capturing the other party's audio (macOS).** macOS cannot capture arbitrary
-system audio out of the box. You need a **loopback** device that mirrors your
-output, and it must actually be in the output path:
+system audio out of the box; the recorder has two ways, picked automatically:
 
-1. Install BlackHole: `brew install blackhole-2ch`.
-2. Then let the app do the rest: `./zoom_record.py --fix-routing` creates the
-   Multi-Output Device (BlackHole 2ch + your real output) **and** selects it as
-   the default output — no clicking in Audio MIDI Setup. The menu-bar app has a
-   `Fix Audio Routing…` item that does the same thing. Use
-   `--fix-output "MacBook Air Speakers"` to pick which real output to pair;
-   re-run after switching headphones/speakers to rebuild the device.
-3. If macOS refuses the automated fix (or BlackHole is missing), the tool
-   prints a click-by-click walkthrough: **Audio MIDI Setup → + → Create
-   Multi-Output Device**, tick **both** your headphones/speakers **and**
-   `BlackHole 2ch`, tick "Drift Correction" on BlackHole, make your real output
-   the master, then select the Multi-Output Device as the system output (and in
-   Zoom).
+1. **Capturing the other party's audio (macOS).** macOS cannot capture arbitrary
+system audio out of the box; the recorder picks one of two capture paths
+automatically:
 
-System audio is then mirrored into BlackHole and captured automatically; the
-HUD shows `mic: … · sys: BlackHole 2ch`. Note that `ZoomAudioDevice` is **not**
-a general loopback — it only carries audio Zoom itself shares, so it is ranked
-last and flagged.
+1. **Core Audio process tap (macOS 14.2+, Terminal context).** When launched
+   from an app context that holds the **System Audio Recording** permission
+   (e.g. Apple Terminal — the grant is per app context and Terminal's covers
+   its child processes), `hud/system_tap.py` creates a *private, observe-only*
+   tap that mirrors every playing process. Your default output and input are
+   untouched — volume keys work, and the recording level does not follow the
+   volume slider. First run only: macOS prompts once. `--system-capture tap`
+   forces this path; `python3 -m hud.system_tap` self-tests it.
+2. **Loopback / Multi-Output (the default elsewhere — menu bar, launchd,
+   older macOS).** A Multi-Output Device (BlackHole + your real output) is
+   created and selected automatically at recording start (idempotent; the
+   pairing lives in `~/.zoom_recorder_routing.json`). Because macOS volume
+   keys do nothing for a Multi-Output Device, the menu bar's **Audio Out ▸**
+   menu includes a **volume slider** that sets the real output's volume
+   directly. `--restore-routing` (also in that menu) returns your Mac to
+   normal when you stop using loopback mode.
+2. **Loopback fallback (older macOS, or `--system-capture loopback`).**
+   Install BlackHole (`brew install blackhole-2ch`), then run
+   `./zoom_record.py --fix-routing` to create a Multi-Output Device
+   (BlackHole + your real output) and select it as the default output — or
+   use the menu-bar **Audio Out ▸** dropdown to switch the paired output.
+   Note this macOS legacy: a Multi-Output Device has **no volume control**,
+   which is why tap capture is preferred whenever it is available.
 
 `./zoom_record.py --list` prints every device with its transport, the current
-defaults, and exactly what to fix; `./zoom_record.py --check-routing` plays a
-tone and verifies that it reaches a loopback. If system audio can't be
+defaults, the capture mode, and exactly what to fix; `--self-test` plays a
+tone and verifies the system track end to end. If system audio can't be
 captured, the HUD shows a warning banner and flags the devices pill, so room
-audio isn't mistaken for the remote party. Plugging in headphones or switching
-to Bluetooth changes the route mid-call; the recorder re-detects it and
-re-resolves the source, and the HUD follows along.
+audio isn't mistaken for the remote party. Switching to Bluetooth mid-call
+changes the mic route; the recorder re-detects it and re-resolves the mic
+(the tap side follows on its own), and the HUD follows along.
 
 **Providers.** All are OpenAI-compatible, so the same client serves each of
 them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
@@ -399,8 +407,11 @@ to the **next** recording, since the HUD reads config at session start.
 | `--list` | — | List audio devices (transport, defaults, loopback advice), then exit |
 | `--self-test` | off | Play a tone and verify the output→loopback capture path |
 | `--check-routing` | off | Verify system audio reaches a loopback, then exit |
-| `--fix-routing` | off | Create the Multi-Output Device and select it as default output, then exit |
-| `--fix-output NAME` | auto | With `--fix-routing`: which real output device to pair |
+| `--fix-routing` | off | Loopback mode only: create/rebuild the Multi-Output Device and select it as default output, then exit |
+| `--system-capture MODE` | auto | `tap` (Core Audio tap, no routing changes), `loopback` (BlackHole/Multi-Output), or `auto` |
+| `--restore-routing` | off | Undo everything: real default output/input, remove the Multi-Output Device, then exit |
+| `--fix-output NAME` | stored | With `--fix-routing`/`--restore-routing`: which real output device |
+| `--fix-input NAME` | auto | With `--restore-routing`: which microphone to select |
 | `--chunk-seconds N` | 5 | How often the active mic is tested |
 | `--fail-threshold N` | 3 | Consecutive silent checks before cycling inputs |
 | `--cycle-seconds N` | 60 | How often every inactive input is tested |
@@ -527,6 +538,7 @@ Annotated tags mark each milestone (`git tag -n` for the full messages):
 | `v1.3-grounding` | Transcript-grounded talking points, faster STT/answers, HUD controls (ask/pause/copy/pin), end-of-call summary |
 | `v1.4-stt-hallucination` | Adaptive VAD, `verbose_json` segment confidence gating, text hallucination filter, prompt hygiene |
 | `v1.5-routing` | macOS audio topology, BlackHole-first loopback selection, route re-detection, HUD device status, `--list`/`--check-routing` |
-| `v1.6-routing-fix` | One-command automated routing fix (`--fix-routing`, menu-bar item), bare-BlackHole misroute advice, click-by-click fallback |
+| `v1.6-routing-fix` | One-command automated routing fix (`--fix-routing`, menu-bar item), bare-BlackHole misroute advice, click-by-click fallback; `Audio Out` menu-bar dropdown to switch the passthrough output mid-call, stored pairing preference (`~/.zoom_recorder_routing.json`), stale-device rebuilds |
+| `v1.7-system-tap` | Core Audio process-tap capture (`--system-capture auto|tap|loopback`): system audio recorded directly where permitted (Terminal context), loopback+volume-slider mode for the menu bar, `--restore-routing`, one-time System Audio Recording permission, wedge recovery, preserved failure diagnostics |
 
 Running the tests: `python3 -m unittest discover -s tests`.

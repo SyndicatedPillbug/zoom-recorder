@@ -383,9 +383,85 @@ and accepted any loopback that merely *opened*, even a silent one.
   (`AudioHardwareCreateAggregateDevice` with `stacked=1`, then
   `kAudioHardwarePropertyDefaultOutputDevice`) — no sudo, no GUI scripting.
   `--fix-routing` runs it (and re-runs with `--fix-output NAME` to re-track
-  headphones/speakers); the menu-bar app gets a `Fix Audio Routing…` item.
+  headphones/speakers); the menu-bar app gets an `Audio Out ▸` dropdown that
+  pairs the multi-output with any present real output device in one click
+  (safe mid-call: the recorder only captures BlackHole, which never changes).
   It also detects the inverse misroute (a bare loopback as default output, so
   audio is captured but inaudible) and, when macOS refuses, falls back to a
-  click-by-click Audio MIDI Setup walkthrough.
+  click-by-click Audio MIDI Setup walkthrough. The multi-output's subdevice
+  list is not readable for stacked aggregates, so the pairing is persisted to
+  `~/.zoom_recorder_routing.json` instead and drives reuse-vs-rebuild:
+  anything stale (missing device, changed pairing) is destroyed and recreated.
+- **Tap capture (`v1.7-system-tap`)**: the loopback approach costs the user
+  normal volume control (Multi-Output Devices have none). macOS 14.2+ adds
+  process taps: `hud/system_tap.py` creates a private, observe-only global tap
+  (PyObjC `CATapDescription` -> `AudioHardwareCreateProcessTap`), wraps it in a
+  private aggregate (tap list entry with drift compensation), and pulls float32
+  PCM through an ObjC block IOProc (raw ctypes block literal) into a pipe that
+  ffmpeg reads as `-f f32le -i pipe:N`. The tap sees pre-volume audio, so
+  recording level is independent of the volume slider, and it follows default
+  output changes automatically — no `Audio Out` dropdown needed in tap mode.
+  `--system-capture auto|tap|loopback` selects the path (auto = tap when
+  macOS >= 14.2, loopback otherwise); the tap keeps running across ffmpeg
+  restarts and a stall watchdog warns if callbacks stop. First capture
+  triggers the one-time System Audio Recording TCC prompt; denial shows up as
+  flowing-but-silent buffers, which `--self-test` detects with guidance.
+  `--restore-routing` undoes all routing changes (real default output/input,
+  destroy the tool-owned multi-output).
+- **Tap/mic ordering + wedge recovery (`v1.7` follow-up)**: starting tap IO
+  while an avfoundation mic open is in flight can wedge the open (live ffmpeg
+  writes nothing, and every concurrent mic open hangs), and starting it after
+  the mic stream began kills the stream (0.1s merged track). Order is
+  therefore: tap IO fully up (0.5s settle) -> open the mic. A startup gate
+  waits for the first mic segment and restarts the capture once if ffmpeg is
+  wedged; the monitor distinguishes open-failures (wedge -> restart capture)
+  from silence (failover), and logs probe error text plus the ffmpeg.log tail.
+  The failure path now preserves segments and ffmpeg stderr under
+  `.segments/` instead of deleting them, and a merged track under 2s is a
+  failed capture, never a 100%-coverage success. The HUD suppresses the
+  loopback advice in tap mode.
+- **Permission attribution root cause (`v1.7` follow-up 2)**: a tap probe run
+  through a temporary LaunchAgent reproduced the menubar failures exactly:
+  under the launchd context (`com.apple.python3`) the tap starts and flows but
+  delivers only silence -- the missing **System Audio Recording** TCC grant
+  for that context (Terminal has it, so CLI tests pass while menu-bar
+  recordings wedge the mic open). Launchd agents also lack brew's PATH, which
+  is why the recorder is unaffected (its agent sets PATH) but bare probes
+  need `EnvironmentVariables`. Handling: the monitor logs tap health each
+  cycle, warns with exact guidance (and a notification) when the tap flows
+  but stays silent, starts the HUD server before the capture gate (URL ready
+  in ~2s), probes the active mic with a short timeout so wedges surface in
+  one chunk, and -- if the mic is still wedged after one restart -- falls
+  back to loopback capture (routing fix + fresh device scan) for the rest of
+  the session. `python3 -m hud.system_tap --open-settings` opens the privacy
+  pane.
+- **Context-based capture mode (`v1.7` final)**: the AudioCapture grant cannot
+  be created for the launchd/`com.apple.python3` context on macOS 15 (pane
+  additions do not match the Apple-signed identity; no prompt mechanism
+  works), so the recorder detects its context (`TERM_PROGRAM`): tap for
+  permission-bearing contexts (Apple Terminal), loopback everywhere else —
+  chosen *before* startup so the menubar path never wedges. Loopback startup
+  auto-runs the routing fix (idempotent) so the route is always in place, and
+  the menu bar gains a **volume slider** (`routing_fix.set_output_volume`)
+  because macOS volume keys do nothing for Multi-Output Devices. The menu-bar
+  app now runs from `zoom-recorder.app` (bundle identity + audio usage
+  descriptions for future macOS releases).
+- **ScreenCaptureKit evaluated and rejected (2026-09-18)**: an SCK audio-only
+  helper (Swift, `NSAudioCaptureUsageDescription` embedded, ad-hoc signed,
+  bundled in the .app) was built and exhaustively tested: screen samples flow
+  in every context, but SCK *audio* never delivered a single sample on macOS
+  15.7 -- TCC reports the screen/audio grant as declined for every context
+  (Terminal CLI, launchd agent, LaunchServices-launched bundle, manually
+  granted pane entries), and ad-hoc signing invalidates the grant on every
+  rebuild (cdhash pinning). Beyond the technical wall, the SCK path forces a
+  **Screen Recording** grant just to obtain audio: a least-privilege violation
+  and a self-signed-certificate/EDR red flag on a managed endpoint. The
+  loopback architecture (public CoreAudio HAL, signed notarized BlackHole, no
+  TCC) is the deliberately boring, compliant choice; the volume slider covers
+  its only real trade-off. No SCK code is shipped (experiment deleted).
 - Covered by `DevicesTests` (classification, output-path detection, advice,
-  system_profiler parsing, HUD device updates) and `RoutingFixTests`.
+  system_profiler parsing, HUD device updates), `RoutingFixTests` (output
+  choice, rebuild decision matrix, state roundtrip, fake-backend fix flows),
+  `AudioMenuTests` (dropdown specs), and `SystemTapTests` (mode resolution,
+  capture command assembly, stall watchdog, tap format parsing, feature
+  detection).

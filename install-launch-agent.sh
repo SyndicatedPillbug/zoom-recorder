@@ -32,8 +32,7 @@ cat > "$PLIST" <<PLIST_EOF
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$PYTHON3</string>
-        <string>$SCRIPT_DIR/menubar.py</string>
+        <string>$SCRIPT_DIR/zoom-recorder.app/Contents/MacOS/zoom-recorder</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
