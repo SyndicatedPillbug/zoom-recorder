@@ -241,7 +241,8 @@
         <div class="ctl"><input type="checkbox" id="offline" />
           <span class="note">Blocks all internet access (local transcript only)</span></div></div>
       <div class="row"><label>Start at login</label>
-        <div class="ctl"><input type="checkbox" id="loginAgent2" /></div></div>
+        <div class="ctl"><input type="checkbox" id="loginAgent2" />
+          <span class="status" id="loginStatus2"></span></div></div>
       <div class="row">
         <button id="saveSettings">Save</button>
         <button class="secondary" id="advancedSettings">Advanced settings…</button>
@@ -284,16 +285,42 @@
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g,
     c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 
-  async function api(path, method, body) {
-    const opts = { method: method || 'GET', headers: { 'X-Auth-Token': TOKEN } };
-    if (body) { opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body); }
-    const resp = await fetch(path + '?token=' + encodeURIComponent(TOKEN), opts);
-    return resp.json().catch(() => ({ ok:false, error:'bad response' }));
+  async function api(path, method, body, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs || 15000);
+    try {
+      const opts = { method: method || 'GET', headers: { 'X-Auth-Token': TOKEN },
+        signal: controller.signal };
+      if (body) { opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body); }
+      const resp = await fetch(path + '?token=' + encodeURIComponent(TOKEN), opts);
+      return await resp.json().catch(() => ({ ok:false, error:'bad response' }));
+    } catch (e) {
+      connectionLost();
+      return { ok:false, error:'lost connection — reopen from the 🎙 menu' };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  function connectionLost() {
+    const pill = $('statePill');
+    if (pill) { pill.textContent = 'not connected — reopen from 🎙'; pill.className = 'pill bad'; }
   }
   function setStatus(el, text, cls) {
     el.textContent = text || '';
     el.className = 'status ' + (cls || 'muted');
+  }
+  // Always replaces the interim message, even if the request times out.
+  async function guarded(el, busyText, fn) {
+    setStatus(el, busyText);
+    try {
+      const r = await fn();
+      if (r && r.ok === false) { setStatus(el, r.error || "That didn't work", 'bad'); return r; }
+      return r;
+    } catch (e) {
+      setStatus(el, 'Lost connection — reopen from the 🎙 menu', 'bad');
+      return null;
+    }
   }
 
   // tabs
@@ -310,7 +337,10 @@
   // ---- status + checks -------------------------------------------------
   async function refreshState() {
     const s = await api('/api/status');
-    if (!s.ok) { setStatus($('statePill'), 'unavailable', 'bad'); return; }
+    if (!s.ok) {
+      setStatus($('statePill'), s.error || 'unavailable', 'bad');
+      return;
+    }
     setStatus($('statePill'),
       (s.recording ? 'recording' : 'ready') + (s.offline ? ' · offline' : ''), 'muted');
     renderChecks(s.checks || []);
@@ -364,17 +394,19 @@
   }
 
   $('runChecks').onclick = async () => {
-    setStatus($('checksStatus'), 'Checking…');
-    await refreshState();
-    setStatus($('checksStatus'), '');
+    await guarded($('checksStatus'), 'Checking…', async () => {
+      await refreshState();
+      setStatus($('checksStatus'), '');
+      return { ok: true };
+    });
   };
 
   // ---- mic test --------------------------------------------------------
   $('micTest').onclick = async () => {
-    setStatus($('micStatus'), 'Listening…');
     $('micHelp').classList.add('hidden');
-    const r = await api('/api/mic-test', 'POST', {});
-    if (!r.ok && r.error) { setStatus($('micStatus'), r.error, 'bad'); return; }
+    const r = await guarded($('micStatus'), 'Listening…',
+      () => api('/api/mic-test', 'POST', {}));
+    if (!r || r.ok === false) return;
     const db = r.max_db == null ? -100 : r.max_db;
     const pct = Math.max(0, Math.min(100, Math.round((db + 80) * 100 / 60)));
     $('micBar').style.width = pct + '%';
@@ -398,20 +430,21 @@
       (d.microphones || []).map(n => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('');
   }
   $('useOutput').onclick = async () => {
-    setStatus($('outputStatus'), 'Setting up…');
-    const r = await api('/api/fix', 'POST',
-      { action:'routing', output: $('outputSelect').value });
-    setStatus($('outputStatus'), r.message || r.error, r.ok ? 'ok' : 'bad');
+    const r = await guarded($('outputStatus'), 'Setting up…',
+      () => api('/api/fix', 'POST',
+        { action:'routing', output: $('outputSelect').value }));
+    if (r && r.ok) setStatus($('outputStatus'), r.message || 'Done', 'ok');
   };
 
   // ---- test recording --------------------------------------------------
   $('testRecord').onclick = async () => {
     const seconds = 10;
-    setStatus($('testStatus'), 'Recording for ' + seconds + 's… (play some call audio or speak)');
     $('testResult').classList.add('hidden');
-    const r = await api('/api/test-recording', 'POST',
-      { seconds: seconds, mode: $('testMode').value });
-    if (!r.ok && r.error) { setStatus($('testStatus'), r.error, 'bad'); return; }
+    const r = await guarded($('testStatus'),
+      'Recording for ' + seconds + 's… (play some call audio or speak)',
+      () => api('/api/test-recording', 'POST',
+        { seconds: seconds, mode: $('testMode').value }, 180000));
+    if (!r || r.ok === false) return;
     setStatus($('testStatus'), '');
     $('testResult').classList.remove('hidden');
     const parts = [];
@@ -444,32 +477,34 @@
     $('liveOnline').classList.toggle('hidden', v !== 'online');
   });
   $('installWhisper').onclick = async () => {
-    setStatus($('localStatus'), 'Installing in Terminal…');
-    await api('/api/fix', 'POST', { action:'install-whisper' });
+    const r = await guarded($('localStatus'), 'Installing in Terminal…',
+      () => api('/api/fix', 'POST', { action:'install-whisper' }));
+    if (r && r.ok) setStatus($('localStatus'), 'Installing in Terminal…', 'ok');
   };
   $('downloadModel').onclick = async () => {
-    setStatus($('localStatus'), 'Downloading…');
-    const r = await api('/api/fix', 'POST',
-      { action:'download-model', model: $('modelChoice').value });
-    setStatus($('localStatus'), r.message || r.error, r.ok ? 'ok' : 'bad');
+    const r = await guarded($('localStatus'), 'Downloading…',
+      () => api('/api/fix', 'POST',
+        { action:'download-model', model: $('modelChoice').value }));
+    if (r && r.ok) setStatus($('localStatus'), r.message || 'Downloading…', 'ok');
   };
   $('testKey').onclick = async () => {
-    setStatus($('keyStatus'), 'Testing…');
-    const r = await api('/api/test-provider', 'POST',
-      { provider: $('provider').value, api_key: $('apiKey').value });
-    setStatus($('keyStatus'), r.ok ? 'Key works (' + r.count + ' models)' : r.error,
-      r.ok ? 'ok' : 'bad');
+    const r = await guarded($('keyStatus'), 'Testing…',
+      () => api('/api/test-provider', 'POST',
+        { provider: $('provider').value, api_key: $('apiKey').value }));
+    if (r && r.ok) setStatus($('keyStatus'), 'Key works (' + r.count + ' models)', 'ok');
   };
 
   // ---- login agent -----------------------------------------------------
   async function setLogin(enabled, statusEl) {
-    setStatus(statusEl, 'Updating…');
-    const r = await api('/api/login-agent', 'POST', { enabled: enabled });
-    setStatus(statusEl, r.ok ? (enabled ? 'Will start at login' : 'Will not start at login')
-      : (r.error || 'failed'), r.ok ? 'ok' : 'bad');
+    const r = await guarded(statusEl, 'Updating…',
+      () => api('/api/login-agent', 'POST', { enabled: enabled }));
+    if (r && r.ok) {
+      setStatus(statusEl, enabled ? 'Will start at login'
+        : 'Will not start at login', 'ok');
+    }
   }
   $('loginAgent').onchange = (e) => setLogin(e.target.checked, $('loginStatus'));
-  $('loginAgent2').onchange = (e) => setLogin(e.target.checked, $('settingsStatus'));
+  $('loginAgent2').onchange = (e) => setLogin(e.target.checked, $('loginStatus2'));
 
   // ---- finish ----------------------------------------------------------
   $('finishSetup').onclick = async () => {
@@ -490,7 +525,9 @@
     }
     const keys = {};
     if (live === 'online' && $('apiKey').value) keys[$('provider').value] = $('apiKey').value;
-    await api('/api/config', 'POST', { config: cfg, api_key_new: keys });
+    const saved = await guarded($('finishStatus'), 'Saving…',
+      () => api('/api/config', 'POST', { config: cfg, api_key_new: keys }));
+    if (!saved || saved.ok === false) return;
     await api('/api/setup/complete', 'POST', {});
     setStatus($('finishStatus'), 'All set. Use the 🎙 menu to start recording.', 'ok');
     setTimeout(() => show('recordings'), 700);
@@ -546,8 +583,9 @@
     $('micSelect').value = rec.mic || '';
   }
   $('pickDir').onclick = async () => {
-    const r = await api('/api/pick-dir', 'POST', {});
-    if (r.ok) $('basedir').value = r.path;
+    const r = await guarded($('settingsStatus'), 'Waiting for the folder…',
+      () => api('/api/pick-dir', 'POST', {}));
+    if (r && r.ok) { $('basedir').value = r.path; setStatus($('settingsStatus'), ''); }
   };
   $('saveSettings').onclick = async () => {
     const cfg = {
@@ -562,9 +600,9 @@
         offline: $('offline').checked,
       },
     };
-    setStatus($('settingsStatus'), 'Saving…');
-    const r = await api('/api/config', 'POST', { config: cfg });
-    setStatus($('settingsStatus'), r.ok ? 'Saved' : r.error, r.ok ? 'ok' : 'bad');
+    const r = await guarded($('settingsStatus'), 'Saving…',
+      () => api('/api/config', 'POST', { config: cfg }));
+    if (r && r.ok) setStatus($('settingsStatus'), 'Saved', 'ok');
   };
   $('advancedSettings').onclick = () => api('/api/fix','POST',{ action:'open-advanced' });
 

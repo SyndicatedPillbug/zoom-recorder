@@ -272,6 +272,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -281,6 +282,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -294,6 +296,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -572,9 +575,20 @@ class _Handler(BaseHTTPRequestHandler):
     def _login_agent(self, body: Dict[str, Any]) -> None:
         enable = bool(body.get("enabled"))
         script = _repo("install-launch-agent.sh")
-        cmd = [str(script)] if enable else [str(script), "--disable"]
-        proc = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True,
-                              timeout=60)
+        mode = "--enable-autostart" if enable else "--disable-autostart"
+        try:
+            # Detach (new session) and never bootout/kickstart: a full install
+            # would kill the menu bar -- and this Control Center with it --
+            # before it could finish. See install-launch-agent.sh.
+            proc = subprocess.run([str(script), mode], cwd=str(REPO),
+                                  capture_output=True, text=True, timeout=20,
+                                  start_new_session=True)
+        except subprocess.TimeoutExpired:
+            self._send_json({"ok": False, "error": "the change timed out"})
+            return
+        except OSError as exc:
+            self._send_json({"ok": False, "error": str(exc)})
+            return
         self._send_json({"ok": proc.returncode == 0, "enabled": enable,
                          "output": (proc.stdout or proc.stderr).strip()})
 

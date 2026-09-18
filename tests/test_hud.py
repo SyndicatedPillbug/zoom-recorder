@@ -1996,5 +1996,84 @@ class RecordingsTests(unittest.TestCase):
             self.assertEqual(rec.as_dict()["duration"], "--:--")  # no probe
 
 
+class ControlCenterTests(unittest.TestCase):
+    def _server(self, tmp):
+        from hud.control import ControlApp
+
+        app = ControlApp(port=0, config_path=Path(tmp) / "config.json",
+                         markers=False, idle_timeout=0, open_browser=False)
+        port = app.start()
+        self.addCleanup(app.stop)
+        return app, port
+
+    def test_health_header_and_config_roundtrip(self) -> None:
+        import urllib.request
+        from hud.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:{}/health?token={}".format(port, app.token),
+                    timeout=5) as resp:
+                self.assertEqual(resp.headers.get("Connection"), "close")
+                self.assertTrue(json.loads(resp.read())["ok"])
+            body = json.dumps({"config": {"recorder": {"mode": "mic"},
+                                          "privacy": {"offline": True}}}).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:{}/api/config?token={}".format(port, app.token),
+                method="POST", data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertTrue(json.loads(resp.read())["ok"])
+            cfg = load_config(Path(tmp) / "config.json")
+            self.assertEqual(cfg.recorder.mode, "mic")
+            self.assertTrue(cfg.offline)
+
+    def test_login_agent_uses_nondestructive_modes(self) -> None:
+        """Regression: a full install would bootout the agent and kill the
+        menu bar (and this Control Center) mid-request."""
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            calls = []
+
+            class FakeProc:
+                returncode = 0
+                stdout = "ok"
+                stderr = ""
+
+            def fake_run(cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                return FakeProc()
+
+            with mock.patch("hud.control.subprocess.run", side_effect=fake_run):
+                for enabled in (False, True):
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:{}/api/login-agent?token={}".format(port, app.token),
+                        method="POST",
+                        data=json.dumps({"enabled": enabled}).encode(),
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        self.assertTrue(json.loads(resp.read())["ok"])
+            self.assertIn("--disable-autostart", calls[0][0])
+            self.assertIn("--enable-autostart", calls[1][0])
+            self.assertTrue(all(kwargs.get("start_new_session")
+                                for _cmd, kwargs in calls))
+
+    def test_autostart_script_dry_runs(self) -> None:
+        import platform
+        import subprocess
+
+        if platform.system() != "Darwin":
+            self.skipTest("macOS only")
+        script = Path(__file__).resolve().parent.parent / "install-launch-agent.sh"
+        for flag in ("--enable-autostart", "--disable-autostart"):
+            proc = subprocess.run([str(script), flag, "--dry-run"],
+                                  capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("dry-run", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

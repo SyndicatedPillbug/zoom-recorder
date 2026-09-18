@@ -525,3 +525,18 @@ and accepted any loopback that merely *opened*, even a silent one.
   offline, transcription model) so the GUI can control it, and
   `install.sh`/`install-launch-agent.sh` gained whisper.cpp + model setup and
   a `--disable` login toggle.
+- **Control Center fixes (`v2.0.1`)**: the Settings autostart toggle called
+  the full installer, whose `launchctl bootout` killed the menu bar -- and the
+  Control Center with it (it is a child of that job) -- before the re-bootstrap
+  ran, leaving the app dead and the browser request unsettled ("Updating…"
+  forever). `install-launch-agent.sh` now has non-destructive
+  `--enable-autostart` (writes the plist, enables it, bootstraps only when
+  nothing is loaded) and `--disable-autostart` (removes the plist, disables,
+  never bootout), which the Control Center uses; the helper runs detached
+  (`start_new_session`) with a 20s timeout. The page's `api()` no longer
+  throws: it has a timeout and always resolves, a `guarded()` wrapper
+  guarantees interim "Saving…/Updating…" messages are replaced (with
+  "lost connection — reopen from 🎙" on failure), the header pill reflects
+  disconnection instead of staying stale, the Settings autostart has its own
+  status element, and the server sends `Connection: close` to avoid
+  hand-rolled keep-alive edge cases.
