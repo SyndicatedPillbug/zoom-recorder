@@ -89,6 +89,27 @@ def available() -> bool:
         return False
 
 
+def in_granted_terminal() -> bool:
+    """True when running under Apple Terminal.
+
+    macOS attributes audio-capture permission to the responsible app: a
+    process spawned from Terminal inherits Terminal's grants, while a
+    launchd/GUI-spawned process (the menu bar) is attributed to its own
+    context, where the System Audio Recording grant cannot be created on
+    macOS 15 (the tap starts but delivers silence and wedges mic opens)."""
+    return os.environ.get("TERM_PROGRAM") == "Apple_Terminal"
+
+
+def usable_in_this_context() -> bool:
+    """True when tap capture is expected to actually work right here.
+
+    Both the recorder (mode selection) and the menu bar (whether to offer
+    the loopback volume slider) must agree on this; capability alone is not
+    enough -- a machine can support taps while this process context cannot
+    be granted capture permission."""
+    return available() and in_granted_terminal()
+
+
 def _backend_ca():
     return backend().ca
 

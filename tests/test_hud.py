@@ -1575,6 +1575,24 @@ class AudioMenuTests(unittest.TestCase):
         self.assertEqual(specs[-2], (None, None))  # separator
         self.assertEqual(specs[-1], ("Rebuild Routing", None))
 
+    def test_populate_submenu_attaches_nsmenu(self) -> None:
+        """Regression: rumps 0.4.0's MenuItem.menu assignment never calls
+        setSubmenu_, so the parent rendered greyed out with no children."""
+        from AppKit import NSMenuItem
+        from menubar import populate_submenu
+
+        class Fake:
+            def __init__(self, title):
+                self._menuitem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    title, None, "")
+
+        parent = Fake("Audio Out")
+        populate_submenu(parent, [Fake("Speakers"), None, Fake("Rebuild Routing")])
+        menu = parent._menuitem.submenu()
+        self.assertIsNotNone(menu)
+        self.assertTrue(parent._menuitem.isEnabled())
+        self.assertEqual(menu.numberOfItems(), 3)
+
 
 class SystemTapTests(unittest.TestCase):
     def _args(self, capture="auto", system=None, no_system=False):
@@ -1594,11 +1612,24 @@ class SystemTapTests(unittest.TestCase):
     def test_resolve_system_capture_requires_tap_support(self) -> None:
         import zoom_record as zr
 
-        with mock.patch("hud.system_tap.available", return_value=True):
+        with mock.patch("hud.system_tap.usable_in_this_context", return_value=True):
             self.assertEqual(zr.resolve_system_capture(self._args()), "tap")
-        with mock.patch("hud.system_tap.available", return_value=False):
+        with mock.patch("hud.system_tap.usable_in_this_context", return_value=False):
             self.assertEqual(zr.resolve_system_capture(self._args()), "loopback")
         self.assertEqual(zr.resolve_system_capture(self._args(capture="tap")), "tap")
+
+    def test_usable_in_this_context_needs_terminal(self) -> None:
+        import hud.system_tap as st
+
+        with mock.patch.object(st, "available", return_value=True), \
+                mock.patch.dict(os.environ, {"TERM_PROGRAM": "Apple_Terminal"}):
+            self.assertTrue(st.usable_in_this_context())
+        with mock.patch.object(st, "available", return_value=True), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(st.usable_in_this_context())
+        with mock.patch.object(st, "available", return_value=False), \
+                mock.patch.dict(os.environ, {"TERM_PROGRAM": "Apple_Terminal"}):
+            self.assertFalse(st.usable_in_this_context())
 
     def test_capture_cmd_with_pcm_pipe(self) -> None:
         from zoom_record import build_capture_cmd
@@ -1693,6 +1724,70 @@ class SystemTapTests(unittest.TestCase):
 def _platform_module():
     import hud.system_tap as st
     return st.platform
+
+
+class VolumeControlTests(unittest.TestCase):
+    def _topo(self, default_output):
+        from hud import devices
+
+        topo = devices.Topology(default_output=default_output)
+        topo.devices = [
+            devices.AudioDevice(name="BlackHole 2ch", transport="virtual",
+                                input_channels=2, output_channels=2),
+            devices.AudioDevice(name="MacBook Air Speakers", transport="builtin",
+                                output_channels=2),
+        ]
+        return topo
+
+    def test_volume_math(self) -> None:
+        from hud.routing_fix import clamp_percent, stepped_volume
+
+        self.assertEqual(clamp_percent(-5), 0.0)
+        self.assertEqual(clamp_percent(150), 100.0)
+        self.assertEqual(stepped_volume(98, 5), 100.0)
+        self.assertEqual(stepped_volume(2, -5), 0.0)
+        self.assertEqual(stepped_volume(50, 5), 55.0)
+
+    def test_volume_labels(self) -> None:
+        from hud.routing_fix import format_volume_label, format_volume_title
+
+        self.assertEqual(format_volume_title(44), "Volume 44%")
+        self.assertEqual(format_volume_title(44, muted=True), "Volume (muted)")
+        self.assertEqual(format_volume_label(44), "Volume: 44%")
+        self.assertEqual(format_volume_label(44, muted=True), "Volume: muted")
+
+    def test_is_loopback_active(self) -> None:
+        from hud.routing_fix import MULTI_OUTPUT_NAME, is_loopback_active
+
+        self.assertTrue(is_loopback_active(self._topo(MULTI_OUTPUT_NAME)))
+        self.assertFalse(is_loopback_active(self._topo("MacBook Air Speakers")))
+
+    def test_volume_target_prefers_default_when_not_loopback(self) -> None:
+        from hud.routing_fix import CaDevice, _volume_target
+
+        class FakeCA:
+            def default_output_id(self):
+                return 2
+
+        ca_devices = [CaDevice(1, "BlackHole 2ch", "bh"),
+                      CaDevice(2, "MacBook Air Speakers", "spk")]
+        target = _volume_target(FakeCA(), ca_devices,
+                                self._topo("MacBook Air Speakers"))
+        self.assertEqual(target.name, "MacBook Air Speakers")
+
+    def test_volume_target_uses_multi_output_member_in_loopback(self) -> None:
+        from hud.routing_fix import MULTI_OUTPUT_NAME, CaDevice, _volume_target
+
+        class FakeCA:
+            def default_output_id(self):
+                return 9  # the aggregate has no volume
+
+        ca_devices = [CaDevice(1, "BlackHole 2ch", "bh"),
+                      CaDevice(2, "MacBook Air Speakers", "spk")]
+        target = _volume_target(FakeCA(), ca_devices,
+                                self._topo(MULTI_OUTPUT_NAME),
+                                physical_output="MacBook Air Speakers")
+        self.assertEqual(target.name, "MacBook Air Speakers")
 
 
 if __name__ == "__main__":

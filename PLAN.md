@@ -459,9 +459,29 @@ and accepted any loopback that merely *opened*, even a silent one.
   loopback architecture (public CoreAudio HAL, signed notarized BlackHole, no
   TCC) is the deliberately boring, compliant choice; the volume slider covers
   its only real trade-off. No SCK code is shipped (experiment deleted).
+- **Volume as a first-class control (`v1.8-volume`)**: the Multi-Output Device
+  has no volume at all, so the menu bar gains a top-level **Volume** item whose
+  title always shows the level (`Volume 44%` / `Volume (muted)`), with a
+  slider, `Volume +5%` / `Volume −5%`, `Mute`/`Unmute` and 25/50/75/100%
+  presets. rumps 0.4.0's `MenuItem.menu = [...]` never attaches an NSMenu (the
+  parent renders greyed out with no children) and cannot carry a slider, so
+  submenus are built directly with `setSubmenu_`/`addItem_` (`populate_submenu`).
+  Volume actions target the *audible* device: the real output inside the
+  Multi-Output Device in loopback mode, otherwise whatever is the current
+  default output -- so the menu and the remapped keys behave like the system
+  volume in both modes. The slider/label/title update live (debounced drags,
+  poll sync with a drag guard), fixing the frozen percentage. The recorder
+  now hands the default output back to the real device when it stops
+  (`deactivate_loopback`, keeping the device and pairing so the next recording
+  re-selects it instantly), so native volume keys work between calls. Mute
+  silences the speakers/headphones only; BlackHole and the tap are unaffected,
+  so recordings continue. `karabiner/zoom-recorder-volume.json` maps the
+  hardware volume keys to the CLI actions (no Accessibility TCC -- consistent
+  with the Falcon/least-privilege decision).
 - Covered by `DevicesTests` (classification, output-path detection, advice,
   system_profiler parsing, HUD device updates), `RoutingFixTests` (output
   choice, rebuild decision matrix, state roundtrip, fake-backend fix flows),
-  `AudioMenuTests` (dropdown specs), and `SystemTapTests` (mode resolution,
-  capture command assembly, stall watchdog, tap format parsing, feature
-  detection).
+  `AudioMenuTests` (dropdown specs, submenu attachment), `VolumeControlTests`
+  (volume math, labels, target selection) and `SystemTapTests` (mode
+  resolution, capture command assembly, stall watchdog, tap format parsing,
+  feature detection).

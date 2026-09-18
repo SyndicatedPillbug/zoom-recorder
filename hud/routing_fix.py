@@ -63,6 +63,7 @@ _DEVICE_UID = int.from_bytes(b"uid ", "big")
 _DEFAULT_OUTPUT = int.from_bytes(b"dOut", "big")
 _DEFAULT_INPUT = int.from_bytes(b"dIn ", "big")
 _VOLUME_SCALAR = int.from_bytes(b"volm", "big")
+_MUTE = int.from_bytes(b"mute", "big")
 _OUTPUT_SCOPE = int.from_bytes(b"outp", "big")
 _SYSTEM_OBJECT = 1
 
@@ -92,6 +93,26 @@ def physical_output_priority(name: str) -> int:
         if pattern.search(name):
             return score
     return 10
+
+
+def clamp_percent(value: float) -> float:
+    return max(0.0, min(100.0, float(value)))
+
+
+def stepped_volume(current: float, delta: float) -> float:
+    return clamp_percent(float(current) + float(delta))
+
+
+def format_volume_label(percent: float, muted: bool = False) -> str:
+    if muted:
+        return "Volume: muted"
+    return "Volume: {:.0f}%".format(clamp_percent(percent))
+
+
+def format_volume_title(percent: float, muted: bool = False) -> str:
+    if muted:
+        return "Volume (muted)"
+    return "Volume {:.0f}%".format(clamp_percent(percent))
 
 
 def walkthrough(loopback: str, physical: str, multi: str) -> str:
@@ -298,6 +319,40 @@ class _CoreAudio:
             raise RoutingError("GetPropertyData(volume) failed: {}".format(err))
         scalar = ctypes.cast(buf, ctypes.POINTER(ctypes.c_float)).contents.value
         return round(scalar * 100.0)
+
+    def set_device_mute(self, device_id: int, muted: bool) -> None:
+        class _Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32),
+                        ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        addr = _Addr(_MUTE, _OUTPUT_SCOPE, 0)
+        val = ctypes.c_uint32(1 if muted else 0)
+        err = self.ca.AudioObjectSetPropertyData(
+            device_id, ctypes.byref(addr), 0, None,
+            ctypes.sizeof(ctypes.c_uint32), ctypes.byref(val))
+        if err != 0:
+            raise RoutingError("SetPropertyData(mute) failed: {}".format(err))
+
+    def get_device_mute(self, device_id: int) -> bool:
+        class _Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32),
+                        ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        addr = _Addr(_MUTE, _OUTPUT_SCOPE, 0)
+        size = ctypes.c_uint32(0)
+        err = self.ca.AudioObjectGetPropertyDataSize(
+            device_id, ctypes.byref(addr), 0, None, ctypes.byref(size))
+        if err != 0:
+            raise RoutingError("mute is not available on this device ({})".format(err))
+        buf = ctypes.create_string_buffer(size.value)
+        n = ctypes.c_uint32(size.value)
+        err = self.ca.AudioObjectGetPropertyData(
+            device_id, ctypes.byref(addr), 0, None, ctypes.byref(n), buf)
+        if err != 0:
+            raise RoutingError("GetPropertyData(mute) failed: {}".format(err))
+        return bool(ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint32)).contents.value)
 
     def default_output_id(self) -> int:
         return self.get_u32(_SYSTEM_OBJECT, _DEFAULT_OUTPUT)
@@ -517,23 +572,46 @@ def restore_routing(topo: Optional[Topology] = None,
                              verified or ""))
 
 
+def _volume_target(ca, ca_devices, topo: Topology,
+                   physical_output: Optional[str] = None):
+    """The device whose volume the user actually wants to change.
+
+    In loopback mode that is the real output inside the Multi-Output Device
+    (the aggregate itself has no volume). Otherwise it is whatever is
+    currently the default output -- so the menu, the CLI and remapped volume
+    keys behave like the normal system volume in both modes.
+    """
+    if is_loopback_active(topo):
+        physical = choose_physical_output(topo, physical_output, load_state())
+        if physical is None:
+            return None
+        return next((d for d in ca_devices if d.name == physical.name), None)
+    default_id = ca.default_output_id()
+    for dev in ca_devices:
+        if dev.object_id == default_id:
+            return dev
+    physical = choose_physical_output(topo, physical_output, load_state())
+    if physical is None:
+        return None
+    return next((d for d in ca_devices if d.name == physical.name), None)
+
+
 def set_output_volume(percent: float, topo: Optional[Topology] = None,
                       physical_output: Optional[str] = None) -> FixResult:
-    """Volume for loopback (Multi-Output) mode: macOS volume keys do nothing
-    for an aggregate, so the real output device's volume is set directly."""
+    """Set the audible output device's volume (see _volume_target)."""
     topo = topo or read_system_profiler()
     try:
         ca = backend()
         ca_devices = ca.devices()
     except RoutingError as exc:
         return FixResult(False, False, str(exc))
-    physical = choose_physical_output(topo, physical_output, load_state())
-    if physical is None or physical.name not in {d.name for d in ca_devices}:
-        return FixResult(False, False, "No real output device found for volume control.")
-    dev_id = next(d.object_id for d in ca_devices if d.name == physical.name)
+    target = _volume_target(ca, ca_devices, topo, physical_output)
+    if target is None:
+        return FixResult(False, False, "No output device found for volume control.")
     try:
-        ca.set_device_volume(dev_id, percent)
-        return FixResult(True, True, "'{}' volume -> {:.0f}%".format(physical.name, percent))
+        ca.set_device_volume(target.object_id, percent)
+        return FixResult(True, True, "'{}' volume -> {:.0f}%".format(
+            target.name, clamp_percent(percent)))
     except RoutingError as exc:
         return FixResult(False, False, str(exc))
 
@@ -546,16 +624,94 @@ def get_output_volume(topo: Optional[Topology] = None,
         ca_devices = ca.devices()
     except RoutingError:
         return None
-    physical = choose_physical_output(topo, physical_output, load_state())
-    if physical is None or physical.name not in {d.name for d in ca_devices}:
-        return None
-    dev_id = next((d.object_id for d in ca_devices if d.name == physical.name), None)
-    if dev_id is None:
+    target = _volume_target(ca, ca_devices, topo, physical_output)
+    if target is None:
         return None
     try:
-        return ca.get_device_volume(dev_id)
+        return ca.get_device_volume(target.object_id)
     except RoutingError:
         return None
+
+
+def get_output_mute(topo: Optional[Topology] = None,
+                    physical_output: Optional[str] = None) -> Optional[bool]:
+    topo = topo or read_system_profiler()
+    try:
+        ca = backend()
+        ca_devices = ca.devices()
+    except RoutingError:
+        return None
+    target = _volume_target(ca, ca_devices, topo, physical_output)
+    if target is None:
+        return None
+    try:
+        return ca.get_device_mute(target.object_id)
+    except RoutingError:
+        return None
+
+
+def set_output_mute(muted: bool, topo: Optional[Topology] = None,
+                    physical_output: Optional[str] = None) -> FixResult:
+    topo = topo or read_system_profiler()
+    try:
+        ca = backend()
+        ca_devices = ca.devices()
+    except RoutingError as exc:
+        return FixResult(False, False, str(exc))
+    target = _volume_target(ca, ca_devices, topo, physical_output)
+    if target is None:
+        return FixResult(False, False, "No output device found for mute control.")
+    try:
+        ca.set_device_mute(target.object_id, muted)
+        return FixResult(True, True, "'{}' {}".format(
+            target.name, "muted" if muted else "unmuted"))
+    except RoutingError as exc:
+        return FixResult(False, False, str(exc))
+
+
+def is_loopback_active(topo: Optional[Topology] = None) -> bool:
+    """True when the default output is this tool's Multi-Output Device."""
+    topo = topo or read_system_profiler()
+    return topo.default_output == MULTI_OUTPUT_NAME
+
+
+def change_output_volume(delta: float, topo: Optional[Topology] = None,
+                         physical_output: Optional[str] = None,
+                         loopback_only: bool = False) -> FixResult:
+    if loopback_only and not is_loopback_active(topo):
+        return FixResult(True, False, "not in loopback mode; leaving volume alone")
+    current = get_output_volume(topo, physical_output)
+    if current is None:
+        return FixResult(False, False, "Could not read the current output volume.")
+    target = stepped_volume(current, delta)
+    return set_output_volume(target, topo, physical_output)
+
+
+def deactivate_loopback(topo: Optional[Topology] = None) -> FixResult:
+    """Point the default output back at the real device while KEEPING the
+    Multi-Output Device and the paired-device state, so hardware volume keys
+    work between recordings and the next recording re-selects the device
+    instantly (with the same pairing).
+
+    This is the automatic counterpart to restore_routing(), which removes
+    the device entirely.
+    """
+    topo = topo or read_system_profiler()
+    try:
+        ca = backend()
+        ca_devices = ca.devices()
+    except RoutingError as exc:
+        return FixResult(False, False, str(exc))
+    physical = choose_physical_output(topo, None, load_state())
+    if physical is None or physical.name not in {d.name for d in ca_devices}:
+        return FixResult(False, False, "No real output device found to restore to.")
+    dev_id = next(d.object_id for d in ca_devices if d.name == physical.name)
+    try:
+        ca.set_default_output(dev_id)
+    except RoutingError as exc:
+        return FixResult(False, False, str(exc))
+    return FixResult(True, True, "Default output -> '{}' (loopback device kept)."
+                     .format(physical.name))
 
 
 def list_real_outputs(topo: Optional[Topology] = None) -> List[str]:
@@ -712,6 +868,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="with --restore-routing: which microphone to select")
     parser.add_argument("--yes", action="store_true",
                         help="never prompt; accept the chosen/default output")
+    parser.add_argument("--volume", type=float, default=None, metavar="PCT",
+                        help="set the real output device's volume (0-100) and exit")
+    parser.add_argument("--volume-up", action="store_true",
+                        help="raise the volume by --step percent and exit")
+    parser.add_argument("--volume-down", action="store_true",
+                        help="lower the volume by --step percent and exit")
+    parser.add_argument("--step", type=float, default=5.0,
+                        help="percent per --volume-up/--volume-down (default 5)")
+    parser.add_argument("--mute", action="store_true", help="mute the real output")
+    parser.add_argument("--unmute", action="store_true", help="unmute the real output")
+    parser.add_argument("--toggle-mute", action="store_true",
+                        help="flip the real output's mute state")
+    parser.add_argument("--loopback-only", action="store_true",
+                        help="volume/mute actions only act while the default output is "
+                             "the tool's Multi-Output Device (so the native volume keys "
+                             "keep behaving normally otherwise)")
     args = parser.parse_args(argv)
 
     if args.list_outputs:
@@ -723,6 +895,29 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.restore_routing:
         result = restore_routing(output=args.output, input_device=args.input)
+        print(result.message)
+        print("RESULT: {}".format("OK" if result.ok else "MANUAL"))
+        return 0 if result.ok else 1
+
+    volume_action = (args.volume is not None or args.volume_up or args.volume_down
+                     or args.mute or args.unmute or args.toggle_mute)
+    if volume_action:
+        if args.loopback_only and not is_loopback_active():
+            print("not in loopback mode; leaving volume alone")
+            print("RESULT: OK")
+            return 0
+        if args.volume is not None:
+            result = set_output_volume(args.volume, physical_output=args.output)
+        elif args.volume_up:
+            result = change_output_volume(args.step, physical_output=args.output)
+        elif args.volume_down:
+            result = change_output_volume(-args.step, physical_output=args.output)
+        else:
+            muted = get_output_mute(physical_output=args.output)
+            if args.toggle_mute and muted is not None:
+                result = set_output_mute(not muted, physical_output=args.output)
+            else:
+                result = set_output_mute(bool(args.mute), physical_output=args.output)
         print(result.message)
         print("RESULT: {}".format("OK" if result.ok else "MANUAL"))
         return 0 if result.ok else 1

@@ -1,0 +1,37 @@
+{
+  "title": "zoom-recorder volume keys (loopback capture)",
+  "rules": [
+    {
+      "description": "Volume up/down/mute control the zoom-recorder output device (works while the Multi-Output Device is the default output, where macOS's own volume keys do nothing). Edit the path below if your checkout lives elsewhere.",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": { "consumer_key_code": "volume_increment" },
+          "to": [
+            {
+              "shell_command": "cd /Users/OHalvorson/zoom-recorder && /usr/bin/python3 -m hud.routing_fix --volume-up --step 5"
+            }
+          ]
+        },
+        {
+          "type": "basic",
+          "from": { "consumer_key_code": "volume_decrement" },
+          "to": [
+            {
+              "shell_command": "cd /Users/OHalvorson/zoom-recorder && /usr/bin/python3 -m hud.routing_fix --volume-down --step 5"
+            }
+          ]
+        },
+        {
+          "type": "basic",
+          "from": { "consumer_key_code": "mute" },
+          "to": [
+            {
+              "shell_command": "cd /Users/OHalvorson/zoom-recorder && /usr/bin/python3 -m hud.routing_fix --toggle-mute"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

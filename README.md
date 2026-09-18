@@ -290,10 +290,21 @@ automatically:
 2. **Loopback / Multi-Output (the default elsewhere — menu bar, launchd,
    older macOS).** A Multi-Output Device (BlackHole + your real output) is
    created and selected automatically at recording start (idempotent; the
-   pairing lives in `~/.zoom_recorder_routing.json`). Because macOS volume
-   keys do nothing for a Multi-Output Device, the menu bar's **Audio Out ▸**
-   menu includes a **volume slider** that sets the real output's volume
-   directly. `--restore-routing` (also in that menu) returns your Mac to
+   pairing lives in `~/.zoom_recorder_routing.json`), and the default output
+   is handed back to your real device when the recording stops, so the
+   normal volume keys work between calls. Because macOS gives Multi-Output
+   Devices no volume control at all, the menu bar has a top-level **Volume**
+   menu (its title always shows the current level): a slider, `Volume +5%` /
+   `Volume −5%`, `Mute`/`Unmute`, and 25/50/75/100% presets. The same
+   controls are available from the CLI:
+   `python3 -m hud.routing_fix --volume 40 | --volume-up | --volume-down |
+   --mute | --unmute | --toggle-mute`. To put the volume keys back on the
+   hardware keys, import `karabiner/zoom-recorder-volume.json` in Karabiner
+   Elements (Complex Modifications → Add rule → Import more rules from a
+   file); it maps volume up/down/mute to those CLI actions in both modes.
+   Muting silences your speakers/headphones only — the recording keeps
+   capturing system audio.
+   `--restore-routing` (also in the `Audio Out ▸` menu) returns your Mac to
    normal when you stop using loopback mode.
 2. **Loopback fallback (older macOS, or `--system-capture loopback`).**
    Install BlackHole (`brew install blackhole-2ch`), then run
@@ -412,6 +423,10 @@ to the **next** recording, since the HUD reads config at session start.
 | `--restore-routing` | off | Undo everything: real default output/input, remove the Multi-Output Device, then exit |
 | `--fix-output NAME` | stored | With `--fix-routing`/`--restore-routing`: which real output device |
 | `--fix-input NAME` | auto | With `--restore-routing`: which microphone to select |
+| `--volume PCT` | — | Set the audible output's volume (loopback member, else the default output) |
+| `--volume-up` / `--volume-down` | — | Step the volume by `--step` (default 5); used by remapped keys |
+| `--mute` / `--unmute` / `--toggle-mute` | — | Mute the audible output without affecting the recording |
+| `--loopback-only` | off | With a volume action: only act while the Multi-Output Device is the default output |
 | `--chunk-seconds N` | 5 | How often the active mic is tested |
 | `--fail-threshold N` | 3 | Consecutive silent checks before cycling inputs |
 | `--cycle-seconds N` | 60 | How often every inactive input is tested |
@@ -540,5 +555,6 @@ Annotated tags mark each milestone (`git tag -n` for the full messages):
 | `v1.5-routing` | macOS audio topology, BlackHole-first loopback selection, route re-detection, HUD device status, `--list`/`--check-routing` |
 | `v1.6-routing-fix` | One-command automated routing fix (`--fix-routing`, menu-bar item), bare-BlackHole misroute advice, click-by-click fallback; `Audio Out` menu-bar dropdown to switch the passthrough output mid-call, stored pairing preference (`~/.zoom_recorder_routing.json`), stale-device rebuilds |
 | `v1.7-system-tap` | Core Audio process-tap capture (`--system-capture auto|tap|loopback`): system audio recorded directly where permitted (Terminal context), loopback+volume-slider mode for the menu bar, `--restore-routing`, one-time System Audio Recording permission, wedge recovery, preserved failure diagnostics |
+| `v1.8-volume` | First-class top-level **Volume** menu (live level in the title, slider, ±5%, mute, presets), CLI volume/mute actions, Karabiner key mapping for loopback mode, mute leaves the recording intact, default output auto-restored when a recording stops (native keys return between calls) |
 
 Running the tests: `python3 -m unittest discover -s tests`.

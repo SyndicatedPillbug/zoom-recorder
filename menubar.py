@@ -53,6 +53,31 @@ def audio_menu_specs(outputs, paired):
     return specs
 
 
+def populate_submenu(parent_item, entries) -> None:
+    """Attach ``entries`` (rumps.MenuItem / rumps.SliderMenuItem / None for a
+    separator) as the real submenu of ``parent_item``.
+
+    rumps 0.4.0's ``MenuItem.menu`` assignment is a plain Python attribute --
+    it never calls ``setSubmenu_``, so the parent renders with no children and
+    macOS greys it out. It also cannot carry a SliderMenuItem. Attaching the
+    NSMenu ourselves sidesteps both; callbacks still dispatch because
+    MenuItem/SliderMenuItem registered them with NSApp on construction.
+    """
+    from AppKit import NSMenu, NSMenuItem
+
+    menu = parent_item._menuitem.submenu()
+    if menu is None:
+        menu = NSMenu.alloc().init()
+        parent_item._menuitem.setSubmenu_(menu)
+    menu.removeAllItems()
+    for entry in entries:
+        if entry is None:
+            menu.addItem_(NSMenuItem.separatorItem())
+        else:
+            menu.addItem_(entry._menuitem)
+    parent_item._menuitem.setEnabled_(True)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -80,14 +105,20 @@ def _read_pidfile(path: Path = PIDFILE) -> "int | None":
 class RecorderApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(IDLE_TITLE, quit_button="Quit")
+        # Volume is deliberately the first top-level item so the current
+        # level is visible at all times (its title carries the percentage).
+        self.volume_item = rumps.MenuItem("Volume")
         self.toggle_item = rumps.MenuItem("Start Recording", callback=self.toggle)
         self.live_item = rumps.MenuItem("Start with Live HUD", callback=self.start_live)
         self.open_hud_item = rumps.MenuItem("Open Live HUD…", callback=self.open_hud)
         self.settings_item = rumps.MenuItem("Settings…", callback=self.open_settings)
         self.audio_item = rumps.MenuItem("Audio Out")
-        self.menu = [self.toggle_item, self.live_item, None,
+        self.menu = [self.volume_item, self.toggle_item, self.live_item, None,
                      self.open_hud_item, self.settings_item, self.audio_item]
         self._audio_sig = None
+        self._volume_value = None
+        self._volume_muted = None
+        self._vol_drag_until = 0.0
         self._sync_ui()
 
     def _hud_active(self) -> bool:
@@ -103,22 +134,106 @@ class RecorderApp(rumps.App):
         self.live_item.title = state["live_title"]
         self.live_item.set_callback(self.start_live if state["live_enabled"] else None)
         self.open_hud_item.set_callback(self.open_hud if state["open_enabled"] else None)
+        self._sync_volume_if_changed()
         self._sync_audio_menu()
+
+    def _read_volume(self):
+        try:
+            from hud.routing_fix import get_output_volume, get_output_mute
+            return get_output_volume(), bool(get_output_mute())
+        except Exception:
+            return None, False
+
+    def _sync_volume_menu(self) -> None:
+        """Build/refresh the top-level Volume menu (slider, +/- , mute,
+        presets). Runs on construction, after every action, and on the poll
+        so the label/title always match the real device volume."""
+        from hud.routing_fix import format_volume_label, format_volume_title
+        volume, muted = self._read_volume()
+        if volume is None:
+            self.volume_item.title = "Volume"
+            populate_submenu(self.volume_item, [
+                rumps.MenuItem("(no controllable output)", callback=None)])
+            return
+        self._volume_value, self._volume_muted = volume, muted
+        self.volume_item.title = format_volume_title(volume, muted)
+        self._volume_slider = rumps.SliderMenuItem(value=volume,
+                                                   callback=self._volume_changed)
+        self._volume_label = rumps.MenuItem(format_volume_label(volume, muted),
+                                            callback=None)
+        entries = [
+            self._volume_slider,
+            self._volume_label,
+            None,
+            rumps.MenuItem("Volume +5%", callback=lambda _s: self._nudge_volume(5)),
+            rumps.MenuItem("Volume \u22125%", callback=lambda _s: self._nudge_volume(-5)),
+            rumps.MenuItem("Unmute" if muted else "Mute", callback=self._toggle_mute),
+            None,
+        ]
+        presets = rumps.MenuItem("Presets")
+        populate_submenu(presets, [
+            rumps.MenuItem("{}%".format(p),
+                           callback=lambda _s, pct=p: self._set_volume(pct))
+            for p in (25, 50, 75, 100)])
+        entries.append(presets)
+        populate_submenu(self.volume_item, entries)
+
+    def _sync_volume_if_changed(self) -> None:
+        # Don't fight the user mid-drag, and don't rebuild while idle unless
+        # the underlying value actually moved (e.g. changed from the CLI).
+        if time.time() < self._vol_drag_until:
+            return
+        volume, muted = self._read_volume()
+        if (volume, muted) != (self._volume_value, self._volume_muted):
+            self._sync_volume_menu()
+
+    def _set_volume(self, percent: float) -> None:
+        try:
+            from hud.routing_fix import set_output_volume
+            result = set_output_volume(percent)
+            if not result.ok:
+                rumps.notification("zoom-recorder", "Volume", result.message)
+        except Exception as exc:  # noqa: BLE001
+            rumps.notification("zoom-recorder", "Volume", str(exc))
+        self._sync_volume_menu()
+
+    def _nudge_volume(self, delta: float) -> None:
+        try:
+            from hud.routing_fix import change_output_volume
+            result = change_output_volume(delta)
+            if not result.ok:
+                rumps.notification("zoom-recorder", "Volume", result.message)
+        except Exception as exc:  # noqa: BLE001
+            rumps.notification("zoom-recorder", "Volume", str(exc))
+        self._sync_volume_menu()
+
+    def _toggle_mute(self, _sender) -> None:
+        try:
+            from hud.routing_fix import set_output_mute
+            result = set_output_mute(not bool(self._volume_muted))
+            if not result.ok:
+                rumps.notification("zoom-recorder", "Volume", result.message)
+        except Exception as exc:  # noqa: BLE001
+            rumps.notification("zoom-recorder", "Volume", str(exc))
+        self._sync_volume_menu()
 
     def _sync_audio_menu(self) -> None:
         # Rebuild the "Audio Out" submenu only when the device set actually
         # changed (this runs on the 5s poll; CoreAudio reads are cheap but
         # rebuilding menu items every tick would reset their callbacks).
         try:
-            from hud.system_tap import available as tap_available
-            from hud.routing_fix import list_real_outputs, load_state, get_output_volume
-            tap_ok = tap_available()
+            from hud.system_tap import usable_in_this_context
+            from hud.routing_fix import list_real_outputs, load_state
+            # Whether *this* process context will use tap capture, exactly as
+            # the recorder decides it -- capability alone would hide the
+            # loopback pairing items in the menu bar even though recordings
+            # run in loopback mode here.
+            tap_ok = usable_in_this_context()
             outputs = [] if tap_ok else list_real_outputs()
             paired = None if tap_ok else load_state().get("physical_name")
-            volume = None if tap_ok else get_output_volume()
         except Exception:
             tap_ok = True  # conservative: assume nothing to switch
-            outputs, paired, volume = [], None, None
+            outputs, paired = [], None
         sig = (tuple(outputs), paired, tap_ok)
         if sig == self._audio_sig:
             return
@@ -126,32 +241,27 @@ class RecorderApp(rumps.App):
         if tap_ok:
             # Tap capture needs no routing changes at all: the tap follows
             # whatever the default output is. Only offer the undo switch.
-            self.audio_item.menu = [
+            populate_submenu(self.audio_item, [
                 rumps.MenuItem("(direct capture: routing untouched)", callback=None),
                 rumps.MenuItem("Restore Normal Routing…", callback=self.restore_routing),
-            ]
+            ])
             return
         # Loopback (Multi-Output) mode: volume keys do not work for it, so
         # provide the volume control macOS omits.
-        items = []
+        entries = []
         for label, name in audio_menu_specs(outputs, paired):
             if label is None:
-                items.append(None)
+                entries.append(None)
             elif name is None:
-                items.append(rumps.MenuItem(label, callback=self.fix_routing))
+                entries.append(rumps.MenuItem(label, callback=self.fix_routing))
             else:
-                items.append(rumps.MenuItem(label, callback=self._pair_output))
-        if volume is not None:
-            items.append(None)
-            items.append(rumps.SliderMenuItem(
-                value=volume, callback=self._volume_changed))
-            items.append(rumps.MenuItem("Volume: {:.0f}% (loopback mode)".format(volume),
-                                        callback=None))
-        self.audio_item.menu = items
+                entries.append(rumps.MenuItem(label, callback=self._pair_output))
+        populate_submenu(self.audio_item, entries)
 
     def _volume_changed(self, sender) -> None:
         value = sender.value if hasattr(sender, "value") else sender
-        # Debounce: the slider fires continuously while dragging.
+        # Guard the poll sync: a rebuild mid-drag would reset the NSSlider.
+        self._vol_drag_until = time.time() + 1.0
         timer = getattr(self, "_vol_timer", None)
         if timer is not None:
             timer.cancel()
@@ -162,10 +272,20 @@ class RecorderApp(rumps.App):
 
     def _set_volume_worker(self, percent: float) -> None:
         try:
-            from hud.routing_fix import set_output_volume
+            from hud.routing_fix import (format_volume_label,
+                                         format_volume_title,
+                                         set_output_volume)
             result = set_output_volume(percent)
             if not result.ok:
                 rumps.notification("zoom-recorder", "Volume", result.message)
+                return
+            # Update the visible state in place (no menu rebuild while the
+            # user may still be dragging).
+            self._volume_value = percent
+            self.volume_item.title = format_volume_title(percent, self._volume_muted)
+            label = getattr(self, "_volume_label", None)
+            if label is not None:
+                label.title = format_volume_label(percent, self._volume_muted)
         except Exception as exc:
             rumps.notification("zoom-recorder", "Volume", str(exc))
 

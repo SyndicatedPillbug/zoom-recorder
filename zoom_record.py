@@ -1118,27 +1118,16 @@ def build_hud_config(args: argparse.Namespace):
     return cfg
 
 
-def in_granted_terminal() -> bool:
-    """True when the recorder runs under Apple Terminal.
-
-    macOS attributes audio-capture permission to the responsible app: a
-    process spawned from Terminal inherits Terminal's grants, while a
-    launchd/GUI-spawned process (menu bar) is attributed to its own context,
-    where the System Audio Recording grant cannot be created on macOS 15
-    (the tap starts but delivers silence, and wedges mic opens)."""
-    return os.environ.get("TERM_PROGRAM") == "Apple_Terminal"
-
-
 def resolve_system_capture(args: argparse.Namespace) -> str:
     """Decide how system audio is captured: tap or loopback."""
     if args.system_capture == "loopback" or args.system:
         return "loopback"
     if args.system_capture == "tap":
         return "tap"
-    if not args.no_system and in_granted_terminal():
+    if not args.no_system:
         try:
-            from hud.system_tap import available
-            if available():
+            from hud.system_tap import usable_in_this_context
+            if usable_in_this_context():
                 return "tap"
         except Exception:  # noqa: BLE001
             pass
@@ -1462,6 +1451,20 @@ def main(argv: List[str]) -> int:
                 pcm_source.stop()
             except Exception as exc:  # noqa: BLE001
                 log.warn("System tap shutdown error: {}".format(exc))
+        # Hand the default output back to the real device so hardware volume
+        # keys work between recordings. The Multi-Output Device and the
+        # paired-device state are kept, so the next recording re-selects it
+        # instantly with the same pairing. Skipped when the user pinned a
+        # specific system device themselves.
+        if (cfg.system_capture == "loopback" and cfg.use_system
+                and not cfg.system_override):
+            try:
+                from hud.routing_fix import deactivate_loopback
+                restored = deactivate_loopback()
+                if restored.changed:
+                    log.info("Audio routing: {}".format(restored.message))
+            except Exception as exc:  # noqa: BLE001
+                log.warn("Could not restore the default output ({})".format(exc))
         if live is not None:
             try:
                 live.stop()
