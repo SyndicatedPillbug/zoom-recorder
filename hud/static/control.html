@@ -160,7 +160,8 @@
           <label>Language</label>
           <div class="ctl">
             <select id="modelChoice">
-              <option value="ggml-base.en.bin">English only (recommended)</option>
+              <option value="ggml-large-v3-turbo-q5_0.bin">Turbo quality (recommended)</option>
+              <option value="ggml-base.en.bin">Base speed (English)</option>
               <option value="ggml-base.bin">All languages</option>
             </select>
             <button class="secondary mini" id="installWhisper">Install transcriber</button>
@@ -168,8 +169,8 @@
             <span class="status" id="localStatus"></span>
           </div>
         </div>
-        <p class="note">Runs entirely on this Mac. The model is about 150 MB and is
-          downloaded once.</p>
+        <p class="note">Runs entirely on this Mac. Turbo is about 547 MiB and is
+          downloaded once; base is a smaller speed-first fallback.</p>
       </div>
       <div id="liveOnline" class="hidden">
         <div class="row">
@@ -388,7 +389,11 @@
     $('liveOnline').classList.toggle('hidden', live !== 'online');
     const model = s.transcription_model || '';
     if ($('modelChoice')) {
-      $('modelChoice').value = model.includes('.en.bin') ? 'ggml-base.en.bin' : 'ggml-base.bin';
+      if (model.includes('large-v3-turbo-q5_0')) {
+        $('modelChoice').value = 'ggml-large-v3-turbo-q5_0.bin';
+      } else {
+        $('modelChoice').value = model.includes('.en.bin') ? 'ggml-base.en.bin' : 'ggml-base.bin';
+      }
     }
     if ($('provider') && ['groq', 'openai', 'openrouter'].includes(backend)) {
       $('provider').value = backend;

@@ -20,13 +20,23 @@ import json
 import math
 import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 DEFAULT_CACHE = Path.home() / ".cache" / "zoom-recorder" / "kb"
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'_-]+", re.I)
+IGNORED_DIRS = {".obsidian", ".git", ".trash", ".stfolder", "node_modules",
+                "__pycache__"}
+LEXICAL_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do",
+    "for", "from", "how", "i", "in", "is", "it", "me", "of", "on", "or",
+    "that", "the", "this", "to", "was", "we", "what", "when", "where", "which",
+    "who", "why", "with", "would", "you", "your",
+}
 
 
 # --------------------------------------------------------------------------
@@ -91,15 +101,24 @@ def _make_chunk(heading: str, body: str, source: str) -> Dict[str, str]:
     return {"source": source, "heading": heading or source, "text": body.strip()}
 
 
-def _iter_markdown_files(dirs: List[str]):
+def _iter_markdown_files(dirs: List[str], onerror: Optional[Callable[[str], None]] = None):
     for d in dirs:
         root = Path(os.path.expanduser(d))
         if not root.exists():
             continue
-        paths = [root] if root.is_file() else sorted(root.rglob("*.md"))
-        for path in paths:
-            if path.is_file() and path.suffix.lower() in (".md", ".markdown"):
-                yield path
+        if root.is_file():
+            if root.suffix.lower() in (".md", ".markdown"):
+                yield root
+            continue
+        def _walk_error(exc: OSError) -> None:
+            if onerror:
+                onerror(str(exc))
+        for current, dirnames, filenames in os.walk(root, onerror=_walk_error):
+            dirnames[:] = sorted(name for name in dirnames if name not in IGNORED_DIRS)
+            for name in sorted(filenames):
+                path = Path(current) / name
+                if path.suffix.lower() in (".md", ".markdown"):
+                    yield path
 
 
 def _fingerprint(files: List[Path], salt: str = "") -> str:
@@ -107,12 +126,11 @@ def _fingerprint(files: List[Path], salt: str = "") -> str:
     h.update(salt.encode("utf-8"))
     for path in sorted(files):
         try:
-            stat = path.stat()
+            content = path.read_bytes()
         except OSError:
             continue
         h.update(str(path).encode("utf-8"))
-        h.update(str(int(stat.st_mtime)).encode())
-        h.update(str(stat.st_size).encode())
+        h.update(hashlib.sha256(content).digest())
     return h.hexdigest()
 
 
@@ -122,6 +140,26 @@ def _norm(vector: List[float]) -> float:
 
 def _dot(a: List[float], b: List[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
+
+
+def _tokens(text: str) -> List[str]:
+    return [token.lower() for token in TOKEN_RE.findall(text or "")
+            if token.lower() not in LEXICAL_STOPWORDS]
+
+
+def _lexical_score(query: str, chunk: Dict[str, str]) -> float:
+    """Score exact meaningful-term coverage, independent of embeddings."""
+    query_tokens = set(_tokens(query))
+    if not query_tokens:
+        return 0.0
+    haystack = set(_tokens("{}\n{}".format(chunk.get("heading", ""),
+                                        chunk.get("text", ""))))
+    overlap = len(query_tokens & haystack) / len(query_tokens)
+    phrase = " ".join(_tokens(query))
+    body = "{} {}".format(chunk.get("heading", ""), chunk.get("text", "")).lower()
+    if phrase and phrase in body:
+        overlap = min(1.0, overlap + 0.15)
+    return overlap
 
 
 # --------------------------------------------------------------------------
@@ -220,18 +258,93 @@ class KBIndex:
         self.max_chunks = max_chunks
         self._chunks: List[Dict[str, str]] = []
         self._vectors: List[List[float]] = []
+        self._token_index: Dict[str, List[int]] = {}
         self._ready = False
         self._lock = threading.Lock()
+
+    def _rebuild_token_index(self) -> None:
+        index: Dict[str, List[int]] = {}
+        for number, chunk in enumerate(self._chunks):
+            for token in set(_tokens("{}\n{}".format(
+                    chunk.get("heading", ""), chunk.get("text", "")))):
+                index.setdefault(token, []).append(number)
+        self._token_index = index
+
+    def _embedder_label(self) -> str:
+        # The suffix invalidates old body-only vectors after adding headings to
+        # the embedding input.  It also keeps caches for different embedders
+        # completely separate.
+        return "{}:heading-v1".format(getattr(self.embedder, "label", ""))
+
+    @staticmethod
+    def _embedding_text(chunk: Dict[str, str]) -> str:
+        return "{}\n{}".format(chunk.get("heading", ""), chunk.get("text", ""))
+
+    def _file_cache_path(self, path: Path) -> Path:
+        key = hashlib.sha256((str(path) + "\0" + self._embedder_label()).encode(
+            "utf-8")).hexdigest()
+        return self.cache_dir / "files" / (key + ".json.gz")
+
+    def _load_file_cache(self, cache_file: Path, content_fingerprint: str
+                         ) -> Optional[Tuple[List[Dict[str, str]], List[List[float]]]]:
+        try:
+            with gzip.open(cache_file, "rt", encoding="utf-8") as fh:
+                cached = json.load(fh)
+            chunks = cached.get("chunks") or []
+            vectors = cached.get("vectors") or []
+            if (cached.get("content_fingerprint") != content_fingerprint
+                    or cached.get("embedder") != self._embedder_label()
+                    or len(chunks) != len(vectors)):
+                return None
+            return chunks, vectors
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
+    @staticmethod
+    def _atomic_write(path: Path, writer: Callable[[str], None]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=str(path.parent),
+                    prefix=".kb-", suffix=".tmp", delete=False) as fh:
+                temp_name = fh.name
+                writer(fh.name)
+            os.replace(temp_name, path)
+        finally:
+            if temp_name:
+                try:
+                    Path(temp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _save_file_cache(self, path: Path, content_fingerprint: str,
+                         chunks: List[Dict[str, str]],
+                         vectors: List[List[float]]) -> None:
+        cache_file = self._file_cache_path(path)
+
+        def write(temp_name: str) -> None:
+            with gzip.open(temp_name, "wt", encoding="utf-8") as fh:
+                json.dump({"content_fingerprint": content_fingerprint,
+                           "embedder": self._embedder_label(),
+                           "chunks": chunks, "vectors": vectors}, fh)
+
+        self._atomic_write(cache_file, write)
 
     # -- build -------------------------------------------------------------
     def build(self, force: bool = False) -> bool:
         if not self.dirs:
             return False
-        files = list(_iter_markdown_files(self.dirs))
+        walk_errors: List[str] = []
+        files = list(_iter_markdown_files(self.dirs, walk_errors.append))
+        for error in walk_errors:
+            self.log("KB: could not inspect a vault path ({}); macOS may need "
+                     "Files & Folders access for this vault".format(error))
         if not files:
             self.log("KB: no markdown files found in {}".format(", ".join(self.dirs)))
             return False
-        fingerprint = _fingerprint(files, salt=getattr(self.embedder, "label", ""))
+        embedder_label = self._embedder_label()
+        fingerprint = _fingerprint(files, salt=embedder_label)
         meta_file = self.cache_dir / "index.json"
         vectors_file = self.cache_dir / "vectors.json.gz"
         if not force and meta_file.is_file() and vectors_file.is_file():
@@ -239,40 +352,101 @@ class KBIndex:
                 self._ready = True
                 return True
 
-        chunks: List[Dict[str, str]] = []
+        entries: List[Tuple[Path, str, List[Dict[str, str]],
+                             Optional[List[List[float]]]]] = []
+        reused_files = 0
+        unreadable_files = 0
         for path in files:
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
+                unreadable_files += 1
+                self.log("KB: could not read {}; macOS may need Files & Folders "
+                         "access for this vault".format(path))
                 continue
-            chunks.extend(chunk_markdown(text, str(path)))
+            content_fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            cached = None if force else self._load_file_cache(
+                self._file_cache_path(path), content_fingerprint)
+            if cached is not None:
+                cached_chunks, cached_vectors = cached
+                entries.append((path, content_fingerprint, cached_chunks,
+                                cached_vectors))
+                reused_files += 1
+                continue
+            file_chunks = chunk_markdown(text, str(path))
+            entries.append((path, content_fingerprint, file_chunks, None))
+
+        embedded_files = 0
+        pending_indices = [index for index, (_path, _fingerprint, file_chunks, vectors)
+                           in enumerate(entries) if vectors is None and file_chunks]
+        if pending_indices:
+            pending_chunks = [chunk for index in pending_indices
+                              for chunk in entries[index][2]]
+            try:
+                pending_vectors = self.embedder.encode(
+                    [self._embedding_text(c) for c in pending_chunks])
+            except Exception as exc:  # noqa: BLE001
+                self.log("KB: failed to embed ({}); continuing without KB".format(exc))
+                return False
+            if len(pending_vectors) != len(pending_chunks):
+                self.log("KB: embedding count mismatch ({} != {}); skipping KB".format(
+                    len(pending_vectors), len(pending_chunks)))
+                return False
+            offset = 0
+            for index in pending_indices:
+                path, content_fingerprint, file_chunks, _old_vectors = entries[index]
+                count = len(file_chunks)
+                file_vectors = pending_vectors[offset:offset + count]
+                offset += count
+                entries[index] = (path, content_fingerprint, file_chunks, file_vectors)
+                embedded_files += 1
+                try:
+                    self._save_file_cache(path, content_fingerprint,
+                                          file_chunks, file_vectors)
+                except OSError as exc:
+                    self.log("KB: could not write per-file cache for {} ({})".format(
+                        path, exc))
+
+        # Cached chunks and newly embedded chunks are accumulated together in
+        # file order, keeping the vector list aligned with the chunk list.
+        chunks: List[Dict[str, str]] = []
+        vectors: List[List[float]] = []
+        for _path, _content_fingerprint, file_chunks, file_vectors in entries:
+            chunks.extend(file_chunks)
+            vectors.extend(file_vectors or [])
         if not chunks:
             return False
-        try:
-            vectors = self.embedder.encode([c["text"] for c in chunks])
-        except Exception as exc:  # noqa: BLE001
-            self.log("KB: failed to embed ({}); continuing without KB".format(exc))
-            return False
         if len(vectors) != len(chunks):
-            self.log("KB: embedding count mismatch ({} != {}); skipping KB".format(
+            self.log("KB: vector/chunk assembly mismatch ({} != {}); skipping KB".format(
                 len(vectors), len(chunks)))
             return False
 
         self._chunks = chunks
         self._vectors = vectors
+        self._rebuild_token_index()
         self._ready = True
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            meta_file.write_text(json.dumps(
-                {"fingerprint": fingerprint,
-                 "embedder": getattr(self.embedder, "label", ""),
-                 "chunks": chunks}), encoding="utf-8")
-            with gzip.open(vectors_file, "wt", encoding="utf-8") as fh:
-                json.dump(vectors, fh)
+            def write_meta(temp_name: str) -> None:
+                Path(temp_name).write_text(
+                    json.dumps({"fingerprint": fingerprint,
+                                "embedder": embedder_label,
+                                "chunks": chunks}), encoding="utf-8")
+
+            def write_vectors(temp_name: str) -> None:
+                with gzip.open(temp_name, "wt", encoding="utf-8") as fh:
+                    json.dump(vectors, fh)
+
+            self._atomic_write(meta_file, write_meta)
+            self._atomic_write(vectors_file, write_vectors)
         except OSError as exc:
             self.log("KB: could not write cache ({})".format(exc))
-        self.log("KB: indexed {} chunk(s) from {} file(s) [{}]".format(
-            len(chunks), len(files), getattr(self.embedder, "label", "?")))
+        self.log("KB: indexed {} chunk(s) from {} file(s) [{}]; reused {}, "
+                 "embedded {}".format(len(chunks), len(files), embedder_label,
+                                       reused_files, embedded_files))
+        if unreadable_files:
+            self.log("KB: {} file(s) were unreadable and were skipped".format(
+                unreadable_files))
         return True
 
     def _load_cache(self, meta_file: Path, vectors_file: Path, fingerprint: str) -> bool:
@@ -286,6 +460,7 @@ class KBIndex:
             self._vectors = vectors
             if len(self._vectors) != len(self._chunks):
                 return False
+            self._rebuild_token_index()
             self.log("KB: loaded cached index ({} chunks, {})".format(
                 len(self._chunks), getattr(self.embedder, "label", "?")))
             return True
@@ -307,7 +482,7 @@ class KBIndex:
         if not chunks:
             return 0
         try:
-            vectors = self.embedder.encode([c["text"] for c in chunks])
+            vectors = self.embedder.encode([self._embedding_text(c) for c in chunks])
         except Exception as exc:  # noqa: BLE001
             self.log("KB: live add_chunks embed failed ({})".format(exc))
             return 0
@@ -318,11 +493,13 @@ class KBIndex:
         with self._lock:
             self._chunks.extend(chunks)
             self._vectors.extend(vectors)
+            self._rebuild_token_index()
             self._ready = True
             if self.max_chunks and len(self._chunks) > self.max_chunks:
                 excess = len(self._chunks) - self.max_chunks
                 del self._chunks[:excess]
                 del self._vectors[:excess]
+                self._rebuild_token_index()
         return len(chunks)
 
     # -- query -------------------------------------------------------------
@@ -344,13 +521,31 @@ class KBIndex:
             chunks = list(self._chunks)
             vectors = list(self._vectors)
 
+        with self._lock:
+            token_index = {token: list(indices)
+                           for token, indices in self._token_index.items()}
+
+        # Large vaults benefit from a cheap exact-term candidate set. If the
+        # query has no lexical anchor, fall back to the full semantic scan so
+        # conceptual/synonym matches are never discarded.
+        candidate_indices = range(len(vectors))
+        if len(vectors) > 5000:
+            query_tokens = set(_tokens(text))
+            candidates = {idx for token in query_tokens
+                          for idx in token_index.get(token, [])}
+            if candidates and len(candidates) < len(vectors) * 0.75:
+                candidate_indices = candidates
+
         scored: List["tuple[float, int]"] = []
-        for idx, vec in enumerate(vectors):
+        for idx in candidate_indices:
+            vec = vectors[idx]
             norm = _norm(vec)
             if not norm:
                 continue
-            score = _dot(query_vec, vec) / (qnorm * norm)
-            if score > self.min_score:
+            semantic = _dot(query_vec, vec) / (qnorm * norm)
+            lexical = _lexical_score(text, chunks[idx])
+            score = (0.8 * semantic) + (0.2 * lexical)
+            if score > self.min_score or lexical >= 0.5:
                 scored.append((score, idx))
         scored.sort(reverse=True)
 

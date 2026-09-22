@@ -68,7 +68,13 @@ it, and it is opt-in.
 Open **Setup** (menu: *Check my audio setup…*) and choose step 4:
 
 - **On this Mac** — free and private: `whisper.cpp` (installed by
-  `./install.sh --install-deps`) plus a one-time ~150 MB model. No account.
+  `./install.sh --install-deps`) plus a one-time ~547 MiB
+  `large-v3-turbo-q5_0` model. No account. `base.en` remains available as a
+  smaller speed-first fallback.
+- Local mode also shows a live, provisional word draft from overlapping
+  two-second windows. Only words stable across windows are committed to the
+  transcript and answer context; unstable draft text is never written back or
+  indexed. This is enabled by default and can be adjusted in Settings.
 - **Online** — Groq / OpenAI / OpenRouter with an API key for the best
   accuracy and for Suggestions/answers.
 

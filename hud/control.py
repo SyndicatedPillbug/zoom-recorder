@@ -14,6 +14,7 @@ Launched from the menu bar; nothing here requires a terminal.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -35,13 +36,16 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from hud.config import (CONFIG_PATH, PROVIDERS, _defaults, _deep_merge,  # noqa: E402
-                        config_from_dict, config_to_dict, get_provider,
-                        load_config, recorder_defaults, save_config, tcc_protected)
+                        DEFAULT_TRANSCRIPTION_MODEL_FILENAME,
+                        DEFAULT_TRANSCRIPTION_MODEL_SHA1, config_from_dict,
+                        config_to_dict, get_provider, load_config,
+                        recorder_defaults, save_config, tcc_protected)
 from hud.llm import LLMClient, LLMError  # noqa: E402
+from hud.local_http import bind_local_server, host_from_header, url_host  # noqa: E402
 from hud.recordings import list_recordings, move_to_trash  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 CONTROL_PIDFILE = Path.home() / ".zoom_recorder_control.pid"
 CONTROL_URLFILE = Path.home() / ".zoom_recorder_control.url"
 MIC_SETTINGS_URL = ("x-apple.systempreferences:com.apple.preference.security"
@@ -56,8 +60,9 @@ TERMINAL_COMMANDS = {
 }
 
 # Local transcription models we are willing to download, with their official
-# HuggingFace SHA-256 values where known (verified after download).
+# HuggingFace SHA-1 values where known.
 WHISPER_MODELS = {
+    DEFAULT_TRANSCRIPTION_MODEL_FILENAME: DEFAULT_TRANSCRIPTION_MODEL_SHA1,
     "ggml-base.en.bin": None,
     "ggml-base.bin": None,
     "ggml-small.en.bin": None,
@@ -102,7 +107,7 @@ class ControlApp:
     def start(self) -> int:
         _cleanup_stale_test_dirs()
         handler = type("_BoundHandler", (_Handler,), {"app": self})
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd, self.host = bind_local_server(handler, self.host, self.port)
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever,
@@ -161,7 +166,7 @@ class ControlApp:
     @property
     def url(self) -> str:
         return "http://{}:{}/?token={}&tab={}".format(
-            self.host, self.port, self.token, self.initial_tab)
+            url_host(self.host), self.port, self.token, self.initial_tab)
 
     def open(self) -> None:
         try:
@@ -187,7 +192,7 @@ def doctor_checks(probe_seconds: float = 1.2, skip_mic: bool = False) -> List[Di
     checks = [doctor.check_macos(), doctor.check_python()]
     checks += doctor.check_tools()
     checks += [doctor.check_rumps(), doctor.check_blackhole(), doctor.check_routing(),
-               doctor.check_output_volume()]
+               doctor.check_output_volume(), doctor.check_local_http()]
     if skip_mic:
         # Never open the microphone while a recording is running.
         checks.append(doctor.Check("microphone", True, "in use (recording)"))
@@ -316,7 +321,7 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
     def _host_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        host = host_from_header(self.headers.get("Host") or "")
         return host in ALLOWED_HOSTS
 
     def _token_ok(self, parsed: Any) -> bool:
@@ -535,6 +540,29 @@ class _Handler(BaseHTTPRequestHandler):
         path = save_config(cfg, self.app.config_path, api_keys=keys)
         self._send_json({"ok": True, "path": str(path)})
 
+    def _download_model(self, dest: Path, url: str, expected_sha1: Optional[str]) -> None:
+        """Download a model off-thread and publish it only after validation."""
+        tmp = dest.with_name(dest.name + ".download")
+        try:
+            subprocess.run(["curl", "-L", "--fail", "-o", str(tmp), url],
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            if expected_sha1:
+                digest = hashlib.sha1()
+                with tmp.open("rb") as fh:
+                    for block in iter(lambda: fh.read(1024 * 1024), b""):
+                        digest.update(block)
+                if digest.hexdigest() != expected_sha1:
+                    raise RuntimeError("checksum verification failed")
+            os.replace(str(tmp), str(dest))
+            self.app.log("downloaded and verified local model {}".format(dest.name))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.app.log("local model download failed ({}): {}".format(dest.name, exc))
+
     def _fix(self, body: Dict[str, Any]) -> None:
         from hud import routing_fix
         action = str(body.get("action") or "")
@@ -553,7 +581,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif action == "install-whisper":
             return self._run_terminal("install-whisper")
         elif action == "download-model":
-            model = str(body.get("model") or "ggml-base.en.bin")
+            model = str(body.get("model") or "ggml-large-v3-turbo-q5_0.bin")
             if model not in WHISPER_MODELS:
                 self._send_json({"ok": False, "error": "unknown model"})
                 return
@@ -561,9 +589,13 @@ class _Handler(BaseHTTPRequestHandler):
             url = ("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
                    + model)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.Popen(["curl", "-L", "--fail", "-o", str(dest), url])
+            threading.Thread(target=self._download_model,
+                             args=(dest, url, WHISPER_MODELS[model]),
+                             name="model-download", daemon=True).start()
+            size = "about 547 MiB" if "turbo-q5" in model else "about 150 MB"
             self._send_json({"ok": True, "path": str(dest),
-                             "message": "Downloading {} (about 150 MB)...".format(model)})
+                             "message": "Downloading {} ({}; keep this window open)...".format(
+                                 model, size)})
             return
         elif action == "open-advanced":
             subprocess.Popen([sys.executable, str(_repo("settings.py"))],

@@ -39,7 +39,8 @@ one-click fixes:
 Click **🎙** → **Check my audio setup…** → step 4:
 
 - **On this Mac** — free, private, nothing leaves the computer (downloads a
-  one-time model, about 150 MB).
+  one-time `large-v3-turbo-q5_0` model, about 547 MiB). Local mode also shows
+  a fast provisional word draft; only stable words become permanent evidence.
 - **Online** — best accuracy; needs an API key and sends audio to that
   service while recording.
 

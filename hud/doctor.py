@@ -63,6 +63,32 @@ def check_tools() -> List[Check]:
     return checks
 
 
+def check_local_http() -> Check:
+    """Verify that this app context can open its loopback HUD server."""
+    try:
+        from .local_http import bind_local_server
+    except ImportError:
+        from hud.local_http import bind_local_server  # type: ignore
+    from http.server import BaseHTTPRequestHandler
+
+    class _ProbeHandler(BaseHTTPRequestHandler):
+        def log_message(self, _fmt: str, *_args) -> None:  # noqa: A003
+            return
+
+    server = None
+    try:
+        server, host = bind_local_server(_ProbeHandler, "127.0.0.1", 0)
+        return Check("local HUD server", True, "loopback available ({})".format(host),
+                     critical=False)
+    except OSError as exc:
+        return Check("local HUD server", False, str(exc),
+                     "Allow local loopback sockets for this Python app and retry; "
+                     "the recorder can still run without the HUD.", critical=False)
+    finally:
+        if server is not None:
+            server.server_close()
+
+
 def check_rumps() -> Check:
     try:
         import rumps  # noqa: F401
@@ -173,7 +199,7 @@ def check_transcription() -> Check:
     if not model.is_file():
         return Check("transcription (local)", False,
                      "model not downloaded ({})".format(model.name),
-                     "Download it from the Setup tab (about 150 MB)",
+                     "Download it from the Setup tab (size depends on the selected model)",
                      critical=False)
     return Check("transcription (local)", True,
                  "{} + {}".format(Path(server).name, model.name))
@@ -200,7 +226,7 @@ def run_doctor(probe_seconds: float = 1.5) -> bool:
     checks: List[Check] = [check_macos(), check_python()]
     checks += check_tools()
     checks += [check_rumps(), check_blackhole(), check_routing(),
-               check_output_volume(), check_microphone(probe_seconds),
+               check_output_volume(), check_local_http(), check_microphone(probe_seconds),
                check_transcription(), check_tap()]
 
     print("zoom-recorder doctor")

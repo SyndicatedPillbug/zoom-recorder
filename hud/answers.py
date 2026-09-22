@@ -40,7 +40,7 @@ QUESTION_WORDS = re.compile(
 QUESTION_PHRASES = re.compile(
     r"\b(tell me about|explain|what's|whats|how do|how does|how would|"
     r"can you|could you|would you|do you|did you|are you|is there|"
-    r"any thoughts|your take|walk me through)\b",
+    r"any thoughts|your take|walk me through|walk us through)\b",
     re.I,
 )
 BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*)$")
@@ -66,6 +66,19 @@ RHETORICAL_RE = re.compile(
     re.I,
 )
 
+# Speech-to-text often drops the final question mark from indirect questions.
+# This remains a local high-recall signal; it does not trigger any new network
+# call or attempt to answer until the normal answer gate accepts it.
+INDIRECT_QUESTION_RE = re.compile(
+    r"\b(?:i(?:'m| am| was) wondering|i(?:'d| would) like to know|"
+    r"i(?:'m| am) curious|help me understand|i want to understand|"
+    r"i(?:'m| am) trying to understand|could you tell (?:me|us)|"
+    r"would you mind|do you happen to know|is there any chance|"
+    r"can i ask|the question is)\b"
+    r".{0,100}\b(?:whether|if|what|how|why|when|where|which|who)\b",
+    re.I,
+)
+
 
 @dataclass
 class Turn:
@@ -73,6 +86,7 @@ class Turn:
     ts: float
     speaker: str
     text: str
+    finalized: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -91,6 +105,8 @@ def is_question_sentence(sentence: str) -> bool:
     if QUESTION_WORDS.match(s):
         return True
     if QUESTION_PHRASES.search(s):
+        return True
+    if INDIRECT_QUESTION_RE.search(s):
         return True
     return False
 
@@ -126,6 +142,27 @@ def _question_from_turn(turn: Turn) -> Optional[str]:
     return found
 
 
+def _question_from_adjacent_turns(turns: List[Turn], index: int) -> Optional[str]:
+    """Recover an indirect question split at an STT chunk boundary."""
+    if index <= 0:
+        return None
+    prior = " ".join(t.text.strip() for t in turns[max(0, index - 2):index]
+                      if t.text.strip())
+    # If the preceding window already formed the question, this turn is not a
+    # new question; avoid re-emitting the same indirect question as the rolling
+    # lookback advances.
+    if INDIRECT_QUESTION_RE.search(prior):
+        return None
+    joined = " ".join(t.text.strip() for t in turns[max(0, index - 2):index + 1]
+                      if t.text.strip())
+    question = detect_question_text(joined)
+    if not question:
+        return None
+    if question == detect_question_text(prior):
+        return None
+    return question
+
+
 def detect_questions_since(turns: List[Turn], after_seq: int,
                            lookback_seconds: float = 90.0,
                            now: Optional[float] = None) -> List[Dict[str, Any]]:
@@ -143,7 +180,8 @@ def detect_questions_since(turns: List[Turn], after_seq: int,
     for idx, turn in enumerate(recent):
         if turn.seq <= after_seq:
             continue
-        question = _question_from_turn(turn)
+        question = (_question_from_turn(turn)
+                    or _question_from_adjacent_turns(recent, idx))
         if not question:
             continue
         context = "\n".join(_format_turn(t) for t in recent[max(0, idx - 2):idx])
@@ -152,6 +190,7 @@ def detect_questions_since(turns: List[Turn], after_seq: int,
             "speaker": turn.speaker or "",
             "seq": turn.seq,
             "context": context,
+            "finalized": bool(turn.finalized),
         })
     return out
 
@@ -174,7 +213,10 @@ def is_ambiguous_question(question: str) -> bool:
     q = (question or "").strip()
     if not q:
         return False
-    if len(q.split()) <= 6:
+    # Very short fragments still need context, but a six-word cutoff treats
+    # perfectly self-contained interview questions as ambiguous. Keep the
+    # conservative rule only for fragments of three words or fewer.
+    if len(q.split()) <= 3:
         return True
     if AMBIGUOUS_START_RE.match(q):
         return True
@@ -354,6 +396,8 @@ class AnswerEngine:
         self._last_rolling_ts = 0.0
         self._last_rolling_hash = ""
         self._words_since_rolling = 0
+        self._question_inflight = False
+        self._partial_question_draft = ""
 
         self._kb: Optional[KBIndex] = None
         self._live_kb: Optional[KBIndex] = None
@@ -501,7 +545,7 @@ class AnswerEngine:
         """Background thread: batch-embed transcript turns into the live KB.
 
         Keeping this off the main answer loop means a slow remote embedder
-        never blocks question detection or the 1 s tick.
+        never blocks question detection or the event-driven answer loop.
         """
         batch: List[Dict[str, str]] = []
         while not self._stop.is_set():
@@ -579,17 +623,24 @@ class AnswerEngine:
             self.cfg.answers_backend, self._chain.entries[0]["chat_model"],
             self._chain.entries[0]["rolling_model"], self.cfg.answer_interval))
 
-        while not self._stop.wait(1.0):
+        while not self._stop.is_set():
             try:
                 self._tick()
             except Exception as exc:  # noqa: BLE001
                 self.log("answers loop error: {}".format(exc))
+            if self._stop.is_set():
+                break
+            # Transcript events wake the loop immediately; the timeout keeps
+            # budget timers and rolling-point scheduling alive during silence.
+            # This removes the old fixed one-second question-detection delay.
+            self.state.wait_for(self._id_cursor, timeout=1.0)
 
         if self._worker is not None:
             self._worker.join(timeout=12.0)
         self._flush_buffer()
 
     def _put(self, priority: int, job: Dict[str, Any]) -> None:
+        job.setdefault("queued_at", time.time())
         self._queue.put((priority, next(self._job_seq), job))
 
     def _worker_loop(self) -> None:
@@ -616,7 +667,13 @@ class AnswerEngine:
             if payload:
                 self._refresh_talking_points(payload)
             return
-        self._answer_question(job)
+        with self._lock:
+            self._question_inflight = True
+        try:
+            self._answer_question(job)
+        finally:
+            with self._lock:
+                self._question_inflight = False
 
     def _tick(self) -> None:
         self._drain_events()
@@ -632,6 +689,12 @@ class AnswerEngine:
         lookback = self.cfg.question_lookback_seconds
         for detected in detect_questions_since(self._buffer, self._last_question_seq,
                                                lookback, now):
+            if not detected.get("finalized") and not str(
+                    detected.get("question") or "").rstrip().endswith("?"):
+                # A stable prefix can look like a question before Whisper has
+                # heard its endpoint. Keep reconstructing it until the final
+                # chunk boundary marks the evidence authoritative.
+                continue
             self._last_question_seq = max(self._last_question_seq, detected["seq"])
             if not self._should_answer(detected):
                 continue
@@ -641,7 +704,10 @@ class AnswerEngine:
                 "speaker": detected["speaker"],
                 "context": detected["context"],
                 "window": self._context_text(),
+                "detected_at": time.time(),
             })
+            self._partial_question_draft = ""
+            self.state.set_meta(question_draft="")
 
         if not self.cfg.rolling_enabled:
             return
@@ -658,6 +724,16 @@ class AnswerEngine:
         if self._words_since_rolling < self.cfg.talking_points_min_new_words:
             self._last_rolling_ts = now
             return
+        with self._lock:
+            question_busy = self._question_inflight
+        with self._queue.mutex:
+            pending_question = any(
+                item[2] is not None and item[2].get("kind") == "question"
+                for item in list(self._queue.queue))
+        if question_busy or pending_question:
+            # Talking points are deliberately best effort. Do not add another
+            # low-priority call while a question is waiting or being answered.
+            return
         digest = str(hash(window))
         if digest == self._last_rolling_hash:
             self._last_rolling_ts = now
@@ -670,7 +746,7 @@ class AnswerEngine:
         self._last_rolling_hash = digest
         self._words_since_rolling = 0
         with self._lock:
-            self._rolling_payload = {"window": window}
+            self._rolling_payload = {"window": window, "queued_at": time.time()}
             if not self._rolling_queued:
                 self._rolling_queued = True
                 self._put(1, {"kind": "rolling"})
@@ -690,6 +766,31 @@ class AnswerEngine:
         events = self.state.since(self._id_cursor)
         for event in events:
             self._id_cursor = max(self._id_cursor, int(event.get("id", 0)))
+            if event.get("type") == "transcript_partial":
+                # This is a UI-only draft. It can help the user see a question
+                # forming, but it must never enter the authoritative buffer or
+                # an answer prompt until stable words arrive as transcript events.
+                draft = str(event.get("text") or "").strip()
+                speaker = event.get("speaker") or ""
+                if draft:
+                    prior = ""
+                    for turn in reversed(self._buffer):
+                        if turn.speaker == speaker:
+                            prior = turn.text
+                            break
+                    candidate = (prior + " " + draft).strip()
+                    question = detect_question_text(candidate)
+                    if question and question != self._partial_question_draft:
+                        self._partial_question_draft = question
+                        self.state.set_meta(question_draft=question)
+                continue
+            if event.get("type") == "transcript_boundary":
+                speaker = event.get("speaker") or ""
+                for turn in reversed(self._buffer):
+                    if turn.speaker == speaker:
+                        turn.finalized = True
+                        break
+                continue
             if event.get("type") == "transcript" and event.get("source") == "live":
                 text = str(event.get("text", "")).strip()
                 if not text:
@@ -698,7 +799,8 @@ class AnswerEngine:
                 speaker = event.get("speaker") or ""
                 self._buffer.append(Turn(
                     seq=self._seq, ts=float(event.get("ts", time.time())),
-                    speaker=speaker, text=text))
+                    speaker=speaker, text=text,
+                    finalized=bool(event.get("finalized", True))))
                 self._words_since_rolling += len(text.split())
                 # Feed each turn into the live transcript index so older
                 # conversation is retrievable by meaning, not just the
@@ -758,6 +860,7 @@ class AnswerEngine:
         max_out = max_tokens or self.cfg.answer_max_tokens
         est = estimate_tokens(system + prompt, max_out)
         entries = self._chain.entries
+        rate_limited_after: Optional[float] = None
         for offset in range(len(entries)):
             entry = entries[(self._chain_index + offset) % len(entries)]
             model = model_override or (
@@ -791,9 +894,11 @@ class AnswerEngine:
             except LLMError as exc:
                 self.budget.record(None, None)
                 if exc.status == 429:
-                    self.budget.pause(exc.retry_after, reason=str(exc))
-                    self.log("answers: rate limited by {}; backing off".format(entry["name"]))
-                    return None
+                    rate_limited_after = max(rate_limited_after or 0.0,
+                                             exc.retry_after or 0.0)
+                    self.log("answers: rate limited by {}; trying fallback".format(
+                        entry["name"]))
+                    continue
                 self.log("answers: {} error: {}".format(entry["name"], exc))
                 continue
             except Exception as exc:  # noqa: BLE001
@@ -803,6 +908,9 @@ class AnswerEngine:
             self._chain_index = (self._chain_index + offset) % len(entries)
             self.state.set_budget(self.budget.snapshot())
             return result
+        if rate_limited_after is not None:
+            self.budget.pause(rate_limited_after,
+                              reason="all answer providers rate limited")
         return None
 
     def _chat_stream(self, kind: str, system: str, prompt: str,
@@ -815,6 +923,7 @@ class AnswerEngine:
         max_out = max_tokens or self.cfg.answer_max_tokens
         est = estimate_tokens(system + prompt, max_out)
         entries = self._chain.entries
+        rate_limited_after: Optional[float] = None
         for offset in range(len(entries)):
             entry = entries[(self._chain_index + offset) % len(entries)]
             model = model_override or (
@@ -843,14 +952,22 @@ class AnswerEngine:
                             temperature=temperature, on_chunk=on_chunk)
                     except LLMError as exc2:
                         self.budget.record(None, None)
+                        if exc2.status == 429:
+                            rate_limited_after = max(rate_limited_after or 0.0,
+                                                     exc2.retry_after or 0.0)
+                            self.log("answers: rate limited by {}; trying fallback".format(
+                                entry["name"]))
+                            continue
                         self.log("answers: {} stream error: {}".format(entry["name"], exc2))
                         continue
                 else:
                     self.budget.record(None, None)
                     if exc.status == 429:
-                        self.budget.pause(exc.retry_after, reason=str(exc))
-                        self.log("answers: rate limited by {}; backing off".format(entry["name"]))
-                        return None
+                        rate_limited_after = max(rate_limited_after or 0.0,
+                                                 exc.retry_after or 0.0)
+                        self.log("answers: rate limited by {}; trying fallback".format(
+                            entry["name"]))
+                        continue
                     self.log("answers: {} stream error: {}".format(entry["name"], exc))
                     continue
             except Exception as exc:  # noqa: BLE001
@@ -860,15 +977,22 @@ class AnswerEngine:
             self._chain_index = (self._chain_index + offset) % len(entries)
             self.state.set_budget(self.budget.snapshot())
             return result
+        if rate_limited_after is not None:
+            self.budget.pause(rate_limited_after,
+                              reason="all answer providers rate limited")
         return None
 
     def _answer_question(self, job: Dict[str, Any]) -> None:
+        detected_at = float(job.get("detected_at") or time.time())
+        queued_at = float(job.get("queued_at") or detected_at)
+        started_at = time.time()
         question = job.get("question") or ""
         context = job.get("context") or ""
         window = job.get("window") or self._context_text()
         if not question and not window:
             return
 
+        assembly_started = time.time()
         rewritten = ""
         # Skip the rewrite LLM call when we have enough context for the
         # answer model to resolve references directly — the prompt already
@@ -891,13 +1015,20 @@ class AnswerEngine:
         system = self._system_prompt("question")
         prompt = self._build_prompt("question", effective, context, window, snippets,
                                     qa=self._qa_recent())
+        assembly_seconds = round(time.time() - assembly_started, 3)
 
         # Create a placeholder answer event so the UI shows the question is
         # being answered immediately, then stream the raw text in.
         placeholder = self.state.add(
             "answer", kind="question", question=question,
             rewritten_question=rewritten or None, bullets=[],
-            sources=[s.source for s in snippets], model="", streaming=True)
+            sources=[s.source for s in snippets], model="", streaming=True,
+            answer_queue_wait=round(max(0.0, started_at - queued_at), 2),
+            prompt_assembly_seconds=assembly_seconds,
+            prompt_chars=len(system) + len(prompt),
+            prompt_estimated_tokens=estimate_tokens(system + prompt, 0),
+            context_chars=len(window),
+            reference_chars=sum(len(getattr(s, "text", "") or "") for s in snippets))
         event_id = placeholder["id"]
         accumulated = []
 
@@ -908,13 +1039,18 @@ class AnswerEngine:
         result = self._chat_stream("question", system, prompt, on_chunk=_on_chunk)
         if result is None:
             self.state.update_answer(event_id, bullets=[], model="",
-                                      streaming=False, error="all providers failed")
+                                      streaming=False, error="all providers failed",
+                                      provider_ttft=None, provider_seconds=None,
+                                      answer_latency=round(time.time() - detected_at, 2))
             return
 
         bullets = parse_bullets(result.text)
         if not bullets:
             self.state.update_answer(event_id, bullets=[], model=result.model,
-                                      streaming=False, error="no answer produced")
+                                      streaming=False, error="no answer produced",
+                                      provider_ttft=result.ttft_seconds,
+                                      provider_seconds=result.request_seconds,
+                                      answer_latency=round(time.time() - detected_at, 2))
             return
 
         parent_id = None
@@ -924,7 +1060,10 @@ class AnswerEngine:
         self.state.update_answer(
             event_id, bullets=bullets, model=result.model,
             usage=result.usage, parent_id=parent_id, streaming=False,
-            streaming_text=None)
+            streaming_text=None,
+            provider_ttft=result.ttft_seconds,
+            provider_seconds=result.request_seconds,
+            answer_latency=round(time.time() - detected_at, 2))
         with self._lock:
             self._last_answer_id = event_id
             self._qa_thread.append({"question": question, "bullets": bullets})
@@ -932,6 +1071,8 @@ class AnswerEngine:
             del self._qa_thread[:-keep]
 
     def _refresh_talking_points(self, payload: Dict[str, Any]) -> None:
+        started_at = time.time()
+        queued_at = float(payload.get("queued_at") or started_at)
         window = payload.get("window") or self._context_text()
         if not window:
             return
@@ -942,6 +1083,10 @@ class AnswerEngine:
         system = self._system_prompt("rolling")
         prompt = self._build_prompt("rolling", None, "", window, snippets, existing=existing)
         result = self._chat("rolling", system, prompt, temperature=0.0)
+        self.state.set_meta(
+            talking_point_queue_wait=round(max(0.0, started_at - queued_at), 2),
+            talking_point_prompt_chars=len(system) + len(prompt),
+            talking_point_provider_seconds=(result.request_seconds if result else None))
         if result is None:
             self.log("answers: talking-point refresh failed on all providers")
             return

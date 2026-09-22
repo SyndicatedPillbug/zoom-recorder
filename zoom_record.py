@@ -57,7 +57,7 @@ except Exception:  # noqa: BLE001 - recorder must run even without the HUD packa
     def system_advice(topo=None) -> str:  # type: ignore[misc]
         return ""
 
-DEFAULT_MODEL = "~/.cache/whisper-cpp/ggml-base.en.bin"
+DEFAULT_MODEL = "~/.cache/whisper-cpp/ggml-large-v3-turbo-q5_0.bin"
 FLOOR_DB = -91.0
 LOW_COVERAGE_PCT = 50.0
 DURATION_TOLERANCE_PCT = 0.02
@@ -953,7 +953,7 @@ def transcribe(cfg: Config, merged: Path, log: Log) -> None:
     if not cfg.model.is_file():
         log.warn("Model not found at {} — skipping transcription.".format(cfg.model))
         log.warn("Download it: curl -L -o {} "
-                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin".format(cfg.model))
+                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin".format(cfg.model))
         return
 
     if shutil.which("whisper-cli"):
@@ -1058,7 +1058,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="max_volume below this counts as silence (default -60)")
     parser.add_argument("--model", default=None,
                         help="whisper model path (default: from config, else "
-                             "~/.cache/whisper-cpp/ggml-base.en.bin)")
+                             "~/.cache/whisper-cpp/ggml-large-v3-turbo-q5_0.bin)")
     parser.add_argument("--basedir", default=None,
                         help="output base directory (default: from config)")
     parser.add_argument("--no-transcribe", action="store_true", help="skip transcription")
@@ -1096,6 +1096,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="open the live transcript + AI answer HUD during recording")
     parser.add_argument("--hud-port", type=int, default=None,
                         help="port for the local HUD (default: random free port)")
+    parser.add_argument("--transcript-dir", default=None,
+                        help="additional folder for a live Markdown transcript mirror")
     parser.add_argument("--no-hud-browser", action="store_true",
                         help="do not auto-open the HUD in a browser")
     parser.add_argument("--live-no-answers", action="store_true",
@@ -1149,6 +1151,8 @@ def build_hud_config(args: argparse.Namespace):
         cfg.port = args.hud_port
     if args.no_hud_browser:
         cfg.open_browser = False
+    if args.transcript_dir:
+        cfg.transcript_writeback_dir = args.transcript_dir
     if args.live_no_answers:
         cfg.answers_enabled = False
     if args.no_live_summary:

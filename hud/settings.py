@@ -27,10 +27,11 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import (CONFIG_PATH, PROVIDERS, config_from_dict, config_to_dict,
                      get_provider, load_config, save_config, _defaults, _deep_merge)
+from .local_http import bind_local_server, host_from_header, url_host
 from .llm import LLMClient, LLMError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SETTINGS_PIDFILE = Path.home() / ".zoom_recorder_settings.pid"
 SETTINGS_URLFILE = Path.home() / ".zoom_recorder_settings.url"
 
@@ -58,7 +59,7 @@ class SettingsApp:
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> int:
         handler = type("_BoundHandler", (_Handler,), {"app": self})
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd, self.host = bind_local_server(handler, self.host, self.port)
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever,
@@ -116,7 +117,8 @@ class SettingsApp:
 
     @property
     def url(self) -> str:
-        return "http://{}:{}/?token={}".format(self.host, self.port, self.token)
+        return "http://{}:{}/?token={}".format(
+            url_host(self.host), self.port, self.token)
 
     def open(self) -> None:
         try:
@@ -146,7 +148,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- guards ------------------------------------------------------------
     def _host_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        host = host_from_header(self.headers.get("Host") or "")
         return host in ALLOWED_HOSTS
 
     def _token_ok(self, parsed: Any) -> bool:
@@ -238,7 +240,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/models":
                 self._models(body)
             elif parsed.path == "/api/pick-dir":
+                self._request_kind = str(body.get("kind") or "kb")
                 self._pick_dir()
+                self._request_kind = ""
             elif parsed.path == "/api/quit":
                 self._send_json({"ok": True})
                 self.app._shutdown_async()
@@ -294,8 +298,12 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "models": client.models()})
 
     def _pick_dir(self) -> None:
+        kind = str(getattr(self, "_request_kind", "kb") or "kb")
+        prompt = ("Choose a folder for live transcript mirrors"
+                  if kind == "transcript" else
+                  "Choose a notes folder for the knowledge base")
         script = ('POSIX path of (choose folder with prompt '
-                  '"Choose a notes folder for the knowledge base")')
+                  '"{}")').format(prompt.replace('"', '\\"'))
         try:
             proc = subprocess.run(["osascript", "-e", script],
                                   capture_output=True, text=True, timeout=120)
@@ -322,8 +330,8 @@ def main(argv: Optional[list] = None) -> int:
     app = SettingsApp(port=args.port, config_path=Path(args.config) if args.config else None,
                       open_browser=not args.no_browser, idle_timeout=args.timeout,
                       log=lambda m: print("[settings] " + m, flush=True))
-    port = app.start()
-    url_no_tok = "http://127.0.0.1:{}/?token=…".format(port)
+    app.start()
+    url_no_tok = "{} (token hidden)".format(app.url.split("?token=", 1)[0])
     print("Settings GUI: {}".format(url_no_tok), flush=True)
     if not args.no_browser:
         app.open()

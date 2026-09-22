@@ -115,18 +115,45 @@ else
     say "  install: brew install whisper.cpp"
   fi
 fi
-MODEL="$HOME/.cache/whisper-cpp/ggml-base.en.bin"
+MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
+MODEL="$HOME/.cache/whisper-cpp/$MODEL_NAME"
+MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$MODEL_NAME"
+MODEL_SHA1="e050f7970618a659205450ad97eb95a18d69c9ee"
+MODEL_MISSING=0
 if [[ -f "$MODEL" ]]; then
-  say "transcription model: $(basename "$MODEL")"
+  actual_sha1="$(shasum "$MODEL" 2>/dev/null | awk '{print $1}')"
+  if [[ "$actual_sha1" == "$MODEL_SHA1" ]]; then
+    say "transcription model: $MODEL_NAME (verified)"
+  else
+    MODEL_MISSING=1
+    missing=1
+    say "transcription model: INVALID CHECKSUM ($MODEL_NAME)"
+  fi
 else
+  MODEL_MISSING=1
   missing=1
-  say "transcription model: MISSING (~150 MB, downloaded once)"
+  say "transcription model: MISSING (~547 MiB, downloaded once)"
+fi
+if [[ "$MODEL_MISSING" == "1" ]]; then
   if [[ "$INSTALL_DEPS" == "1" ]]; then
     run mkdir -p "$(dirname "$MODEL")"
-    run curl -L --fail -o "$MODEL" \
-      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      say "  [dry-run] curl -L --fail -o $MODEL $MODEL_URL"
+    else
+      tmp_model="${MODEL}.download.$$"
+      if curl -L --fail -o "$tmp_model" "$MODEL_URL" \
+          && [[ "$(shasum "$tmp_model" | awk '{print $1}')" == "$MODEL_SHA1" ]]; then
+        mv "$tmp_model" "$MODEL"
+        say "  downloaded and verified $MODEL_NAME"
+        MODEL_MISSING=0
+      else
+        rm -f "$tmp_model"
+        say "  ERROR: downloaded model failed checksum verification" >&2
+      fi
+    fi
   else
-    say "  download: curl -L -o $MODEL https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+    say "  download: curl -L -o $MODEL $MODEL_URL"
+    say "  verify SHA-1: $MODEL_SHA1"
   fi
 fi
 

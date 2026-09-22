@@ -22,7 +22,10 @@ from typing import Any, Dict, List, Optional
 
 CONFIG_PATH = Path.home() / ".config" / "zoom-recorder" / "config.json"
 
-DEFAULT_TRANSCRIPTION_MODEL = "~/.cache/whisper-cpp/ggml-base.en.bin"
+DEFAULT_TRANSCRIPTION_MODEL_FILENAME = "ggml-large-v3-turbo-q5_0.bin"
+DEFAULT_TRANSCRIPTION_MODEL = ("~/.cache/whisper-cpp/" +
+                               DEFAULT_TRANSCRIPTION_MODEL_FILENAME)
+DEFAULT_TRANSCRIPTION_MODEL_SHA1 = "e050f7970618a659205450ad97eb95a18d69c9ee"
 RECORDING_MODES = ("both", "mic", "system")
 
 # Directories macOS protects with TCC: a launchd-spawned recorder is denied
@@ -171,6 +174,11 @@ class HudConfig:
     stt_compression_ratio_max: float = 2.4
     stt_hallucination_filter: bool = True
     stt_context_prompt: bool = True    # seed Whisper with previous transcript
+    # Local-only rolling interim recognition. Partial text is UI-only until it
+    # survives the stability gate and becomes an authoritative transcript event.
+    stt_partial_enabled: bool = True
+    stt_partial_window_seconds: float = 2.0
+    stt_partial_interval_seconds: float = 0.8
 
     # Answers
     answers_enabled: bool = True
@@ -220,6 +228,10 @@ class HudConfig:
     open_browser: bool = True
     host: str = "127.0.0.1"
     persist_seconds: float = 20.0     # periodic crash-safe flush of derived/
+
+    # Optional second transcript destination. This never replaces recorder or
+    # derived/ output; it mirrors the live transcript while the call runs.
+    transcript_writeback_dir: Optional[str] = None
 
     # Budget caps (0 == trust the provider's rate-limit headers)
     budget_tpm: int = 0
@@ -305,6 +317,9 @@ def _defaults() -> Dict[str, Any]:
             "compression_ratio_max": 2.4,
             "hallucination_filter": True,
             "context_prompt": True,
+            "partial_enabled": True,
+            "partial_window_seconds": 2.0,
+            "partial_interval_seconds": 0.8,
         },
         "answers": {
             "enabled": True,
@@ -343,6 +358,7 @@ def _defaults() -> Dict[str, Any]:
             "min_score": 0.1,
         },
         "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1", "persist_seconds": 20.0},
+        "transcript": {"writeback_dir": None},
         "speakers": {"enabled": True, "self_name": "You", "remote_name": "Others"},
         "budget": {"tpm": 0, "tpd": 0},
         "privacy": {"offline": False, "notifications": True},
@@ -390,6 +406,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
     speakers = data.get("speakers") or {}
     budget = data.get("budget") or {}
     privacy = data.get("privacy") or {}
+    transcript = data.get("transcript") or {}
 
     return HudConfig(
         stt_backend=str(stt.get("backend") or "groq"),
@@ -410,6 +427,9 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_compression_ratio_max=_as_float(stt.get("compression_ratio_max"), 2.4),
         stt_hallucination_filter=bool(stt.get("hallucination_filter", True)),
         stt_context_prompt=bool(stt.get("context_prompt", True)),
+        stt_partial_enabled=bool(stt.get("partial_enabled", True)),
+        stt_partial_window_seconds=_as_float(stt.get("partial_window_seconds"), 2.0),
+        stt_partial_interval_seconds=_as_float(stt.get("partial_interval_seconds"), 0.8),
         answers_enabled=bool(answers.get("enabled", True)),
         answers_backend=str(answers.get("backend") or "groq"),
         answers_fallback=_as_str_list(answers.get("fallback")),
@@ -449,6 +469,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         open_browser=bool(hud.get("open_browser", True)),
         host=str(hud.get("host") or "127.0.0.1"),
         persist_seconds=_as_float(hud.get("persist_seconds"), 20.0),
+        transcript_writeback_dir=transcript.get("writeback_dir") or None,
         budget_tpm=_as_int(budget.get("tpm"), 0),
         budget_tpd=_as_int(budget.get("tpd"), 0),
         offline=bool(privacy.get("offline", False)),
@@ -481,6 +502,9 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "compression_ratio_max": cfg.stt_compression_ratio_max,
         "hallucination_filter": cfg.stt_hallucination_filter,
         "context_prompt": cfg.stt_context_prompt,
+        "partial_enabled": cfg.stt_partial_enabled,
+        "partial_window_seconds": cfg.stt_partial_window_seconds,
+        "partial_interval_seconds": cfg.stt_partial_interval_seconds,
     })
     out["answers"].update({
         "enabled": cfg.answers_enabled,
@@ -528,6 +552,9 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "open_browser": cfg.open_browser,
         "host": cfg.host,
         "persist_seconds": cfg.persist_seconds,
+    })
+    out["transcript"].update({
+        "writeback_dir": cfg.transcript_writeback_dir,
     })
     out["budget"].update({"tpm": cfg.budget_tpm, "tpd": cfg.budget_tpd})
     out["privacy"].update({"offline": cfg.offline, "notifications": cfg.notifications})

@@ -20,9 +20,11 @@ from typing import Any, Callable, Dict, Optional
 from .answers import AnswerEngine
 from .budget import BudgetGovernor
 from .config import HudConfig
+from .local_http import url_host
 from .server import HudServer
 from .state import LiveState
 from .stt import LiveTranscriber
+from .transcript_writeback import TranscriptWriteback
 
 HUD_URLFILE = Path.home() / ".zoom_recorder_hud.url"
 
@@ -50,6 +52,7 @@ class LiveSession:
         self._port = 0
         self._stop = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
+        self._writeback: Optional[TranscriptWriteback] = None
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> Optional[int]:
@@ -78,6 +81,13 @@ class LiveSession:
                               stt_backend=self.cfg.stt_backend)
         self.state.set_budget(self.budget.snapshot())
         self._publish_devices()
+
+        if self.cfg.transcript_writeback_dir:
+            self._writeback = TranscriptWriteback(
+                self.state, self.cfg.transcript_writeback_dir,
+                self.outdir.name, self.log)
+            if not self._writeback.start():
+                self._writeback = None
 
         try:
             self.stt = LiveTranscriber(self.state, self.log, self.cfg,
@@ -136,6 +146,12 @@ class LiveSession:
                     component.stop()
                 except Exception:  # noqa: BLE001
                     pass
+        if self._writeback is not None:
+            try:
+                self._writeback.stop()
+            except Exception as exc:  # noqa: BLE001
+                self.log("live transcript writeback shutdown failed ({})".format(exc))
+            self._writeback = None
         self.state.set_status("stopped")
         try:
             HUD_URLFILE.unlink(missing_ok=True)
@@ -154,7 +170,8 @@ class LiveSession:
 
     @property
     def url(self) -> str:
-        base = "http://{}:{}/".format(self.cfg.host, self._port)
+        host = self.server.host if self.server is not None else self.cfg.host
+        base = "http://{}:{}/".format(url_host(host), self._port)
         return "{}?token={}".format(base, self.token) if self.token else base
 
     def _on_ask(self, text: str, expand: bool) -> bool:

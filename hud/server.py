@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
+from .local_http import bind_local_server, host_from_header, url_host
 from .state import LiveState
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -43,7 +44,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- guards ------------------------------------------------------------
     def _host_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        host = host_from_header(self.headers.get("Host") or "")
         return host in ALLOWED_HOSTS
 
     def _token_ok(self, parsed: Any) -> bool:
@@ -228,7 +229,7 @@ class HudServer:
             "on_pause": staticmethod(self.on_pause) if self.on_pause else None,
             "on_stop": staticmethod(self.on_stop) if self.on_stop else None,
         })
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd, self.host = bind_local_server(handler, self.host, self.port)
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever,
@@ -240,7 +241,7 @@ class HudServer:
 
     @property
     def url(self) -> str:
-        base = "http://{}:{}/".format(self.host, self.port)
+        base = "http://{}:{}/".format(url_host(self.host), self.port)
         return "{}?token={}".format(base, self.token) if self.token else base
 
     def stop(self) -> None:

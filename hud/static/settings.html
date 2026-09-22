@@ -71,6 +71,13 @@
       <button class="mini secondary" data-load-models="stt">Load</button></div></div>
     <div class="row"><label>Chunk seconds</label><div class="ctl">
       <input type="number" step="1" min="5" id="stt.chunk_seconds" /></div></div>
+    <div class="row"><label>Live word draft</label><div class="ctl">
+      <input type="checkbox" id="stt.partial_enabled" />
+      <span class="hint">local Whisper only; unstable words stay provisional</span></div></div>
+    <div class="row"><label>Draft window seconds</label><div class="ctl">
+      <input type="number" step="0.1" min="1.5" max="6" id="stt.partial_window_seconds" /></div></div>
+    <div class="row"><label>Draft update seconds</label><div class="ctl">
+      <input type="number" step="0.1" min="0.5" max="5" id="stt.partial_interval_seconds" /></div></div>
     <div class="row"><label>Glossary</label><div class="ctl">
       <input type="text" id="stt.glossary" placeholder="Acme, Q3, names… (comma separated)" /></div></div>
     <div class="row"><label>Speech detection</label><div class="ctl">
@@ -177,6 +184,10 @@
     <div class="row"><label>Flush seconds</label><div class="ctl">
       <input type="number" step="5" min="0" id="hud.persist_seconds" />
       <span class="hint">crash-safe derived/</span></div></div>
+    <div class="row"><label>Transcript mirror</label><div class="ctl">
+      <input type="text" id="transcript.writeback_dir" placeholder="optional folder" />
+      <button class="mini secondary" id="pickTranscriptBtn">Choose…</button></div></div>
+    <div class="hint">Optional additional Markdown copy written during the call; it never replaces the normal recording or derived/ files.</div>
     <div class="row"><label>TPM cap</label><div class="ctl">
       <input type="number" step="1000" min="0" id="budget.tpm" /><span class="hint">0 = trust provider</span></div></div>
     <div class="row"><label>TPD cap</label><div class="ctl">
@@ -265,6 +276,9 @@
     cfg = c;
     setVal('stt.backend', c.stt.backend); setVal('stt.model', c.stt.model);
     setVal('stt.chunk_seconds', c.stt.chunk_seconds);
+    setVal('stt.partial_enabled', c.stt.partial_enabled);
+    setVal('stt.partial_window_seconds', c.stt.partial_window_seconds);
+    setVal('stt.partial_interval_seconds', c.stt.partial_interval_seconds);
     setVal('stt.glossary', (c.stt.glossary || []).join(', '));
     setVal('stt.vad_backend', c.stt.vad_backend);
     setVal('stt.vad_margin_db', c.stt.vad_margin_db);
@@ -289,6 +303,7 @@
     setVal('speakers.remote_name', c.speakers.remote_name);
     setVal('hud.port', c.hud.port); setVal('hud.open_browser', c.hud.open_browser);
     setVal('hud.persist_seconds', c.hud.persist_seconds);
+    setVal('transcript.writeback_dir', c.transcript.writeback_dir);
     setVal('budget.tpm', c.budget.tpm); setVal('budget.tpd', c.budget.tpd);
   }
 
@@ -297,6 +312,9 @@
     return {
       stt: { backend: $('stt.backend').value, model: $('stt.model').value || null,
              chunk_seconds: num('stt.chunk_seconds'),
+             partial_enabled: $('stt.partial_enabled').checked,
+             partial_window_seconds: num('stt.partial_window_seconds'),
+             partial_interval_seconds: num('stt.partial_interval_seconds'),
              glossary: $('stt.glossary').value.split(',').map(s => s.trim()).filter(Boolean),
              vad_backend: $('stt.vad_backend').value,
              vad_margin_db: Number($('stt.vad_margin_db').value || 6),
@@ -325,6 +343,7 @@
                   remote_name: $('speakers.remote_name').value },
       hud: { port: num('hud.port'), open_browser: $('hud.open_browser').checked,
              persist_seconds: num('hud.persist_seconds') },
+      transcript: { writeback_dir: $('transcript.writeback_dir').value.trim() || null },
       budget: { tpm: num('budget.tpm'), tpd: num('budget.tpd') },
     };
   }
@@ -387,8 +406,13 @@
   $('testBtn').onclick = testProvider;
   $('doneBtn').onclick = async () => { await api('/api/quit', {}); window.close(); };
   $('addDirBtn').onclick = async () => {
-    const res = await api('/api/pick-dir', {});
+    const res = await api('/api/pick-dir', { kind: 'kb' });
     if (res.ok && res.path) { kbDirs.push(res.path); renderDirs(); }
+    else if (res.error && res.error !== 'cancelled') toast(res.error, 'err');
+  };
+  $('pickTranscriptBtn').onclick = async () => {
+    const res = await api('/api/pick-dir', { kind: 'transcript' });
+    if (res.ok && res.path) $('transcript.writeback_dir').value = res.path;
     else if (res.error && res.error !== 'cancelled') toast(res.error, 'err');
   };
   $('addDirManual').onclick = () => {

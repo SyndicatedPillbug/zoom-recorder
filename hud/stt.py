@@ -176,6 +176,60 @@ def fuzzy_overlap(prev_words: List[str], new_words: List[str],
     return 0
 
 
+class StablePartialDecoder:
+    """Turn overlapping Whisper hypotheses into stable word commits.
+
+    Whisper re-decodes a moving audio window, so the newest words are allowed
+    to change. A prefix seen in two consecutive hypotheses is safe enough to
+    publish; the remainder stays provisional. The caller still applies the
+    normal transcript delta de-duplication before emitting an authoritative
+    ``transcript`` event.
+    """
+
+    def __init__(self) -> None:
+        self.previous: List[str] = []
+        self.stable: List[str] = []
+        self.current: List[str] = []
+
+    @staticmethod
+    def _same(a: str, b: str) -> bool:
+        return _normalize_word(a) == _normalize_word(b)
+
+    def _common_prefix(self, a: List[str], b: List[str]) -> int:
+        count = 0
+        for left, right in zip(a, b):
+            if not self._same(left, right):
+                break
+            count += 1
+        return count
+
+    def accept(self, text: str) -> str:
+        words = split_words(text)
+        if not words:
+            return ""
+        # When a moving window drops old audio, retain only a matching tail of
+        # the stable prefix. This prevents the decoder from blocking forever
+        # while keeping the normal source-level de-duplication as a guard.
+        if self.stable and (len(words) < len(self.stable) or not all(
+                self._same(a, b) for a, b in zip(self.stable, words[:len(self.stable)]))):
+            overlap = fuzzy_overlap(self.stable, words)
+            self.stable = self.stable[-overlap:] if overlap else []
+
+        common = self._common_prefix(self.previous, words) if self.previous else 0
+        committed_len = len(self.stable)
+        emit = words[committed_len:common] if common > committed_len else []
+        if common > committed_len:
+            self.stable = words[:common]
+        self.previous = words
+        self.current = words
+        return " ".join(emit).strip()
+
+    @property
+    def provisional_text(self) -> str:
+        stable_len = min(len(self.stable), len(self.current))
+        return " ".join(self.current[stable_len:]).strip()
+
+
 # --------------------------------------------------------------------------
 # Chunking
 # --------------------------------------------------------------------------
@@ -475,7 +529,14 @@ class _Source:
         self.proc: Optional[subprocess.Popen] = None
         self.thread: Optional[threading.Thread] = None
         self.worker: Optional[threading.Thread] = None
+        self.partial_worker: Optional[threading.Thread] = None
         self.queue: "queue.Queue" = queue.Queue(maxsize=4)
+        self.partial_queue: "queue.Queue" = queue.Queue(maxsize=1)
+        self.partial_lock = threading.Lock()
+        self.partial_buffer = bytearray()
+        self.partial_last_submit = 0.0
+        self.partial_decoder = StablePartialDecoder()
+        self.partial_revision = 0
         self.vad = None
         self.tail: List[str] = []
         self.context_tail = ""
@@ -497,6 +558,10 @@ class LiveTranscriber:
         self._sources: List[_Source] = []
         self._stt: object = None
         self._glossary = [g for g in getattr(cfg, "stt_glossary", []) if g]
+        self._provider_backoff_until = 0.0
+        self._provider_backoff_seconds = 4.0
+        self._provider_backoff_lock = threading.Lock()
+        self._active_chunk_seconds = float(cfg.stt_chunk_seconds)
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -535,8 +600,9 @@ class LiveTranscriber:
 
     def _start_sources(self) -> None:
         label = " + ".join(s.speaker or "mixed" for s in self._sources)
+        self._active_chunk_seconds = self._effective_chunk_seconds()
         self.log("live STT running ({} backend, {:.0f}s chunks, {} queue, sources: {})".format(
-            self.cfg.stt_backend, self.cfg.stt_chunk_seconds,
+            self.cfg.stt_backend, self._active_chunk_seconds,
             getattr(self.cfg, "stt_queue_chunks", 4), label))
         if self._glossary:
             self.log("live STT glossary: {}".format(", ".join(self._glossary)))
@@ -546,10 +612,31 @@ class LiveTranscriber:
                 target=self._stt_worker, args=(source,),
                 name="hud-stt-work-{}".format(source.speaker or "mix"), daemon=True)
             source.worker.start()
+            if self._partial_enabled():
+                source.partial_queue = queue.Queue(maxsize=1)
+                source.partial_worker = threading.Thread(
+                    target=self._partial_worker, args=(source,),
+                    name="hud-stt-partial-{}".format(source.speaker or "mix"), daemon=True)
+                source.partial_worker.start()
             source.thread = threading.Thread(
                 target=self._run_source, args=(source,),
                 name="hud-stt-{}".format(source.speaker or "mix"), daemon=True)
             source.thread.start()
+
+    def _effective_chunk_seconds(self) -> float:
+        """Avoid exceeding Groq's current STT request rate with two sources."""
+        configured = float(self.cfg.stt_chunk_seconds)
+        if ((self.cfg.stt_backend or "").lower() == "groq"
+                and len(self._sources) >= 2 and configured < 7.0):
+            self.log("live STT: using 7s chunks for two Groq sources to stay below "
+                     "the provider request limit (configured {:.1f}s)".format(configured))
+            return 7.0
+        return configured
+
+    def _partial_enabled(self) -> bool:
+        return ((self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS
+                and bool(getattr(self.cfg, "stt_partial_enabled", True))
+                and float(getattr(self.cfg, "stt_partial_window_seconds", 2.0)) > 0)
 
     def _stop_sources(self, sources: List["_Source"]) -> None:
         for source in sources:
@@ -578,9 +665,22 @@ class LiveTranscriber:
                     source.queue.put_nowait(None)
                 except queue.Full:
                     pass
+            try:
+                source.partial_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    source.partial_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    source.partial_queue.put_nowait(None)
+                except queue.Full:
+                    pass
         for source in sources:
             if source.worker is not None:
                 source.worker.join(timeout=8.0)
+            if source.partial_worker is not None:
+                source.partial_worker.join(timeout=8.0)
 
     def stop(self) -> None:
         self._stop.set()
@@ -663,12 +763,13 @@ class LiveTranscriber:
             self.state.set_status("recording", tap_error=str(exc))
             return
         source.vad = build_vad(self.cfg, self.log)
-        chunker = Chunker(self.cfg.stt_chunk_seconds, self.cfg.stt_min_speech_seconds,
+        chunker = Chunker(self._active_chunk_seconds, self.cfg.stt_min_speech_seconds,
                           vad=source.vad)
         assert source.proc.stdout is not None
         last_publish = 0.0
         try:
             for block in self._iter_blocks(source.proc.stdout):
+                self._feed_partial(source, block)
                 for chunk in chunker.feed(block):
                     self._enqueue(source, chunk, chunker.last_margin_db)
                 # Publish the live level even when the gate is rejecting
@@ -714,7 +815,7 @@ class LiveTranscriber:
     def _publish_lag(self) -> None:
         queued = sum(s.queue.qsize() for s in self._sources)
         dropped = sum(s.dropped for s in self._sources)
-        lag = round(queued * self.cfg.stt_chunk_seconds, 1)
+        lag = round(queued * self._active_chunk_seconds, 1)
         meta = {"stt_lag_seconds": lag, "stt_queued": queued, "stt_dropped": dropped}
         thresholds = [t for t in (
             getattr(s.vad, "threshold_db", lambda: None)()
@@ -737,6 +838,79 @@ class LiveTranscriber:
                 break
             captured_at, chunk, margin_db = item
             self._transcribe_chunk(chunk, source, captured_at, margin_db)
+
+    def _feed_partial(self, source: "_Source", block: bytes) -> None:
+        """Queue the newest short rolling window without blocking capture."""
+        if not self._partial_enabled():
+            return
+        window_bytes = int(float(getattr(self.cfg, "stt_partial_window_seconds", 2.0))
+                          * SAMPLE_RATE * SAMPLE_WIDTH)
+        if window_bytes <= 0:
+            return
+        now = time.time()
+        with source.partial_lock:
+            source.partial_buffer.extend(block)
+            max_bytes = window_bytes * 3
+            if len(source.partial_buffer) > max_bytes:
+                del source.partial_buffer[:-max_bytes]
+            if (len(source.partial_buffer) < window_bytes
+                    or now - source.partial_last_submit
+                    < float(getattr(self.cfg, "stt_partial_interval_seconds", 0.8))):
+                return
+            source.partial_last_submit = now
+            audio = bytes(source.partial_buffer[-window_bytes:])
+        try:
+            source.partial_queue.put_nowait((now, audio))
+        except queue.Full:
+            # A slow inference is allowed to skip an interim frame; the next
+            # frame always contains newer audio and keeps the UI current.
+            pass
+
+    def _partial_worker(self, source: "_Source") -> None:
+        while not self._stop.is_set():
+            try:
+                item = source.partial_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            captured_at, audio = item
+            started = time.time()
+            try:
+                out = self._stt.transcribe(audio, prompt=self._prompt_for(source))  # type: ignore[attr-defined]
+                result = out if isinstance(out, STTResult) else STTResult(text=str(out or ""))
+                text = result.text.strip()
+                if (text and (not self.cfg.stt_hallucination_filter
+                              or not looks_hallucinated(text, marginal=True))):
+                    committed = source.partial_decoder.accept(text)
+                    source.partial_revision += 1
+                    provisional = source.partial_decoder.provisional_text
+                    if committed:
+                        self._publish_committed(source, committed, started, finalized=False)
+                    self.state.set_transcript_partial(
+                        source.speaker or "mixed", provisional, source.speaker,
+                        source.partial_revision,
+                        latency=round(time.time() - started, 2),
+                        captured_at=captured_at)
+                    self.state.set_meta(
+                        stt_partial_latency=round(max(0.0, time.time() - captured_at), 2))
+            except Exception as exc:  # noqa: BLE001
+                # Partial recognition is an enhancement. A failed interim
+                # request must never disable final transcription.
+                self.log("local STT partial frame skipped: {}".format(exc))
+
+    def _publish_committed(self, source: "_Source", text: str,
+                           started: Optional[float] = None,
+                           finalized: bool = True) -> None:
+        delta = self._delta_text(source, text)
+        if not delta:
+            return
+        source.context_tail = (source.context_tail + " " + delta).strip()[-200:]
+        source.transcribed += 1
+        self.state.add("transcript", text=delta, source="live",
+                       speaker=source.speaker,
+                       latency=round(time.time() - started, 2) if started else None,
+                       stable_partial=not finalized, finalized=finalized)
 
     def _prompt_for(self, source: _Source) -> Optional[str]:
         if not self.cfg.stt_context_prompt:
@@ -766,6 +940,12 @@ class LiveTranscriber:
                           margin_db: float = 0.0) -> None:
         if self._stop.is_set():
             return
+        if (self.cfg.stt_backend or "").lower() not in LOCAL_STT_BACKENDS:
+            with self._provider_backoff_lock:
+                blocked = self._provider_backoff_until - time.time()
+            if blocked > 0:
+                self.state.set_meta(stt_provider_backoff_seconds=round(blocked, 1))
+                return
         started = time.time()
         prompt = self._prompt_for(source)
         try:
@@ -776,10 +956,22 @@ class LiveTranscriber:
         except LLMError as exc:
             self.log("STT error: {}".format(exc))
             self.state.add("status", status="recording", stt_error=str(exc))
+            if exc.status == 429:
+                with self._provider_backoff_lock:
+                    delay = max(2.0, min(60.0, exc.retry_after or
+                                         self._provider_backoff_seconds))
+                    self._provider_backoff_until = time.time() + delay
+                    self._provider_backoff_seconds = min(60.0, delay * 2.0)
+                self.log("live STT: provider rate limited; dropping queued audio for "
+                         "{:.0f}s to stay live".format(delay))
             return
         except Exception as exc:  # noqa: BLE001
             self.log("STT failure: {}".format(exc))
             return
+        if (self.cfg.stt_backend or "").lower() not in LOCAL_STT_BACKENDS:
+            with self._provider_backoff_lock:
+                self._provider_backoff_until = 0.0
+                self._provider_backoff_seconds = 4.0
         result = out if isinstance(out, STTResult) else STTResult(text=str(out or ""))
         text = result.text.strip()
         if not text:
@@ -793,13 +985,14 @@ class LiveTranscriber:
                 compression_ratio_max=self.cfg.stt_compression_ratio_max):
             self.log("live STT: dropped likely hallucination ({!r}...)".format(text[:40]))
             return
-        source.context_tail = (source.context_tail + " " + text).strip()[-200:]
-        source.transcribed += 1
-        delta = self._delta_text(source, text)
-        if delta:
-            self.state.add("transcript", text=delta, source="live",
-                           speaker=source.speaker,
-                           latency=round(time.time() - started, 2))
+        self._publish_committed(source, text, started, finalized=True)
+        if self._partial_enabled():
+            self.state.add("transcript_boundary", source_key=source.speaker or "mixed",
+                           speaker=source.speaker, finalized=True)
+            source.partial_revision += 1
+            self.state.set_transcript_partial(
+                source.speaker or "mixed", "", source.speaker,
+                source.partial_revision, finalized=True)
         if captured_at is not None:
             self.state.set_meta(
                 stt_lag_seconds=round(max(0.0, time.time() - captured_at), 1))

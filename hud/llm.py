@@ -52,6 +52,8 @@ class LLMResult:
     usage: Dict[str, Any] = field(default_factory=dict)
     headers: Dict[str, str] = field(default_factory=dict)
     data: Dict[str, Any] = field(default_factory=dict)
+    request_seconds: Optional[float] = None
+    ttft_seconds: Optional[float] = None
 
 
 def _lower_headers(headers: Any) -> Dict[str, str]:
@@ -306,13 +308,15 @@ class LLMClient:
         if response_format is not None:
             payload["response_format"] = response_format
         data = json.dumps(payload).encode("utf-8")
+        started = time.time()
         obj, headers = self._request("/chat/completions", data, "application/json", timeout)
         choices = obj.get("choices") or []
         text = ""
         if choices:
             text = ((choices[0].get("message") or {}).get("content") or "").strip()
         return LLMResult(text=text, model=obj.get("model", model),
-                         usage=obj.get("usage") or {}, headers=headers)
+                         usage=obj.get("usage") or {}, headers=headers,
+                         request_seconds=round(time.time() - started, 3))
 
     def chat_stream(self, messages: List[Dict[str, str]], model: str,
                     max_tokens: int = 400, temperature: float = 0.2,
@@ -341,15 +345,30 @@ class LLMClient:
         headers = self._headers("application/json")
         url = "{}{}".format(self.base_url, "/chat/completions")
 
+        started = time.time()
+        first_token = [None]
+
+        def record_chunk(delta: str) -> None:
+            if first_token[0] is None:
+                first_token[0] = time.time()
+            if on_chunk:
+                on_chunk(delta)
+
         try:
             result = self._stream_request("/chat/completions", data, headers,
-                                          timeout or self.timeout, on_chunk)
+                                          timeout or self.timeout, record_chunk)
         except LLMError as exc:
             if exc.status == 400:
                 # Some providers reject stream + json mode; retry non-streaming.
-                return self.chat(messages, model, max_tokens, temperature,
-                                 response_format, timeout)
+                fallback = self.chat(messages, model, max_tokens, temperature,
+                                     response_format, timeout)
+                if fallback.request_seconds is None:
+                    fallback.request_seconds = round(time.time() - started, 3)
+                return fallback
             raise
+        result.request_seconds = round(time.time() - started, 3)
+        if first_token[0] is not None:
+            result.ttft_seconds = round(first_token[0] - started, 3)
         return result
 
     # -- embeddings --------------------------------------------------------

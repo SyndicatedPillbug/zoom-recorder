@@ -24,19 +24,23 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
-                         detect_question_turns, estimate_tokens, grounded_in,
+                         detect_question_turns, detect_questions_since,
+                         estimate_tokens, grounded_in,
                          is_ambiguous_question, parse_bullets, parse_point_objects)
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
-from hud.kb import KBIndex, chunk_markdown  # noqa: E402
+from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
+from hud.local_http import host_from_header, url_host  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
 from hud.menu_state import describe  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
 from hud.stt import (Chunker, LiveTranscriber, _Source, frame_rms_dbfs,  # noqa: E402
-                     fuzzy_overlap, looks_hallucinated, overlap_suffix_prefix,
+                     StablePartialDecoder, fuzzy_overlap, looks_hallucinated,
+                     overlap_suffix_prefix,
                      pcm_to_wav, split_words)
+from hud.transcript_writeback import TranscriptWriteback  # noqa: E402
 from hud.vad import EnergyVAD, NoiseFloor, build_vad, frame_level_dbfs  # noqa: E402
 
 
@@ -50,6 +54,25 @@ def tone(seconds: float, freq: float = 440.0, amp: int = 16000) -> bytes:
 
 
 class OverlapTests(unittest.TestCase):
+    def test_partial_decoder_commits_only_stable_prefix(self) -> None:
+        decoder = StablePartialDecoder()
+        self.assertEqual(decoder.accept("what is the"), "")
+        self.assertEqual(decoder.provisional_text, "what is the")
+        self.assertEqual(decoder.accept("what is the plan"), "what is the")
+        self.assertEqual(decoder.provisional_text, "plan")
+        self.assertEqual(decoder.accept("what is the plan for tomorrow"), "plan")
+        self.assertEqual(decoder.provisional_text, "for tomorrow")
+
+    def test_partial_decoder_rebases_after_window_moves(self) -> None:
+        decoder = StablePartialDecoder()
+        decoder.accept("we should ship the beta")
+        self.assertEqual(decoder.accept("we should ship the beta next week"),
+                         "we should ship the beta")
+        # The rolling window no longer contains the original prefix. It must
+        # not crash or emit an unbounded duplicate prefix.
+        decoder.accept("the beta next week after launch")
+        self.assertLessEqual(len(decoder.provisional_text.split()), 5)
+
     def test_overlap_detection(self) -> None:
         prev = split_words("the deadline is friday next week")
         new = split_words("friday next week we ship")
@@ -165,6 +188,59 @@ class SttPipelineTests(unittest.TestCase):
         events = tr.state.snapshot()["transcript"]
         self.assertEqual(events[0]["text"], "hello Acme world")
         self.assertIn("Acme", seen["prompt"])
+
+    def test_local_partial_worker_keeps_draft_out_of_authoritative_text(self) -> None:
+        cfg = HudConfig(stt_backend="local", stt_hallucination_filter=False)
+        tr = self._transcriber(cfg)
+        outputs = iter(["what is the", "what is the plan"])
+
+        class FakeSTT:
+            def transcribe(self, pcm, prompt=None):
+                return next(outputs)
+
+        tr._stt = FakeSTT()
+        src = _Source("Client", [])
+        src.partial_queue = queue.Queue(maxsize=1)
+        tr._sources = [src]
+        worker = threading.Thread(target=tr._partial_worker, args=(src,), daemon=True)
+        worker.start()
+        src.partial_queue.put((time.time(), b"audio"))
+        src.partial_queue.put((time.time(), b"audio"))
+        deadline = time.time() + 2
+        while time.time() < deadline and not tr.state.snapshot()["transcript"]:
+            time.sleep(0.01)
+        src.partial_queue.put(None)
+        worker.join(timeout=2)
+        snap = tr.state.snapshot()
+        self.assertEqual(snap["transcript"][0]["text"], "what is the")
+        self.assertEqual(snap["partials"][0]["text"], "plan")
+        self.assertNotIn("plan", tr.state.transcript_text())
+
+    def test_partial_recognition_is_local_only(self) -> None:
+        self.assertFalse(self._transcriber(HudConfig(stt_backend="groq"))._partial_enabled())
+        self.assertTrue(self._transcriber(HudConfig(stt_backend="local"))._partial_enabled())
+
+    def test_final_chunk_deduplicates_stable_partial_words(self) -> None:
+        cfg = HudConfig(stt_backend="local", stt_hallucination_filter=False)
+        tr = self._transcriber(cfg)
+        tr._stt = type("FakeSTT", (), {
+            "transcribe": lambda _self, _pcm, prompt=None: "what is the"
+        })()
+        src = _Source("Client", [])
+        tr._publish_committed(src, "what is the", finalized=False)
+        tr._transcribe_chunk(b"audio", src)
+        transcript = tr.state.snapshot()["transcript"]
+        self.assertEqual([e["text"] for e in transcript], ["what is the"])
+        self.assertTrue(any(e["type"] == "transcript_boundary"
+                            for e in tr.state.since(0)))
+
+    def test_groq_two_source_chunk_floor_protects_request_rate(self) -> None:
+        cfg = HudConfig(stt_backend="groq", stt_chunk_seconds=5.0)
+        tr = LiveTranscriber(LiveState(), lambda _m: None, cfg, "Mic", "System")
+        tr._sources = [_Source("You", []), _Source("Others", [])]
+        self.assertEqual(tr._effective_chunk_seconds(), 7.0)
+        cfg.stt_backend = "local"
+        self.assertEqual(tr._effective_chunk_seconds(), 5.0)
 
 
 class VADTests(unittest.TestCase):
@@ -285,11 +361,40 @@ class TextTests(unittest.TestCase):
         turns = [Turn(1, now - 600, "Client", "What is the plan?")]
         self.assertIsNone(detect_question_turns(turns, 90.0, now))
 
+    def test_detect_indirect_question_without_punctuation(self) -> None:
+        self.assertEqual(
+            detect_question_text(
+                "I was wondering whether your team supports staged rollouts"),
+            "I was wondering whether your team supports staged rollouts")
+
+    def test_detect_question_turns_spans_stt_chunks(self) -> None:
+        now = time.time()
+        turns = [
+            Turn(1, now - 2, "Client", "I was wondering"),
+            Turn(2, now - 1, "Client", "whether your team supports staged rollouts"),
+        ]
+        got = detect_question_turns(turns, 90.0, now)
+        self.assertIsNotNone(got)
+        assert got is not None
+        self.assertIn("whether your team supports staged rollouts", got["question"])
+
+    def test_split_question_is_not_reemitted_on_next_turn(self) -> None:
+        now = time.time()
+        turns = [
+            Turn(1, now - 3, "Client", "I was wondering"),
+            Turn(2, now - 2, "Client", "whether your team supports staged rollouts"),
+            Turn(3, now - 1, "Client", "across the three regions"),
+        ]
+        found = detect_questions_since(turns, 0, 90.0, now)
+        self.assertEqual(len(found), 1)
+
     def test_is_ambiguous_question(self) -> None:
         self.assertTrue(is_ambiguous_question("What about that?"))
         self.assertTrue(is_ambiguous_question("Why?"))
         self.assertFalse(is_ambiguous_question(
             "What are the three rollout rings and their timelines?"))
+        self.assertFalse(is_ambiguous_question(
+            "Could you explain the three rollout rings and their timelines?"))
 
     def test_parse_bullets_json(self) -> None:
         raw = json.dumps({"bullets": ["First point", "Second point"]})
@@ -310,7 +415,11 @@ class KBTests(unittest.TestCase):
         label = "test:keywords"
         KEYWORDS = ["alpha", "beta", "gamma", "rollout", "pricing"]
 
+        def __init__(self):
+            self.calls = []
+
         def encode(self, texts):
+            self.calls.append(list(texts))
             out = []
             for text in texts:
                 low = text.lower()
@@ -354,6 +463,43 @@ class KBTests(unittest.TestCase):
                             cache_dir=str(cache), log=lambda _m: None)
             self.assertTrue(again.build())
             self.assertTrue(again.query("alpha"))
+
+    def test_index_reembeds_only_changed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "a.md").write_text("# Alpha\n\nalpha content\n")
+            (root / "b.md").write_text("# Beta\n\nbeta content\n")
+            cache = Path(tmp) / "cache"
+            first_embedder = self.KeywordEmbedder()
+            self.assertTrue(KBIndex([str(root)], first_embedder,
+                                    cache_dir=str(cache), log=lambda _m: None).build())
+
+            (root / "b.md").write_text("# Beta\n\nbeta pricing content\n")
+            second_embedder = self.KeywordEmbedder()
+            rebuilt = KBIndex([str(root)], second_embedder,
+                              cache_dir=str(cache), log=lambda _m: None)
+            self.assertTrue(rebuilt.build())
+            self.assertEqual(len(second_embedder.calls), 1)
+            self.assertEqual(len(second_embedder.calls[0]), 1)
+            self.assertIn("beta pricing", second_embedder.calls[0][0].lower())
+
+    def test_index_skips_obsidian_metadata_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "vault"
+            (root / ".obsidian").mkdir(parents=True)
+            (root / "notes").mkdir()
+            (root / ".obsidian" / "workspace.md").write_text("secret metadata")
+            (root / "notes" / "meeting.md").write_text("# Meeting\n\nalpha notes")
+            index = KBIndex([str(root)], self.KeywordEmbedder(),
+                            cache_dir=str(Path(tmp) / "cache"),
+                            log=lambda _m: None, min_score=0.0)
+            self.assertTrue(index.build())
+            self.assertTrue(all(".obsidian" not in c["source"] for c in index._chunks))
+
+    def test_lexical_score_rewards_exact_reference_terms(self) -> None:
+        chunk = {"heading": "Pricing model", "text": "The annual seat price is fixed."}
+        self.assertGreaterEqual(_lexical_score("pricing seat", chunk), 1.0)
 
     def test_is_duplicate_point(self) -> None:
         existing = ["Price is $10 per seat."]
@@ -399,6 +545,55 @@ class KBTests(unittest.TestCase):
                                "text": "alpha " * (i + 1)}])
         self.assertEqual(len(index._chunks), 2)
         self.assertEqual(len(index._vectors), 2)
+
+
+class LocalHttpTests(unittest.TestCase):
+    def test_host_header_canonicalization(self) -> None:
+        self.assertEqual(host_from_header("127.0.0.1:43123"), "127.0.0.1")
+        self.assertEqual(host_from_header("[::1]:43123"), "::1")
+        self.assertEqual(host_from_header("LOCALHOST"), "localhost")
+
+    def test_ipv6_url_formatting(self) -> None:
+        self.assertEqual(url_host("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(url_host("::1"), "[::1]")
+
+
+class TranscriptWritebackTests(unittest.TestCase):
+    def test_mirrors_transcript_events_and_drains_on_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = LiveState()
+            logs = []
+            sink = TranscriptWriteback(state, tmp, "2026-01-01_session/", logs.append)
+            self.assertTrue(sink.start())
+            state.add("transcript", text="hello from the call", speaker="You")
+            state.add("transcript", text="welcome", speaker="Client")
+            sink.stop()
+            files = list(Path(tmp).glob("*-live-transcript.md"))
+            self.assertEqual(len(files), 1)
+            text = files[0].read_text(encoding="utf-8")
+            self.assertIn("# Live transcript", text)
+            self.assertIn("**You:** hello from the call", text)
+            self.assertIn("**Client:** welcome", text)
+
+    def test_reused_session_name_gets_a_fresh_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp) / "session-live-transcript.md"
+            existing.write_text("old session\n", encoding="utf-8")
+            sink = TranscriptWriteback(LiveState(), tmp, "session", lambda _m: None)
+            sink.start()
+            sink.stop()
+            self.assertEqual(sink.path.name, "session-live-transcript-2.md")
+            self.assertEqual(existing.read_text(encoding="utf-8"), "old session\n")
+
+    def test_writeback_failure_is_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            blocked = Path(tmp) / "not-a-folder"
+            blocked.write_text("occupied", encoding="utf-8")
+            logs = []
+            sink = TranscriptWriteback(LiveState(), str(blocked), "session", logs.append)
+            self.assertTrue(sink.start())
+            sink.stop()
+            self.assertTrue(any("writeback disabled" in line for line in logs))
 
 
 class BudgetTests(unittest.TestCase):
@@ -484,7 +679,8 @@ class ConfigTests(unittest.TestCase):
             max_context_qa=5, summary_enabled=False, persist_seconds=15.0,
             talking_points_grounded=False, talking_points_max=2,
             talking_points_min_new_words=80, talking_points_min_words=30,
-            talking_points_quote_overlap=0.6)
+            talking_points_quote_overlap=0.6,
+            transcript_writeback_dir="~/Obsidian/LiveTranscripts")
         again = config_from_dict(config_to_dict(cfg))
         for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
                      "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
@@ -495,7 +691,9 @@ class ConfigTests(unittest.TestCase):
                      "max_context_qa", "summary_enabled", "persist_seconds",
                      "talking_points_grounded", "talking_points_max",
                      "talking_points_min_new_words", "talking_points_min_words",
-                     "talking_points_quote_overlap"):
+                     "talking_points_quote_overlap", "transcript_writeback_dir",
+                     "stt_partial_enabled", "stt_partial_window_seconds",
+                     "stt_partial_interval_seconds"):
             self.assertEqual(getattr(cfg, attr), getattr(again, attr), attr)
 
     def test_save_preserves_unknown_keys_and_backs_up(self) -> None:
@@ -525,6 +723,8 @@ class ConfigTests(unittest.TestCase):
             cfg = load_config(Path(tmp) / "nope.json")
             self.assertEqual(cfg.self_name, "You")
             self.assertEqual(cfg.answers_backend, "groq")
+            self.assertTrue(cfg.recorder.transcription_model.endswith(
+                "ggml-large-v3-turbo-q5_0.bin"))
 
 
 class StateTests(unittest.TestCase):
@@ -541,6 +741,16 @@ class StateTests(unittest.TestCase):
         self.assertIn("hello", text)
         self.assertIn("world", text)
         self.assertIn("Talking points", state.answers_markdown())
+
+    def test_partial_transcript_is_replaceable_and_not_authoritative(self) -> None:
+        state = LiveState()
+        state.set_transcript_partial("You", "what is the", "You", 1)
+        state.set_transcript_partial("You", "plan", "You", 2)
+        state.add("transcript", source="live", speaker="You", text="what is")
+        snap = state.snapshot()
+        self.assertEqual(len(snap["partials"]), 1)
+        self.assertEqual(snap["partials"][0]["text"], "plan")
+        self.assertNotIn("plan", state.transcript_text())
 
     def test_talking_points_dedupe_and_snapshot(self) -> None:
         state = LiveState()
@@ -994,6 +1204,68 @@ class AnswerEngineTests(unittest.TestCase):
         answers = state.snapshot()["answers"]
         self.assertEqual(answers[0]["bullets"], ["first point", "second point"])
         self.assertEqual(answers[0]["kind"], "question")
+
+    def test_rate_limited_primary_uses_answer_fallback(self) -> None:
+        class RateLimitedClient:
+            def chat(self, *args, **kwargs):
+                raise LLMError("slow down", status=429, retry_after=0.01)
+
+            def chat_stream(self, *args, **kwargs):
+                raise LLMError("slow down", status=429, retry_after=0.01)
+
+        cfg = HudConfig(answers_backend="groq", answers_fallback=["openrouter"],
+                        rolling_enabled=False, kb_enabled=False)
+        engine = AnswerEngine(LiveState(), lambda _m: None, cfg)
+        engine._chain = self._Chain([
+            {"name": "groq", "client": RateLimitedClient(),
+             "chat_model": "groq-model", "rolling_model": "groq-model",
+             "structured": True},
+            {"name": "openrouter", "client": self._EchoClient(),
+             "chat_model": "fallback-model", "rolling_model": "fallback-model",
+             "structured": False},
+        ])
+        result = engine._chat_stream("question", "stable instructions", "dynamic question")
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.model, "fallback-model")
+
+    def test_tick_enqueues_indirect_question_for_answer_worker(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        rolling_enabled=False)
+        state = LiveState()
+        engine = AnswerEngine(state, lambda _m: None, cfg)
+        state.add("transcript", source="live", speaker="Client",
+                  text="I was wondering whether your team supports staged rollouts")
+        engine._tick()
+        _priority, _seq, job = engine._queue.get_nowait()
+        self.assertEqual(job["kind"], "question")
+        self.assertIn("supports staged rollouts", job["question"])
+
+    def test_partial_question_draft_updates_without_enqueuing_answer(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        rolling_enabled=False)
+        state = LiveState()
+        engine = AnswerEngine(state, lambda _m: None, cfg)
+        state.set_transcript_partial("Client", "what is the plan?", "Client", 1)
+        engine._tick()
+        self.assertEqual(state.snapshot()["meta"]["question_draft"], "what is the plan?")
+        with self.assertRaises(queue.Empty):
+            engine._queue.get_nowait()
+
+    def test_stable_prefix_waits_for_final_boundary_before_answering(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        rolling_enabled=False)
+        state = LiveState()
+        engine = AnswerEngine(state, lambda _m: None, cfg)
+        state.add("transcript", source="live", speaker="Client",
+                  text="what is the", finalized=False)
+        engine._tick()
+        with self.assertRaises(queue.Empty):
+            engine._queue.get_nowait()
+        state.add("transcript_boundary", source_key="Client", speaker="Client")
+        engine._tick()
+        _priority, _seq, job = engine._queue.get_nowait()
+        self.assertEqual(job["question"], "what is the")
 
     def test_rolling_emits_talking_points_not_answers(self) -> None:
         cfg = HudConfig(answers_backend="groq", kb_enabled=False,
@@ -2341,6 +2613,13 @@ class AuditHardeningTests(unittest.TestCase):
             out = self._post(port, app.token, "api/fix",
                              {"action": "download-model", "model": "../../evil"})
             self.assertFalse(out["ok"])
+
+    def test_turbo_model_is_an_allowed_download(self) -> None:
+        from hud.control import WHISPER_MODELS
+
+        self.assertIn("ggml-large-v3-turbo-q5_0.bin", WHISPER_MODELS)
+        self.assertEqual(WHISPER_MODELS["ggml-large-v3-turbo-q5_0.bin"],
+                         "e050f7970618a659205450ad97eb95a18d69c9ee")
 
     def test_open_is_restricted_to_recordings_and_docs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

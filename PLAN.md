@@ -575,3 +575,117 @@ and accepted any loopback that merely *opened*, even a silent one.
   picker rejects TCC-protected locations; Bluetooth-headset help; stale test
   temp dirs are cleaned. *Tests*: whitelist/lock/cache/status-split coverage
   and test isolation (no more writes to the real state file).
+
+## Phase 2.6: interview question-boundary fix
+
+Real-use feedback: spoken interview questions can be indirect, omit a question
+mark, or be split at an STT chunk boundary. The local detector now recognizes
+common indirect forms (for example, “I was wondering whether…”), stitches the
+adjacent turns needed to complete one, and suppresses re-emission as the
+lookback window advances. The ambiguity rewrite path no longer treats every
+six-word question as context-dependent; only very short fragments are
+inherently ambiguous. This adds no new network or credential behavior.
+
+## Phase 2.7: permission resilience and large-vault context
+
+The next reliability/performance pass is a retrofit on the existing HUD, not a
+new Zoom surface:
+
+- Local HTTP servers now bind through one shared loopback helper, retrying the
+  alternate local address family and converting raw `PermissionError` failures
+  into a clear setup message. Host validation and IPv6 URL formatting will use
+  the same canonicalization helper.
+- The markdown index now uses per-file fingerprinted reuse instead of
+  all-or-nothing cache invalidation. Unchanged Obsidian notes load their saved
+  chunks/vectors without re-embedding; only added/changed notes will be
+  embedded. Directory traversal will skip Obsidian/plugin/build detritus and
+  report unreadable roots instead of silently producing an empty KB.
+- Retrieval will preserve the current local-first behavior and top-k prompt
+  budget. A later measured pass can add lexical/semantic fusion and a compact
+  rolling meeting memory; neither will be allowed to put vault contents into a
+  live prompt wholesale.
+
+The success criteria are: no recorder-path regression when the HUD cannot bind,
+incremental reindex work proportional to changed notes, explicit access errors
+for TCC-protected vaults, and unchanged live capture when indexing is slow.
+
+## Phase 2.8: asynchronous transcript writeback and measured context improvements
+
+Requested workflow: optionally mirror the live transcript into a separate folder
+while the call is running. This is additive; the normal recording directory and
+its `derived/` outputs remain the canonical session artifacts.
+
+- Add a `transcript.writeback_dir` setting plus CLI and Settings GUI controls.
+- Give each live session a unique Markdown document in that folder. A dedicated
+  daemon writer consumes transcript events and flushes them independently of
+  audio capture, STT, answers, and the existing periodic persistence loop.
+- On destination errors, log once and disable only the mirror. Never block the
+  recorder, drop a transcript event from the HUD, or replace the normal save.
+- Keep the document append-only during the call, with a final drain on stop so
+  the last recognized speech is written before shutdown.
+- Preserve local-first vault context. The shipped retrieval pass now combines
+  lexical and semantic scores and uses lexical candidates for very large indexes;
+  a later measured pass may add an ANN-backed candidate index only when a vault
+  is large enough to justify it. Prompt structure should keep static instructions
+  ahead of dynamic context to benefit from provider prefix caching.
+
+Success criteria: a writeback destination can be enabled without changing the
+existing recording path; live transcript lines appear in the mirror while the
+call is active; writeback failures do not affect capture; and tests cover config
+round-trip, event draining, unique file naming, and failure isolation.
+
+The provider/reliability follow-up also now includes:
+
+- Answer calls try the next configured provider on a Groq 429 before pausing the
+  queue; STT backs off without blocking audio ingestion or replaying stale audio.
+- Two simultaneous Groq STT streams automatically use a seven-second minimum
+  chunk when configured lower, staying below the current STT request-rate limit.
+- Local whisper.cpp remains the low-egress path. The current Apple-silicon
+  runtime has Metal/BLAS support; `large-v3-turbo-q5_0` is now the local
+  baseline, measured at roughly 6x real-time on this 24 GB M4 Air. `base.en`
+  remains the speed-first fallback for smaller or thermally constrained Macs.
+
+## Phase 2.9: measured live-latency pass
+
+The first latency pass is shipped: the existing explicit 10-second local
+configuration was migrated to the 5-second baseline, the Groq two-source guard
+still raises remote streams to 7 seconds when needed, and the answer engine now
+wakes on transcript events instead of polling once per second. Persistent local
+whisper-server timing is captured in the README so model choice is based on
+measured hardware, not model-file size alone.
+
+The next measured candidates are answer-provider time-to-first-token, prompt
+size/context assembly, and whether low-priority talking-point work ever delays
+a question answer. Any concurrency or prompt compaction change must preserve
+the current rate-limit fallback and transcript-grounding guarantees.
+
+## Phase 2.10: near-real-time local transcript and evidence-safe question assembly
+
+The live HUD should feel closer to word streaming without treating every interim
+Whisper guess as fact. The implementation boundary is deliberately explicit:
+
+- Local-only overlapping Whisper windows will publish a replaceable
+  `transcript_partial` draft about once per second using a two-second window.
+  The draft is UI-only and
+  is never written to the transcript mirror, permanent transcript text, live KB,
+  or answer evidence.
+- A word is committed only after it is stable across consecutive windows. Those
+  committed words use the existing `transcript` event path, so writeback,
+  retrieval, question detection, and answer prompts continue to consume one
+  authoritative stream.
+- The final chunk transcription remains enabled and de-duplicates against words
+  already committed by the partial recognizer. Remote/Groq STT stays on the
+  stable chunk path because the current provider endpoint is file-based.
+- The question detector consumes committed words only. This means questions can
+  be reconstructed across partial/final boundaries and answered as soon as the
+  stable endpoint lands, without answering a question that later changes.
+- Provider telemetry will record prompt assembly duration/size, provider TTFT,
+  total provider time, and answer queue wait. Talking-point jobs remain lower
+  priority and are admitted only when no question is pending; telemetry makes
+  any residual in-flight delay visible before considering concurrent workers.
+
+Success criteria: the HUD shows a visibly updating provisional line in local
+mode; unstable text never reaches writeback or the KB; stable words do not
+duplicate when the final chunk arrives; answer prompts contain only committed
+evidence; and tests cover the stability gate, reconstruction, metrics, and
+talking-point priority behavior.

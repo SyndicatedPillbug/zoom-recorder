@@ -53,6 +53,7 @@ class LiveState:
         self._lock = threading.Condition()
         self._events: List[Dict[str, Any]] = []
         self._talking_points: List[Dict[str, Any]] = []
+        self._partials: Dict[str, Dict[str, Any]] = {}
         self._next_id = 1
         self.status: str = "starting"
         self.budget: Dict[str, Any] = {}
@@ -142,6 +143,24 @@ class LiveState:
                 "fields": dict(fields),
             })
 
+    def set_transcript_partial(self, source_key: str, text: str,
+                               speaker: Optional[str] = None,
+                               revision: int = 0, **fields: Any) -> Dict[str, Any]:
+        """Publish a replaceable, provisional transcript draft.
+
+        Partial speech is intentionally kept out of the authoritative
+        transcript helpers. Consumers may render it, but writeback, retrieval,
+        summaries, and answer evidence only consume ``transcript`` events.
+        """
+        key = str(source_key or "mixed")
+        with self._lock:
+            event = {"type": "transcript_partial", "source_key": key,
+                     "text": str(text or ""), "speaker": speaker,
+                     "revision": int(revision), "provisional": True}
+            event.update(fields)
+            self._partials[key] = dict(event)
+            return self._append_locked(event)
+
     # -- reads -------------------------------------------------------------
     def latest_id(self) -> int:
         with self._lock:
@@ -172,6 +191,7 @@ class LiveState:
                 "meta": self.meta,
                 "latest_id": self._next_id - 1,
                 "transcript": transcript,
+                "partials": [dict(p) for p in self._partials.values()],
                 "answers": answers,
                 "talking_points": [dict(p) for p in self._talking_points],
             }

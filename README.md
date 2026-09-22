@@ -35,8 +35,8 @@ Manual equivalent of `--install-deps`:
 ```bash
 brew install ffmpeg whisper-cpp
 mkdir -p ~/.cache/whisper-cpp
-curl -L -o ~/.cache/whisper-cpp/ggml-base.en.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+curl -L -o ~/.cache/whisper-cpp/ggml-large-v3-turbo-q5_0.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
 
 pip3 install --user rumps        # menu-bar UI
 brew install blackhole-2ch       # system-audio loopback (asks for admin)
@@ -219,6 +219,7 @@ a background database of `.md` files:
 ./zoom_record.py --live                          # Groq STT + Groq answers
 ./zoom_record.py --live --kb-dir ~/notes         # ground answers in your notes
 ./zoom_record.py --live --live-no-answers        # offline transcript only
+./zoom_record.py --live --transcript-dir ~/Obsidian/LiveTranscripts
 ./zoom_record.py --live --answer-backend openrouter   # use OpenRouter instead
 ```
 
@@ -240,6 +241,14 @@ the transcript keeps running. The header shows a live STT **lag** indicator, the
 input **level vs the speech threshold**, and the **mic/system devices** in use,
 with a warning banner when the other party's audio can't be captured (see
 *Capturing the other party's audio* below).
+
+**Optional live transcript mirror.** Set `transcript.writeback_dir` in the
+settings page, choose **Transcript mirror**, or pass `--transcript-dir PATH`.
+The recorder creates one unique Markdown document per live session in that
+folder and appends recognized transcript lines from a background writer. This
+is an additional destination: the normal recording folder, `derived/`, and
+their crash-safe files are unchanged. If macOS denies the folder, the app logs
+the writeback failure and continues recording and transcribing normally.
 
 **Speaker labels (partial diarization).** Because the mic and the
 system/loopback are captured as *separate channels*, the HUD can attribute
@@ -272,7 +281,9 @@ at the segment level (using `verbose_json` `no_speech_prob` / `avg_logprob` /
 `compression_ratio`) and with a text filter that drops repetition loops and
 canned silence phrases. The HUD then runs two independent streams:
 **questions** are detected across the recent conversation (not just the newest
-chunk) and answered with the stronger model, giving it the surrounding turns,
+chunk), including indirect interview questions without a question mark and
+questions split across adjacent STT chunks. They are answered with the stronger
+model, giving it the surrounding turns,
 the earlier Q&A, and your notes so follow-ups like *"what about the other one?"*
 resolve correctly; **talking points** are refreshed every ~35 s on the cheap
 model and appended, deduplicated (lexically and semantically), to their own
@@ -282,6 +293,47 @@ each one, that quote is verified locally, and anything unsupported is dropped.
 A minimum amount of new speech is required before a refresh fires, so sparse or
 noisy audio produces **no** points rather than invented ones. Nothing in the HUD
 can affect the recording — if it fails to start, recording proceeds normally.
+
+For private low-latency transcription, local whisper.cpp is a practical option
+on Apple silicon. The installed runtime uses Metal and BLAS on this Mac. The
+24 GB M4 Air was measured with the official `large-v3-turbo-q5_0` model: a
+persistent local server transcribed a 7-second speech chunk in about 1.17 s,
+versus about 0.11 s for `base.en`. That is roughly 6x real-time for turbo, so
+turbo is now the local baseline; `base.en` remains available as a speed-first
+fallback when a smaller machine needs it.
+The quantized model is about 547 MiB on disk. Use it explicitly with:
+
+```bash
+./zoom_record.py --live --stt-backend local \
+  --model ~/.cache/whisper-cpp/ggml-large-v3-turbo-q5_0.bin
+```
+
+With two remote Groq streams, the recorder raises sub-7-second chunks to 7
+seconds to stay under the provider's current STT request rate; local Whisper
+keeps the configured chunk size. The answer loop wakes on new transcript
+events instead of waiting for a fixed polling tick, so question detection
+starts immediately after recognition. Local mode also removes STT network
+latency, audio egress, and Groq audio-second usage, although it does not make
+the Whisper computation itself faster than Groq's hosted hardware.
+
+Local mode also enables near-real-time interim words by default. It re-decodes
+an overlapping two-second window about every 0.8 seconds. The HUD shows the
+newest unstable words as a muted live draft; words are promoted to the normal
+transcript only after they remain stable across windows. Draft words are never
+written to the optional transcript mirror, indexed in the live KB, or used as
+answer evidence. This is intentionally a stable-word stream rather than false
+certainty: the final chunk pass remains authoritative and removes any overlap.
+Set `stt.partial_enabled` to `false`, or adjust
+`stt.partial_window_seconds` / `stt.partial_interval_seconds`, when running a
+smaller or thermally constrained Mac. Remote Groq remains on the chunked path
+because its current transcription API accepts uploaded audio files rather than
+an app-side audio stream.
+
+The HUD's Details view now exposes the measurements needed to tune latency:
+STT lag and interim latency, answer queue wait, prompt assembly time and size,
+provider time-to-first-token, and total provider time. Talking-point refreshes
+are lower priority and are not admitted while a question is queued or already
+being answered; their own queue wait is recorded separately.
 
 **Voice activity (optional).** Speech is detected with an adaptive noise-floor
 gate by default, which rejects steady hum without any dependency. Installing
@@ -348,13 +400,15 @@ them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
 | `openrouter` | — | ✅ | Use GPT-4o/Claude/Gemini; LLM routing only, no STT |
 | `openai` | ✅ `whisper-1` | ✅ | One key for both |
 | `ollama` | — | ✅ | Fully local; pair with `--stt-backend local` |
-| `local` | ✅ whisper.cpp | — | Private; needs `--model` pointing at a ggml file |
+| `local` | ✅ whisper.cpp (`large-v3-turbo-q5_0`) | — | Private; the turbo model is the baseline and needs a one-time download |
 
 Talking points use the lighter model (`openai/gpt-oss-20b` on Groq) while
 detected questions use the stronger one (`openai/gpt-oss-120b`). By default only
 questions from the other party are answered (`answers.answer_self_questions`
-includes your own); rhetorical/backchannel questions are skipped. When a
-follow-up question is ambiguous (short, or full of *it/that/the other one*), one
+includes your own); rhetorical/backchannel questions are skipped. Only very
+short fragments are treated as inherently ambiguous; a longer, self-contained
+interview question is not forced through the rewrite path. When a
+follow-up question is ambiguous (or full of *it/that/the other one*), one
 extra cheap call first rewrites it into a self-contained question using the
 recent turns; unambiguous questions cost nothing extra. The budget governor
 trusts the provider's own rate-limit headers, so it adapts to whatever plan
@@ -362,12 +416,19 @@ you're on; if a daily token cap exists and runs low, talking-point refreshes are
 dropped first so question answers keep working. Set `budget.tpm` / `budget.tpd`
 in the config to impose limits below the provider's.
 
+When Groq returns a transient rate limit, the answer worker tries the next
+configured provider before pausing the answer queue. STT uses a short provider
+backoff and drops stale queued audio rather than allowing the live transcript
+to drift minutes behind the call.
+
 **Configuration.** Defaults can be set in `~/.config/zoom-recorder/config.json`
 (keep it `chmod 600`); environment variables always win:
 
 ```json
 {
-  "stt":     {"backend": "groq", "chunk_seconds": 10, "glossary": ["Acme", "Q3"],
+  "stt":     {"backend": "groq", "chunk_seconds": 5, "partial_enabled": true,
+               "partial_window_seconds": 2, "partial_interval_seconds": 0.8,
+               "glossary": ["Acme", "Q3"],
                "vad_backend": "auto", "vad_margin_db": 6, "hallucination_filter": true},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
                "context_minutes": 5, "question_rewrite": true,
@@ -377,6 +438,7 @@ in the config to impose limits below the provider's.
                "fallback": ["openrouter", "ollama"]},
   "kb":      {"dirs": ["~/notes"], "top_k": 5, "embed_backend": "auto"},
   "hud":     {"port": 0, "open_browser": true, "persist_seconds": 20},
+  "transcript": {"writeback_dir": "~/Obsidian/LiveTranscripts"},
   "speakers": {"enabled": true, "self_name": "You", "remote_name": "Others"},
   "api_keys": {"openrouter": "sk-or-..."}
 }
@@ -393,9 +455,12 @@ each answer, citing the file. Embeddings are pluggable via `kb.embed_backend`:
 | `openai` | remote | an OpenAI key (`text-embedding-3-small`) |
 | `auto` (default) | picks the first available of the above | — |
 
-The index is cached locally and rebuilt only when files change. With a remote
-embedding backend, note chunks leave the machine; with a local backend or
-`sentence-transformers`, they never do.
+The index is cached locally and rebuilt only when files change. Its cache is
+per note, so changing one file in a large vault re-embeds only that file; the
+index skips `.obsidian`, `.git`, `.trash`, plugin/build folders, and reports
+when macOS cannot read a protected path. With a remote embedding backend, note
+chunks leave the machine; with a local backend or `sentence-transformers`, they
+never do.
 
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your
@@ -419,7 +484,8 @@ JSON — open it from the menu bar (**Settings…**) or run it directly:
 The page covers STT, answers, knowledge base, speakers, HUD/budget and API
 keys, with live model dropdowns (from each provider's `/models`), a **Test**
 button per provider, and a native folder picker for KB directories. It binds
-loopback only, requires a random one-time token, never displays stored API keys
+loopback only, retries IPv4/IPv6 when the preferred local address is blocked,
+requires a random one-time token, never displays stored API keys
 (shows `configured ✓` / `not set`), writes the file atomically with a `.bak`
 backup, and shuts down when idle — there's no persistent server. Changes apply
 to the **next** recording, since the HUD reads config at session start.
@@ -453,14 +519,15 @@ to the **next** recording, since the HUD reads config at session start.
 | `--probe-seconds N` | 1.5 | Length of each signal probe |
 | `--silence-db N` | -60 | `max_volume` below this counts as silence |
 | `--no-transcribe` | off | Skip transcription |
-| `--model PATH` | base.en | Whisper model to use |
+| `--model PATH` | large-v3-turbo-q5_0 | Whisper model to use; base.en remains a speed-first fallback |
 | `--live` | off | Open the live transcript + AI answer HUD |
 | `--live-no-answers` | off | Live transcript only; never call an answer provider |
 | `--no-live-summary` | off | Skip the end-of-call summary/action items/email |
 | `--hud-port N` | random | Port for the local HUD |
+| `--transcript-dir PATH` | config | Additional folder for a live Markdown transcript mirror |
 | `--no-hud-browser` | off | Do not auto-open the HUD in a browser |
 | `--stt-backend X` | groq | Live STT backend: `groq` \| `openai` \| `local` |
-| `--stt-chunk-seconds N` | 10 | Live STT chunk length |
+| `--stt-chunk-seconds N` | 5 (7 with two Groq streams) | Live STT chunk length; the provider guard may raise it for two remote streams |
 | `--glossary-term WORD` | none | Name/acronym to bias live transcription (repeatable) |
 | `--answer-backend X` | groq | Answer provider: `groq` \| `openrouter` \| `openai` \| `ollama` |
 | `--answer-interval N` | 35 | Seconds between rolling talking-point refreshes |

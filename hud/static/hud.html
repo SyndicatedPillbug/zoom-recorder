@@ -76,6 +76,7 @@
   }
   .scroll { flex: 1 1 auto; overflow-y: auto; padding: 12px 16px; scroll-behavior: smooth; }
   .line { margin: 0 0 8px; }
+  .line.partial { color: var(--muted); font-style: italic; border-left: 2px solid var(--accent); padding-left: 8px; }
   .line .t { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; font-size: 12px; }
   .line .spk { color: var(--accent); font-weight: 600; margin-right: 6px; }
   .card {
@@ -136,6 +137,8 @@
 <div class="details" id="details" hidden>
   <span class="pill egress" id="egress" title="Only transcript text leaves this Mac when answers are enabled.">answers: unknown</span>
   <span class="pill" id="lag" title="How far the live transcription is behind the audio">lag —</span>
+  <span class="pill" id="partialLag" title="Interim local transcription delay">interim —</span>
+  <span class="pill" id="answerMetrics" title="Latest answer queue, prompt, and provider timing">answer —</span>
   <span class="pill" id="level" title="Current input level vs the speech threshold (dBFS)">lvl —</span>
   <span class="pill" id="devices" title="Microphone / system audio source">mic — · sys —</span>
   <button class="mini" id="pauseBtn" title="Pause AI answers (transcript keeps running)">Pause answers</button>
@@ -174,6 +177,8 @@
   const statusEl = document.getElementById('status');
   const egressEl = document.getElementById('egress');
   const lagEl = document.getElementById('lag');
+  const partialLagEl = document.getElementById('partialLag');
+  const answerMetricsEl = document.getElementById('answerMetrics');
   const levelEl = document.getElementById('level');
   const devicesEl = document.getElementById('devices');
   const warnbarEl = document.getElementById('warnbar');
@@ -201,6 +206,7 @@
   const TOKEN = new URLSearchParams(location.search).get('token') || '';
   const PINS_KEY = 'hud.pins';
   let transcriptCount = 0, answerCount = 0, lastId = 0, paused = false;
+  const partialNodes = new Map();
   let pointItems = [];
   let pins = new Set();
   try { pins = new Set(JSON.parse(localStorage.getItem(PINS_KEY) || '[]')); } catch (e) {}
@@ -231,7 +237,9 @@
   }
 
   function addTranscript(ev) {
-    if (transcriptCount === 0) transcriptEl.innerHTML = '';
+    const drafts = [...partialNodes.values()].map(node => node._partialEvent).filter(Boolean);
+    if (transcriptCount === 0) { transcriptEl.innerHTML = ''; partialNodes.clear(); }
+    else { drafts.forEach(node => node.remove()); partialNodes.clear(); }
     const stick = atBottom(transcriptEl);
     const p = document.createElement('p');
     p.className = 'line';
@@ -239,7 +247,28 @@
     p.innerHTML = '<span class="t">' + esc(clock(ev.ts)) + '</span>' + speaker + esc(ev.text || '');
     transcriptEl.appendChild(p);
     transcriptCount++;
+    drafts.forEach(addPartial);
     if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  function addPartial(ev) {
+    const key = String(ev.source_key || ev.speaker || 'mixed');
+    const text = String(ev.text || '').trim();
+    let p = partialNodes.get(key);
+    if (!text) {
+      if (p) { p.remove(); partialNodes.delete(key); }
+      return;
+    }
+    if (!p) {
+      p = document.createElement('p');
+      p.className = 'line partial';
+      partialNodes.set(key, p);
+      transcriptEl.appendChild(p);
+    }
+    p._partialEvent = ev;
+    const speaker = ev.speaker ? '<span class="spk">' + esc(ev.speaker) + '</span>' : '';
+    p.innerHTML = '<span class="t">live</span>' + speaker + esc(text);
+    if (atBottom(transcriptEl)) transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
   function pointNode(p, fresh) {
@@ -304,6 +333,11 @@
     copyBtn.onclick = () => copyText((ev.question || '') + '\n' + (ev.bullets || []).join('\n'), copyBtn);
     answersEl.appendChild(card);
     answerCount++;
+    if (ev.answer_queue_wait !== undefined || ev.prompt_chars !== undefined) {
+      const wait = Number(ev.answer_queue_wait || 0).toFixed(1);
+      const chars = Number(ev.prompt_chars || 0);
+      answerMetricsEl.textContent = 'answer q ' + wait + 's · prompt ' + chars;
+    }
     if (stick) answersEl.scrollTop = answersEl.scrollHeight;
   }
 
@@ -328,6 +362,9 @@
     }
     if (meta.stt_lag_seconds !== undefined) {
       lagEl.textContent = 'lag ' + Number(meta.stt_lag_seconds).toFixed(1) + 's';
+    }
+    if (meta.stt_partial_latency !== undefined) {
+      partialLagEl.textContent = 'interim ' + Number(meta.stt_partial_latency).toFixed(1) + 's';
     }
     if (meta.stt_vad_level_db !== undefined) {
       const lvl = Number(meta.stt_vad_level_db);
@@ -365,8 +402,17 @@
       lastId = ev.id;
     }
     if (ev.type === 'transcript') addTranscript(ev);
+    else if (ev.type === 'transcript_partial') addPartial(ev);
     else if (ev.type === 'talking_point') addPoint(ev);
     else if (ev.type === 'answer') addAnswer(ev);
+    else if (ev.type === 'answer_update') {
+      const f = ev.fields || {};
+      if (f.provider_ttft !== undefined || f.provider_seconds !== undefined) {
+        const ttft = f.provider_ttft == null ? '—' : Number(f.provider_ttft).toFixed(1) + 's';
+        const total = f.provider_seconds == null ? '—' : Number(f.provider_seconds).toFixed(1) + 's';
+        answerMetricsEl.textContent += ' · TTFT ' + ttft + ' · total ' + total;
+      }
+    }
     else if (ev.type === 'status' || ev.type === 'meta') applyStatus(ev);
     else if (ev.type === 'budget') applyStatus({ budget: ev.budget, meta: ev.meta, status: ev.status });
   }
@@ -374,6 +420,7 @@
   // Rebuild both answer panes from the server snapshot (e.g. after a reload).
   function hydrate(snap) {
     (snap.transcript || []).forEach(addTranscript);
+    (snap.partials || []).forEach(addPartial);
     (snap.answers || []).forEach(addAnswer);
     pointItems = (snap.talking_points || []).map(p => (
       { text: p.text, ts: p.ts, sources: p.sources || [], fresh: false }));
