@@ -34,7 +34,8 @@ from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E4
                         load_config, save_config)
 from hud.diarization import (diarization_readiness,  # noqa: E402
                              run_post_call_diarization)
-from hud.evaluation import normalize_words, word_error_stats  # noqa: E402
+from hud.evaluation import (first_stable_publication_stats, normalize_words,  # noqa: E402
+                            stable_prefix_stats, word_error_stats)
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
 from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
@@ -876,6 +877,20 @@ class MemoryAndReplayTests(unittest.TestCase):
         silence = word_error_stats("", "hello there")
         self.assertIsNone(silence.wer)
         self.assertEqual(silence.insertions, 2)
+        stable = stable_prefix_stats([
+            {"text": "what is", "captured_at": 10.0, "ts": 11.0},
+            {"text": "what is the plan", "captured_at": 11.0, "ts": 12.0},
+        ])
+        self.assertEqual(stable.first_stable_word, "what")
+        self.assertEqual(stable.first_stable_word_index, 0)
+        self.assertEqual(stable.first_stable_word_latency_seconds, 2.0)
+        published = first_stable_publication_stats([
+            {"type": "transcript_partial", "text": "what is", "latency": 1.0},
+            {"type": "transcript", "finalized": False,
+             "text": "what", "latency": 1.25},
+        ])
+        self.assertEqual(published.first_stable_word, "what")
+        self.assertEqual(published.first_stable_word_latency_seconds, 1.25)
 
     def test_memory_extracts_exact_decision_and_number_evidence(self) -> None:
         items = extract_memory("We agreed to launch in Q3 with a $50,000 budget.",

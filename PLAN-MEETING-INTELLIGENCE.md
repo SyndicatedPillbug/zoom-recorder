@@ -125,8 +125,11 @@ The dependency-free word-level evaluator is now implemented in
 plus substitutions, deletions, and insertions from any checked reference and
 hypothesis text. The aligned AMI 50–80 second speech slice scored 20.0% WER
 with Turbo and 21.3% with base.en. Measuring first-stable-word latency and
-final capture-to-text latency remains; interim window and local-agreement
-changes remain gated on that evidence.
+final capture-to-text latency remains. The evaluator now handles both rolling
+hypotheses and persisted stable interim events; the existing replay's first
+stable publication measured 1.32 seconds, but true speech-start-to-word timing
+still needs an audio-aligned replay. Interim window and local-agreement changes
+remain gated on that evidence.
 
 ### Phase C — question finalization and answer evidence (implemented baseline)
 

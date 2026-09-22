@@ -115,6 +115,14 @@ prerequisite for the expected local baseline.
    manifest with first-stable-word and final capture-to-text latency; the
    aligned AMI speech slice is now available for that streaming measurement.
 
+The evaluator now supports both rolling-hypothesis timing and persisted live
+session events. On the existing dedicated-lane replay, the first persisted
+stable interim word was published with 1.32 seconds of inference/publication
+latency. This is intentionally not called speech-start-to-word latency: the
+current event's `captured_at` marks rolling-window submission, so a future
+word-aligned replay must add the acoustic start time before that stronger claim
+is used for tuning.
+
 ## Explicit non-recommendations
 
 - Do not lower the final Turbo floor below 2.5 seconds without an accuracy
