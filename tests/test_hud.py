@@ -184,6 +184,48 @@ class SttPipelineTests(unittest.TestCase):
         stt._server_transcribe.assert_called_once()
         self.assertTrue(any("warmup skipped" in item for item in logs))
 
+    def test_interim_server_failure_never_falls_back_to_slow_cli(self) -> None:
+        stt = LocalWhisperSTT.__new__(LocalWhisperSTT)
+        stt.model = Path("/tmp/base.bin")
+        stt.log = lambda _message: None
+        stt.allow_cli_fallback = False
+        stt._server = object()
+        stt._port = 1234
+        stt._server_transcribe = mock.Mock(side_effect=ConnectionError("offline"))
+        stt._cli_transcribe = mock.Mock(return_value="must not run")
+        result = stt.transcribe(b"\x00\x00" * 100)
+        self.assertEqual(result.text, "")
+        stt._cli_transcribe.assert_not_called()
+
+    def test_partial_lane_uses_available_smaller_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "ggml-base.en.bin"
+            model.write_bytes(b"test model")
+            cfg = HudConfig(stt_backend="local", stt_partial_model=str(model))
+            tr = self._transcriber(cfg)
+            with mock.patch("hud.stt.LocalWhisperSTT") as factory:
+                expected = object()
+                factory.return_value = expected
+                self.assertIs(tr._build_partial_stt(), expected)
+                factory.assert_called_once_with(
+                    model, mock.ANY, "whisper-server", allow_cli_fallback=False)
+
+    def test_partial_lane_can_run_while_final_lane_is_busy(self) -> None:
+        cfg = HudConfig(stt_backend="local", stt_partial_window_seconds=0.2,
+                        stt_partial_interval_seconds=0.0)
+        tr = self._transcriber(cfg)
+        tr._partial_stt = mock.Mock()
+        tr._partial_stt.transcribe.return_value = "what is the plan"
+        src = _Source("You", [])
+        tr._sources = [src]
+        tr._inference_lock.acquire()
+        try:
+            for _ in range(4):
+                tr._feed_partial(src, b"\x00\x00" * 1600)
+            self.assertFalse(src.partial_queue.empty())
+        finally:
+            tr._inference_lock.release()
+
     def test_enqueue_drops_oldest_when_full(self) -> None:
         tr = self._transcriber(HudConfig(stt_queue_chunks=1))
         src = _Source("You", [])
@@ -411,6 +453,7 @@ class HallucinationTests(unittest.TestCase):
         self.assertTrue(looks_hallucinated("Thank you."))
         self.assertTrue(looks_hallucinated("Thanks for watching!"))
         self.assertTrue(looks_hallucinated("Subtitles by M. Smith"))
+        self.assertTrue(looks_hallucinated("[BLANK_AUDIO]"))
 
     def test_normal_sentence_kept(self) -> None:
         self.assertFalse(looks_hallucinated(

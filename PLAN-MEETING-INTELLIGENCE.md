@@ -84,6 +84,24 @@ steady-state p95 remained variable at about 5.25 seconds. Warmup is therefore
 accepted as a startup improvement, not as the solution to the steady-state
 tail.
 
+### Phase B.3 — dedicated interim lane (implemented, replay pending)
+
+When the optional local `base.en` model exists, provisional words now use a
+separate warm server and inference lock while Turbo retains the authoritative
+final lane. Final audio continues to suppress stale drafts at admission, but a
+draft no longer has to wait for an unrelated Turbo request already in flight.
+Missing interim models fall back to the previous shared-lane behavior. A
+controlled replay and full regression run are still required before tuning its
+default interval or window.
+
+The 45-second AMI replay produced 41 interim measurements at 0.43 seconds p50
+and 1.74 seconds p95, while authoritative Turbo final latency measured 3.25
+seconds p50 and 4.16 seconds p95. Final drops remained at zero. The dedicated
+lane also revealed and fixed two safety issues: canned `[BLANK_AUDIO]` output
+is filtered before provisional publication, and a failed interim server never
+falls back to the slow CLI path. The lane is ready for broader fixture and
+accuracy evaluation, but its provisional text must remain visibly non-final.
+
 ### Phase C — question finalization and answer evidence (implemented baseline)
 
 Interim question marks now wait for an explicit transcript boundary before an

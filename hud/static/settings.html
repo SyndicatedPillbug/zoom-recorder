@@ -74,6 +74,9 @@
     <div class="row"><label>Live word draft</label><div class="ctl">
       <input type="checkbox" id="stt.partial_enabled" />
       <span class="hint">local Whisper only; unstable words stay provisional</span></div></div>
+    <div class="row"><label>Interim model path</label><div class="ctl">
+      <input type="text" id="stt.partial_model" placeholder="~/.cache/whisper-cpp/ggml-base.en.bin" />
+      <span class="hint">optional faster model for live drafts; Turbo remains authoritative</span></div></div>
     <div class="row"><label>Draft window seconds</label><div class="ctl">
       <input type="number" step="0.1" min="1.5" max="6" id="stt.partial_window_seconds" /></div></div>
     <div class="row"><label>Draft update seconds</label><div class="ctl">
@@ -290,6 +293,7 @@
     setVal('stt.backend', c.stt.backend); setVal('stt.model', c.stt.model);
     setVal('stt.chunk_seconds', c.stt.chunk_seconds);
     setVal('stt.partial_enabled', c.stt.partial_enabled);
+    setVal('stt.partial_model', c.stt.partial_model);
     setVal('stt.partial_window_seconds', c.stt.partial_window_seconds);
     setVal('stt.partial_interval_seconds', c.stt.partial_interval_seconds);
     setVal('stt.glossary', (c.stt.glossary || []).join(', '));
@@ -333,6 +337,7 @@
       stt: { backend: $('stt.backend').value, model: $('stt.model').value || null,
              chunk_seconds: num('stt.chunk_seconds'),
              partial_enabled: $('stt.partial_enabled').checked,
+             partial_model: $('stt.partial_model').value || null,
              partial_window_seconds: num('stt.partial_window_seconds'),
              partial_interval_seconds: num('stt.partial_interval_seconds'),
              glossary: $('stt.glossary').value.split(',').map(s => s.trim()).filter(Boolean),

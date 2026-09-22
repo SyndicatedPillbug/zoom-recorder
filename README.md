@@ -384,6 +384,10 @@ transcript only after they remain stable across windows. Draft words are never
 written to the optional transcript mirror, indexed in the live KB, or used as
 answer evidence. This is intentionally a stable-word stream rather than false
 certainty: the final chunk pass remains authoritative and removes any overlap.
+When `~/.cache/whisper-cpp/ggml-base.en.bin` is available, those drafts use a
+dedicated lightweight local server so they can continue while Turbo decodes a
+final chunk. Set `stt.partial_model` to another local model path when needed;
+if it is unavailable, the app safely falls back to the shared Turbo lane.
 Set `stt.partial_enabled` to `false`, or adjust
 `stt.partial_window_seconds` / `stt.partial_interval_seconds`, when running a
 smaller or thermally constrained Mac. Remote Groq remains on the chunked path
@@ -497,6 +501,7 @@ to drift minutes behind the call.
   "stt":     {"backend": "groq", "chunk_seconds": 5, "adaptive_chunking": true,
                "chunk_min_seconds": 2.5, "chunk_max_seconds": 7,
                "chunk_overlap_seconds": 0.5, "partial_enabled": true,
+               "partial_model": "~/.cache/whisper-cpp/ggml-base.en.bin",
                "partial_window_seconds": 2, "partial_interval_seconds": 0.8,
                "glossary": ["Acme", "Q3"],
                "vad_backend": "auto", "vad_margin_db": 6, "hallucination_filter": true},

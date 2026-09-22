@@ -29,7 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional
 
-from .config import HudConfig, LOCAL_STT_BACKENDS
+from .config import (DEFAULT_PARTIAL_TRANSCRIPTION_MODEL, HudConfig,
+                     LOCAL_STT_BACKENDS)
 from .llm import LLMClient, LLMError
 from .state import LiveState
 from .vad import build_vad
@@ -45,6 +46,7 @@ HALLUCINATION_PHRASES = re.compile(
     r"^\s*(?:thanks? for watching.*|thank you[.!]?|thanks[.!]?|"
     r"please (?:like|subscribe).*|"
     r"subtitles? by.*|amara\.org.*|transcription by.*|"
+    r"\[\s*(?:blank[_ ]?audio|silence|music)\s*\]|"
     r"♪+.*|\.+)\s*$",
     re.I,
 )
@@ -450,10 +452,12 @@ class LocalWhisperSTT:
     """
 
     def __init__(self, model_path: Path, log: Callable[[str], None],
-                 bin_name: str = "whisper-server") -> None:
+                 bin_name: str = "whisper-server",
+                 allow_cli_fallback: bool = True) -> None:
         self.model = Path(model_path)
         self.log = log
         self.bin_name = bin_name
+        self.allow_cli_fallback = allow_cli_fallback
         self._server: Optional[subprocess.Popen] = None
         self._port: Optional[int] = None
         self._cli = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
@@ -514,6 +518,9 @@ class LocalWhisperSTT:
             try:
                 return STTResult(text=self._server_transcribe(wav, prompt))
             except Exception as exc:  # noqa: BLE001
+                if not self.allow_cli_fallback:
+                    self.log("local STT interim server request failed ({}); skipping draft".format(exc))
+                    return STTResult(text="")
                 self.log("local STT: server request failed ({}); using whisper-cli".format(exc))
         return STTResult(text=self._cli_transcribe(wav, prompt))
 
@@ -638,6 +645,7 @@ class LiveTranscriber:
         self._stop = threading.Event()
         self._sources: List[_Source] = []
         self._stt: object = None
+        self._partial_stt: object = None
         self._glossary = [g for g in getattr(cfg, "stt_glossary", []) if g]
         self._provider_backoff_until = 0.0
         self._provider_backoff_seconds = 4.0
@@ -646,6 +654,7 @@ class LiveTranscriber:
         # chunks wait for it; stale interim frames skip it and are replaced by
         # the next rolling window.
         self._inference_lock = threading.Lock()
+        self._partial_inference_lock = threading.Lock()
         self._partial_dropped = 0
         self._partial_suppressed = 0
         self._partial_coalesced = 0
@@ -660,6 +669,11 @@ class LiveTranscriber:
             self.log("live STT disabled: {}".format(exc))
             self.state.set_status("recording", stt_error=str(exc))
             return
+        try:
+            self._partial_stt = self._build_partial_stt()
+        except Exception as exc:  # noqa: BLE001
+            self.log("local STT interim lane unavailable; using shared lane ({})".format(exc))
+            self._partial_stt = None
         try:
             self._sources = self._build_sources()
         except Exception as exc:  # noqa: BLE001
@@ -791,6 +805,12 @@ class LiveTranscriber:
                 closer()
             except Exception:  # noqa: BLE001
                 pass
+        partial_closer = getattr(self._partial_stt, "close", None)
+        if callable(partial_closer) and self._partial_stt is not self._stt:
+            try:
+                partial_closer()
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- setup -------------------------------------------------------------
     def _build_stt(self):
@@ -815,6 +835,25 @@ class LiveTranscriber:
             no_speech_prob_max=self.cfg.stt_no_speech_prob_max,
             avg_logprob_min=self.cfg.stt_avg_logprob_min,
             compression_ratio_max=self.cfg.stt_compression_ratio_max)
+
+    def _build_partial_stt(self):
+        """Build an optional fast local lane for provisional words."""
+        if not self._partial_enabled():
+            return None
+        configured = getattr(self.cfg, "stt_partial_model", None)
+        path = Path(str(configured or DEFAULT_PARTIAL_TRANSCRIPTION_MODEL)).expanduser()
+        if not path.is_file():
+            self.log("local STT: interim model not found at {}; using shared Turbo lane".format(path))
+            return None
+        if self.model_path is not None:
+            try:
+                if path.resolve() == Path(self.model_path).expanduser().resolve():
+                    return None
+            except OSError:
+                pass
+        self.log("local STT: starting dedicated interim model {}".format(path.name))
+        return LocalWhisperSTT(path, self.log, self.cfg.stt_whisper_bin,
+                               allow_cli_fallback=False)
 
     # -- sources -----------------------------------------------------------
     def _device_cmd(self, name: str) -> List[str]:
@@ -978,7 +1017,8 @@ class LiveTranscriber:
         # Final recognition owns the inference lane. Do not admit an interim
         # request while final audio is queued or another inference is active;
         # a draft produced in that interval is stale by the time it renders.
-        if source.queue.qsize() > 0 or self._inference_lock.locked():
+        if source.queue.qsize() > 0 or (
+                self._partial_stt is None and self._inference_lock.locked()):
             self._partial_suppressed += 1
             self.state.set_meta(stt_partial_suppressed=self._partial_suppressed)
             return
@@ -1010,15 +1050,19 @@ class LiveTranscriber:
             captured_at, audio = item
             started = time.time()
             try:
-                if not self._inference_lock.acquire(blocking=False):
+                backend = self._partial_stt or self._stt
+                inference_lock = (self._partial_inference_lock
+                                  if self._partial_stt is not None
+                                  else self._inference_lock)
+                if not inference_lock.acquire(blocking=False):
                     self._partial_dropped += 1
                     self.state.set_meta(stt_partial_dropped=self._partial_dropped)
                     continue
                 try:
-                    out = self._stt.transcribe(  # type: ignore[attr-defined]
+                    out = backend.transcribe(  # type: ignore[attr-defined]
                         audio, prompt=self._prompt_for(source))
                 finally:
-                    self._inference_lock.release()
+                    inference_lock.release()
                 result = out if isinstance(out, STTResult) else STTResult(text=str(out or ""))
                 text = result.text.strip()
                 if (text and (not self.cfg.stt_hallucination_filter

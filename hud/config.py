@@ -25,6 +25,7 @@ CONFIG_PATH = Path.home() / ".config" / "zoom-recorder" / "config.json"
 DEFAULT_TRANSCRIPTION_MODEL_FILENAME = "ggml-large-v3-turbo-q5_0.bin"
 DEFAULT_TRANSCRIPTION_MODEL = ("~/.cache/whisper-cpp/" +
                                DEFAULT_TRANSCRIPTION_MODEL_FILENAME)
+DEFAULT_PARTIAL_TRANSCRIPTION_MODEL = "~/.cache/whisper-cpp/ggml-base.en.bin"
 DEFAULT_TRANSCRIPTION_MODEL_SHA1 = "e050f7970618a659205450ad97eb95a18d69c9ee"
 RECORDING_MODES = ("both", "mic", "system")
 
@@ -181,6 +182,7 @@ class HudConfig:
     # Local-only rolling interim recognition. Partial text is UI-only until it
     # survives the stability gate and becomes an authoritative transcript event.
     stt_partial_enabled: bool = True
+    stt_partial_model: Optional[str] = DEFAULT_PARTIAL_TRANSCRIPTION_MODEL
     stt_partial_window_seconds: float = 2.0
     stt_partial_interval_seconds: float = 0.8
 
@@ -335,6 +337,7 @@ def _defaults() -> Dict[str, Any]:
             "hallucination_filter": True,
             "context_prompt": True,
             "partial_enabled": True,
+            "partial_model": DEFAULT_PARTIAL_TRANSCRIPTION_MODEL,
             "partial_window_seconds": 2.0,
             "partial_interval_seconds": 0.8,
         },
@@ -455,6 +458,8 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_hallucination_filter=bool(stt.get("hallucination_filter", True)),
         stt_context_prompt=bool(stt.get("context_prompt", True)),
         stt_partial_enabled=bool(stt.get("partial_enabled", True)),
+        stt_partial_model=(str(stt.get("partial_model") or
+                               DEFAULT_PARTIAL_TRANSCRIPTION_MODEL)),
         stt_partial_window_seconds=_as_float(stt.get("partial_window_seconds"), 2.0),
         stt_partial_interval_seconds=_as_float(stt.get("partial_interval_seconds"), 0.8),
         answers_enabled=bool(answers.get("enabled", True)),
@@ -553,6 +558,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "hallucination_filter": cfg.stt_hallucination_filter,
         "context_prompt": cfg.stt_context_prompt,
         "partial_enabled": cfg.stt_partial_enabled,
+        "partial_model": cfg.stt_partial_model,
         "partial_window_seconds": cfg.stt_partial_window_seconds,
         "partial_interval_seconds": cfg.stt_partial_interval_seconds,
     })
