@@ -46,7 +46,7 @@ from hud.local_http import host_from_header, url_host  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
 from hud.memory import extract_memory, format_memory  # noqa: E402
 from hud.menu_state import describe  # noqa: E402
-from hud.replay import benchmark, replay  # noqa: E402
+from hud.replay import benchmark, replay, write_jsonl  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
 from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, _Source,  # noqa: E402
@@ -919,6 +919,44 @@ class MemoryAndReplayTests(unittest.TestCase):
                 self.assertTrue((outdir / "session.json").is_file())
                 self.assertTrue((outdir / "derived" / "live_events.jsonl").is_file())
                 self.assertEqual(result["status"], "stopped")
+
+    def test_process_forced_stop_and_restart_preserve_distinct_sessions(self) -> None:
+        import signal
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events_path = root / "events.jsonl"
+            write_jsonl(events_path, [
+                {"type": "transcript_partial", "source_key": "remote",
+                 "text": "We agreed to ship", "speaker": "Client", "revision": 1},
+                {"type": "transcript", "finalized": True,
+                 "text": "We agreed to ship next week.", "speaker": "Client"},
+                {"type": "transcript", "finalized": True,
+                 "text": "The restart must preserve the prior run.", "speaker": "Client"},
+            ])
+            for index in range(2):
+                ready = root / "ready-{}.json".format(index)
+                repo = Path(__file__).resolve().parent.parent
+                command = [sys.executable, "-m", "hud.lifecycle_process",
+                           str(events_path), "--outdir", str(root / "2026-09-22_run"),
+                           "--writeback-dir", str(root / "mirror"),
+                           "--ready-file", str(ready), "--interval", "0.05"]
+                process = subprocess.Popen(command, cwd=str(repo),
+                                            env=dict(os.environ, PYTHONPATH=str(repo)))
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not ready.exists():
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                time.sleep(0.08)
+                process.send_signal(signal.SIGTERM)
+                self.assertEqual(process.wait(timeout=5), 0)
+            sessions = sorted(path for path in root.iterdir()
+                              if path.is_dir() and (path / "session.json").is_file())
+            self.assertEqual(len(sessions), 2)
+            for session_dir in sessions:
+                self.assertTrue((session_dir / "derived" / "live_events.jsonl").is_file())
+                self.assertTrue((session_dir / "derived" / "live_diagnostics.json").is_file())
 
     def test_benchmark_manifest_loads_external_audio_without_claiming_readiness(self) -> None:
         manifest = Path(__file__).resolve().parent.parent / "fixtures/manifest.json"

@@ -114,9 +114,9 @@ degraded component.
 Gate: 100 repeated normal runs plus 20 injected-failure runs complete without an orphan process,
 deadlock, corrupt JSON, or unrecoverable next start.
 
-Current status: **100/100 normal deterministic lifecycle runs passed and 20/20 injected provider,
-STT, writeback, and permission runs preserved durable artifacts.** Forced-stop and restart are
-still separate checks before this gate is fully closed.
+Current status: **100/100 normal deterministic lifecycle runs passed, 20/20 injected provider,
+STT, writeback, and permission runs preserved durable artifacts, and the process-level forced-stop
+plus restart check passed with two distinct persisted sessions.** Phase 1.3 is complete.
 
 ### Step 1.4 — Add lifecycle observability — complete
 
