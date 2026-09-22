@@ -34,6 +34,7 @@ from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E4
                         load_config, save_config)
 from hud.diarization import (diarization_readiness,  # noqa: E402
                              run_post_call_diarization)
+from hud.evaluation import normalize_words, word_error_stats  # noqa: E402
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
 from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
@@ -862,6 +863,17 @@ class IdentityTests(unittest.TestCase):
 
 
 class MemoryAndReplayTests(unittest.TestCase):
+    def test_word_error_stats_normalizes_and_counts_edits(self) -> None:
+        self.assertEqual(normalize_words("Hello, WORLD! It's fine."),
+                         ["hello", "world", "it's", "fine"])
+        stats = word_error_stats("we ship next week", "we shipped next")
+        self.assertEqual(stats.substitutions, 1)
+        self.assertEqual(stats.deletions, 1)
+        self.assertEqual(stats.insertions, 0)
+        self.assertEqual(stats.errors, 2)
+        self.assertEqual(stats.reference_words, 4)
+        self.assertEqual(stats.wer, 0.5)
+
     def test_memory_extracts_exact_decision_and_number_evidence(self) -> None:
         items = extract_memory("We agreed to launch in Q3 with a $50,000 budget.",
                                "Client", 123.0, 7)

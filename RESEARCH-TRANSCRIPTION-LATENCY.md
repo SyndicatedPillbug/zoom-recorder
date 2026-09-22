@@ -108,9 +108,10 @@ an operational prerequisite for the expected local baseline.
 4. Only after those measurements, investigate Core ML or ANEForge encoder
    acceleration. Those paths accelerate the encoder only; they are promising,
    but they do not guarantee an equivalent end-to-end latency improvement.
-5. Add a small, dependency-free reference-aligned evaluator that reports word
-   error rate, substitutions, deletions, insertions, first stable word latency,
-   and final capture-to-text latency for each fixture/model/window policy.
+5. Use the new small, dependency-free reference-aligned evaluator for word
+   error rate, substitutions, deletions, and insertions. Extend the fixture
+   manifest with first-stable-word and final capture-to-text latency once
+   checked time-aligned references are available.
 
 ## Explicit non-recommendations
 

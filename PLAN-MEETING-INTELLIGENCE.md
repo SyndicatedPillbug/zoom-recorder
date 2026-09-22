@@ -120,10 +120,12 @@ time and suitable for frequent provisional windows. The smaller model still
 produces visibly weaker wording, so throughput alone cannot justify a smaller
 final model or a shorter interim window.
 
-The next deliverable is a dependency-free fixture evaluator with checked
-reference text. It will report WER plus substitutions, deletions, insertions,
-first-stable-word latency, and final capture-to-text latency. Interim window
-and local-agreement changes remain gated on that evidence.
+The dependency-free word-level evaluator is now implemented in
+`hud/evaluation.py` and covered by the full regression suite. It reports WER
+plus substitutions, deletions, and insertions from any checked reference and
+hypothesis text. Adding aligned fixture references, first-stable-word latency,
+and final capture-to-text latency is the remaining work; interim window and
+local-agreement changes remain gated on that evidence.
 
 ### Phase C — question finalization and answer evidence (implemented baseline)
 
