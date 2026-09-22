@@ -463,6 +463,7 @@ class AnswerEngine:
         self._id_cursor = 0
         self._seq = 0
         self._buffer: List[Turn] = []
+        self._pending_turns: List[Turn] = []
         self._last_question_seq = 0
         self._last_answer_id = 0
         self._qa_thread: List[Dict[str, Any]] = []
@@ -907,6 +908,30 @@ class AnswerEngine:
         return True
 
     # -- transcript buffer -------------------------------------------------
+    def _update_partial_question_draft(self, text: str, speaker: str,
+                                       speaker_id: str) -> None:
+        """Use provisional words for UI question drafting, never evidence."""
+        draft = str(text or "").strip()
+        if not draft:
+            return
+        prior = ""
+        for turn in reversed(self._pending_turns):
+            if ((speaker_id and turn.speaker_id == speaker_id) or
+                    (not speaker_id and turn.speaker == speaker)):
+                prior = turn.text
+                break
+        if not prior:
+            for turn in reversed(self._buffer):
+                if ((speaker_id and turn.speaker_id == speaker_id) or
+                        (not speaker_id and turn.speaker == speaker)):
+                    prior = turn.text
+                    break
+        candidate = (prior + " " + draft).strip()
+        question = detect_question_text(candidate)
+        if question and question != self._partial_question_draft:
+            self._partial_question_draft = question
+            self.state.set_meta(question_draft=question)
+
     def _drain_events(self) -> None:
         events = self.state.since(self._id_cursor)
         for event in events:
@@ -915,30 +940,23 @@ class AnswerEngine:
                 # This is a UI-only draft. It can help the user see a question
                 # forming, but it must never enter the authoritative buffer or
                 # an answer prompt until stable words arrive as transcript events.
-                draft = str(event.get("text") or "").strip()
                 speaker = event.get("speaker") or ""
                 speaker_id = event.get("speaker_id") or ""
-                if draft:
-                    prior = ""
-                    for turn in reversed(self._buffer):
-                        if ((speaker_id and turn.speaker_id == speaker_id) or
-                                (not speaker_id and turn.speaker == speaker)):
-                            prior = turn.text
-                            break
-                    candidate = (prior + " " + draft).strip()
-                    question = detect_question_text(candidate)
-                    if question and question != self._partial_question_draft:
-                        self._partial_question_draft = question
-                        self.state.set_meta(question_draft=question)
+                self._update_partial_question_draft(
+                    str(event.get("text") or ""), speaker, speaker_id)
                 continue
             if event.get("type") == "transcript_boundary":
                 speaker = event.get("speaker") or ""
                 speaker_id = event.get("speaker_id") or ""
-                for turn in reversed(self._buffer):
-                    if ((speaker_id and turn.speaker_id == speaker_id) or
-                            (not speaker_id and turn.speaker == speaker)):
+                matching = [turn for turn in self._pending_turns
+                            if ((speaker_id and turn.speaker_id == speaker_id) or
+                                (not speaker_id and turn.speaker == speaker))]
+                self._pending_turns = [turn for turn in self._pending_turns
+                                       if turn not in matching]
+                if not event.get("finalized", False):
+                    for turn in matching:
                         turn.finalized = True
-                        break
+                    self._buffer.extend(matching)
                 continue
             if event.get("type") == "transcript" and event.get("source") == "live":
                 text = str(event.get("text", "")).strip()
@@ -947,11 +965,16 @@ class AnswerEngine:
                 self._seq += 1
                 speaker = event.get("speaker") or ""
                 speaker_id = event.get("speaker_id") or ""
-                self._buffer.append(Turn(
+                turn = Turn(
                     seq=self._seq, ts=float(event.get("ts", time.time())),
                     speaker=speaker, text=text,
                     finalized=bool(event.get("finalized", True)),
-                    speaker_id=speaker_id))
+                    speaker_id=speaker_id)
+                if not turn.finalized:
+                    self._pending_turns.append(turn)
+                    self._update_partial_question_draft(text, speaker, speaker_id)
+                    continue
+                self._buffer.append(turn)
                 self._words_since_rolling += len(text.split())
                 # Feed each turn into the live transcript index so older
                 # conversation is retrievable by meaning, not just the
@@ -973,6 +996,7 @@ class AnswerEngine:
     def _trim_buffer(self) -> None:
         cutoff = time.time() - self.cfg.context_minutes * 60.0
         self._buffer = [t for t in self._buffer if t.ts >= cutoff][-400:]
+        self._pending_turns = [t for t in self._pending_turns if t.ts >= cutoff][-100:]
 
     def _context_text(self) -> str:
         text = "\n".join(_format_turn(t) for t in self._buffer).strip()

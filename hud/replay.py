@@ -45,7 +45,7 @@ def replay(events: Iterable[Dict[str, Any]]) -> LiveState:
         item.pop("id", None)
         item.pop("ts", None)
         added = state.add(etype, **item)
-        if etype == "transcript":
+        if etype == "transcript" and item.get("finalized", True):
             for memory_item in extract_memory(
                     str(item.get("text") or ""), str(item.get("speaker") or ""),
                     float(added.get("ts") or time.time()), int(added.get("id") or 0)):

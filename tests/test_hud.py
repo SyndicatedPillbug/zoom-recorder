@@ -1109,6 +1109,14 @@ class StateTests(unittest.TestCase):
         self.assertEqual(snap["partials"][0]["text"], "plan")
         self.assertNotIn("plan", state.transcript_text())
 
+    def test_nonfinal_transcript_events_stay_out_of_saved_outputs(self) -> None:
+        state = LiveState()
+        state.add("transcript", source="live", text="wrong draft", finalized=False)
+        state.add("transcript", source="live", text="correct final", finalized=True)
+        self.assertNotIn("wrong draft", state.transcript_text())
+        self.assertIn("correct final", state.transcript_text())
+        self.assertNotIn("wrong draft", state.timeline_markdown())
+
     def test_talking_points_dedupe_and_snapshot(self) -> None:
         state = LiveState()
         added = state.add_talking_points(["Price is $10 per seat.", "Ship in Q3."])

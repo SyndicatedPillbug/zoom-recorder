@@ -303,7 +303,9 @@ class LiveState:
 
     def transcript_text(self, since_ts: Optional[float] = None) -> str:
         with self._lock:
-            events = [e for e in self._events if e.get("type") == "transcript"]
+            events = [e for e in self._events
+                      if e.get("type") == "transcript"
+                      and e.get("finalized", True)]
             mappings = {key: dict(value) for key, value in self._speaker_mappings.items()}
         if since_ts is not None:
             events = [e for e in events if e.get("ts", 0) >= since_ts]
@@ -360,7 +362,8 @@ class LiveState:
         """
         with self._lock:
             events = [e for e in self._events
-                      if e.get("type") in ("transcript", "answer", "talking_point", "memory")]
+                      if e.get("type") in ("transcript", "answer", "talking_point", "memory")
+                      and (e.get("type") != "transcript" or e.get("finalized", True))]
             mappings = {key: dict(value) for key, value in self._speaker_mappings.items()}
         if not events:
             return ""
