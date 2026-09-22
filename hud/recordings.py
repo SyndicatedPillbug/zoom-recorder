@@ -75,12 +75,34 @@ def _session_started(day: str, name: str) -> str:
     return "{} {}".format(day, time_part)
 
 
+def _load_index(basedir: Path) -> Dict[str, Dict[str, Any]]:
+    try:
+        data = json.loads((basedir / ".recordings_index.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_index(basedir: Path, index: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        (basedir / ".recordings_index.json").write_text(
+            json.dumps(index, indent=0), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def list_recordings(basedir: str, limit: int = 200,
                     probe: bool = True) -> List[Recording]:
-    """Newest-first list of recording sessions under ``basedir``."""
+    """Newest-first list of recording sessions under ``basedir``.
+
+    Durations are cached by (path, mtime) in ``.recordings_index.json`` so the
+    list does not spawn ffprobe for every session on every open.
+    """
     root = Path(basedir).expanduser()
     if not root.is_dir():
         return []
+    index = _load_index(root) if probe else {}
+    dirty = False
     found: List[Recording] = []
     for day_dir in sorted(root.iterdir(), reverse=True):
         if not day_dir.is_dir() or not DAY_RE.match(day_dir.name):
@@ -102,8 +124,46 @@ def list_recordings(basedir: str, limit: int = 200,
             rec.summary = str(summary) if summary.is_file() else None
             source = mixed if mixed.is_file() else (mic if mic.is_file() else syswav)
             if probe and source.is_file():
-                rec.duration_s = _probe_duration(source)
+                try:
+                    mtime = source.stat().st_mtime
+                except OSError:
+                    mtime = 0
+                cached = index.get(str(session))
+                if cached and cached.get("mtime") == mtime:
+                    rec.duration_s = cached.get("duration")
+                else:
+                    rec.duration_s = _probe_duration(source)
+                    index[str(session)] = {"mtime": mtime, "duration": rec.duration_s}
+                    dirty = True
             found.append(rec)
             if len(found) >= limit:
+                if dirty:
+                    _save_index(root, index)
                 return found
+    if dirty:
+        _save_index(root, index)
     return found
+
+
+def move_to_trash(session_path: str, basedir: str) -> Dict[str, Any]:
+    """Move a session folder to ~/.Trash (never delete). Only paths under the
+    recordings folder that look like sessions are accepted."""
+    import shutil
+    import time as _time
+
+    root = Path(basedir).expanduser().resolve()
+    target = Path(session_path).expanduser().resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return {"ok": False, "error": "path not allowed"}
+    if not SESSION_RE.match(target.name):
+        return {"ok": False, "error": "not a recording folder"}
+    trash = Path.home() / ".Trash"
+    trash.mkdir(exist_ok=True)
+    dest = trash / "{}-{}".format(target.name, int(_time.time()))
+    try:
+        shutil.move(str(target), str(dest))
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "moved_to": str(dest)}

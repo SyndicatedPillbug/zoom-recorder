@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import List, Optional
 
 try:
-    from .devices import read_system_profiler, system_advice, system_priority
+    from .devices import read_system_profiler, system_priority
 except ImportError:  # plain script / -m from the repo root
-    from hud.devices import read_system_profiler, system_advice, system_priority  # type: ignore
+    from hud.devices import read_system_profiler, system_priority  # type: ignore
 
 MICROPHONE_SETTINGS_URL = ("x-apple.systempreferences:com.apple.preference."
                            "security?Privacy_Microphone")
@@ -82,13 +82,28 @@ def check_blackhole() -> Check:
 
 
 def check_routing() -> Check:
+    """Capability check, not a snapshot of the current default.
+
+    The normal between-recordings state is the real device (so hardware
+    volume keys work); the recorder switches to the Multi-Output Device while
+    recording and hands the real device back afterwards. Only a *bare*
+    loopback as the default output is a real problem (captured but inaudible).
+    """
     topo = read_system_profiler()
-    advice = system_advice(topo)
-    if advice:
-        return Check("audio routing", False, advice,
+    out = topo.device(topo.default_output)
+    if out is not None and out.is_aggregate:
+        return Check("audio routing", True,
+                     "recording setup is active ({})".format(out.name))
+    if out is not None and out.is_loopback and not out.is_aggregate:
+        return Check("audio routing", False, out.name,
                      "Run: ./zoom_record.py --fix-routing", critical=False)
+    good = [d.name for d in topo.loopbacks() if system_priority(d.name) >= 70]
+    if not good:
+        return Check("audio routing", False, "no loopback available",
+                     "brew install blackhole-2ch", critical=False)
     return Check("audio routing", True,
-                 "default output: {}".format(topo.default_output or "unknown"))
+                 "ready (sound plays through {}; switches automatically while "
+                 "recording)".format(topo.default_output or "your output"))
 
 
 def check_output_volume() -> Check:

@@ -719,13 +719,88 @@ def list_real_outputs(topo: Optional[Topology] = None) -> List[str]:
     return [d.name for d in real_outputs(topo or read_system_profiler())]
 
 
+def _ensure_multi_output(topo: Topology, physical_output: Optional[str]) -> Dict[str, object]:
+    """Create or rebuild the Multi-Output Device for the chosen pairing.
+
+    Deliberately does NOT touch the system default output: between recordings
+    the real device should stay the default (so hardware volume keys work),
+    and the recorder activates the Multi-Output only while recording. Returns
+    a dict: {ok, changed, message, device_id, loopback, physical}.
+    """
+    def fail(message: str) -> Dict[str, object]:
+        return {"ok": False, "changed": False, "message": message,
+                "device_id": None, "loopback": None, "physical": None}
+
+    loopbacks = sorted(
+        (d for d in topo.loopbacks() if system_priority(d.name) >= 70),
+        key=lambda d: system_priority(d.name), reverse=True)
+    if not loopbacks:
+        return fail("No general-purpose loopback found. Install BlackHole 2ch first:\n"
+                    "    brew install blackhole-2ch")
+    loopback = loopbacks[0]
+    state = load_state()
+    physical = choose_physical_output(topo, physical_output, state)
+    if physical is None:
+        return fail("Could not identify a real output device (speakers/headphones) "
+                    "to pair with '{}'.".format(loopback.name))
+    try:
+        ca = backend()
+        ca_devices = ca.devices()
+    except RoutingError as exc:
+        return fail(str(exc))
+    by_name = {d.name: d for d in ca_devices}
+    if loopback.name not in by_name or physical.name not in by_name:
+        return fail("A device disappeared while setting up; please try again.")
+    loop_uid = by_name[loopback.name].uid
+    phys_uid = by_name[physical.name].uid
+    existing = by_name.get(MULTI_OUTPUT_NAME)
+    action = decide_action(state, MULTI_OUTPUT_NAME if existing else None,
+                           loop_uid, phys_uid)
+    try:
+        if action == "rebuild" and existing is not None:
+            ca.destroy_aggregate(existing.object_id)
+            existing = None
+        if action == "rebuild":
+            device_id = ca.create_multi_output(MULTI_OUTPUT_NAME, [loop_uid, phys_uid], phys_uid)
+            changed = True
+        else:
+            device_id = existing.object_id
+            changed = False
+        save_state(loop_uid, loopback.name, phys_uid, physical.name)
+    except RoutingError as exc:
+        return fail(str(exc))
+    return {"ok": True, "changed": changed, "message": "", "device_id": device_id,
+            "loopback": loopback, "physical": physical}
+
+
+def pair_output(physical_output: Optional[str] = None,
+                topo: Optional[Topology] = None) -> FixResult:
+    """Choose what recordings play through, without changing the default output.
+
+    The Multi-Output Device is created/rebuilt to contain the loopback plus
+    this device, and the choice is remembered. The system default output is
+    left alone: the recorder switches to the Multi-Output when a recording
+    starts and hands the real device back when it stops.
+    """
+    topo = topo or read_system_profiler()
+    info = _ensure_multi_output(topo, physical_output)
+    if not info["ok"]:
+        return FixResult(False, False, str(info["message"]))
+    physical = info["physical"]
+    name = getattr(physical, "name", physical_output or "your output")
+    return FixResult(True, bool(info["changed"]),
+                     "Recordings will play through '{}' (and into the loopback).".format(name))
+
+
 def fix_routing(topo: Optional[Topology] = None,
                 physical_output: Optional[str] = None,
                 assume_yes: bool = False) -> FixResult:
-    """Create the Multi-Output Device and select it as default output.
+    """Create the Multi-Output Device AND select it as the default output.
 
-    Returns a FixResult; on failure the message contains the click-by-click
-    walkthrough so the user is never blocked.
+    This is the explicit "make capture work right now" action (CLI
+    --fix-routing, and the recorder's own loopback startup). The between-
+    recordings state is the real device; the recorder activates the
+    Multi-Output at start and calls deactivate_loopback() at stop.
     """
     topo = topo or read_system_profiler()
     loopbacks = sorted(
@@ -759,44 +834,26 @@ def fix_routing(topo: Optional[Topology] = None,
             return FixResult(False, False, "No output device selected; nothing changed.")
         physical = picked
 
+    info = _ensure_multi_output(topo, physical.name)
+    if not info["ok"]:
+        return FixResult(False, False, "{}\n\n{}".format(
+            info["message"],
+            walkthrough(loopback.name, physical.name, MULTI_OUTPUT_NAME)))
+
     try:
         ca = backend()
-        ca_devices = ca.devices()
-    except RoutingError as exc:
-        return FixResult(False, False, "{}\n\n{}".format(exc, _walkthrough_or_empty(loopback, physical)))
-
-    by_name = {d.name: d for d in ca_devices}
-    if loopback.name not in by_name or physical.name not in by_name:
-        return FixResult(False, False, _walkthrough_or_empty(loopback, physical))
-
-    loop_uid = by_name[loopback.name].uid
-    phys_uid = by_name[physical.name].uid
-    existing = by_name.get(MULTI_OUTPUT_NAME)
-    action = decide_action(state, MULTI_OUTPUT_NAME if existing else None,
-                           loop_uid, phys_uid)
-
-    try:
-        if action == "rebuild" and existing is not None:
-            ca.destroy_aggregate(existing.object_id)
-        if action == "rebuild":
-            new_id = ca.create_multi_output(MULTI_OUTPUT_NAME, [loop_uid, phys_uid], phys_uid)
-            ca.set_default_output(new_id)
-            save_state(loop_uid, loopback.name, phys_uid, physical.name)
-            return _verified_multi_output(
-                ca, new_id, changed=True,
-                detail="Rebuilt '{}' ({} + {}) and set it as the default output.".format(
-                    MULTI_OUTPUT_NAME, loopback.name, physical.name))
-        # Reuse: make sure the multi-output is the system default output.
-        ca.set_default_output(existing.object_id)
-        return _verified_multi_output(
-            ca, existing.object_id, changed=False,
-            detail="'{}' ({} + {}) is already correct; selected it as the default output.".format(
-                MULTI_OUTPUT_NAME, loopback.name, physical.name))
+        ca.set_default_output(info["device_id"])
     except RoutingError as exc:
         return FixResult(False, False, "macOS refused the automatic fix ({}). Any partially "
                                        "created device may still exist in Audio MIDI Setup under "
                                        "'{}'.\n\n{}".format(exc, MULTI_OUTPUT_NAME,
-                                                            walkthrough(loopback.name, physical.name, MULTI_OUTPUT_NAME)))
+                                                            walkthrough(loopback.name, physical.name,
+                                                                        MULTI_OUTPUT_NAME)))
+    detail = "{} '{}' ({} + {}) and set it as the default output.".format(
+        "Rebuilt" if info["changed"] else "Existing",
+        MULTI_OUTPUT_NAME, loopback.name, physical.name)
+    return _verified_multi_output(ca, info["device_id"],
+                                  changed=bool(info["changed"]), detail=detail)
 
 
 def _prompt_for_output(topo: Topology, default: AudioDevice) -> Optional[AudioDevice]:

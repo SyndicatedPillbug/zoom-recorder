@@ -119,7 +119,7 @@ def _read_pidfile(path: Path = PIDFILE) -> "int | None":
 
 class RecorderApp(rumps.App):
     def __init__(self) -> None:
-        super().__init__(IDLE_TITLE, quit_button="Quit")
+        super().__init__(IDLE_TITLE, quit_button=None)
         # Volume is deliberately the first top-level item so the current
         # level is visible at all times (its title carries the percentage).
         self.volume_item = rumps.MenuItem("Volume")
@@ -135,15 +135,31 @@ class RecorderApp(rumps.App):
         self.help_item = rumps.MenuItem("Help",
                                         callback=lambda _s: self.open_control("help"))
         self.audio_item = rumps.MenuItem("Play sound through")
+        self.quit_item = rumps.MenuItem("Quit zoom-recorder", callback=self.quit_app)
         self.menu = [self.volume_item, self.toggle_item, self.live_item,
                      self.open_hud_item, None,
                      self.recordings_item, self.setup_item, self.settings_item,
-                     self.help_item, None, self.audio_item]
+                     self.help_item, None, self.audio_item, None, self.quit_item]
         self._audio_sig = None
         self._volume_value = None
         self._volume_muted = None
         self._vol_drag_until = 0.0
         self._sync_ui()
+        # Recover from a previous SIGKILL/crash that left the recording audio
+        # setup selected: hand the real device back when nothing is recording.
+        try:
+            from hud import routing_fix
+            if _read_pidfile() is None and routing_fix.is_loopback_active():
+                routing_fix.deactivate_loopback()
+        except Exception:  # noqa: BLE001
+            pass
+        # First run: open the Setup wizard once so a new user is guided.
+        try:
+            from hud.config import load_config
+            if not load_config().onboarded:
+                self.open_control("setup")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _hud_active(self) -> bool:
         # The HUD writes its URL file on start and removes it on stop, so its
@@ -342,6 +358,27 @@ class RecorderApp(rumps.App):
             self._start()
         self._sync_ui()
 
+    def quit_app(self, _sender) -> None:
+        """Quit, but never orphan a recording: stop it and wait for the save."""
+        pid = _read_pidfile()
+        if pid is not None:
+            rumps.notification("zoom-recorder", "Finishing…",
+                               "Saving your recording before quitting")
+            try:
+                os.kill(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pid = None
+        if pid is not None:
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.5)
+        PIDFILE.unlink(missing_ok=True)
+        rumps.quit_application()
+
     def start_live(self, _sender) -> None:
         if _read_pidfile() is not None:
             return
@@ -410,6 +447,17 @@ class RecorderApp(rumps.App):
         rumps.notification("zoom-recorder", "Audio routing", detail)
 
     def _start(self, live: bool = False) -> None:
+        # Refuse a second recorder (another menu-bar instance or the CLI).
+        try:
+            from hud.config import load_config
+            from zoom_record import recorder_running
+            basedir = Path(load_config().recorder.basedir).expanduser()
+            if recorder_running(basedir):
+                rumps.notification("zoom-recorder", "Already recording",
+                                   "Another recording is in progress.")
+                return
+        except Exception:  # noqa: BLE001
+            pass
         args = [sys.executable, str(RECORDER)]
         extra = os.environ.get("ZOOM_RECORDER_ARGS")
         if extra:
@@ -423,13 +471,15 @@ class RecorderApp(rumps.App):
                            if live else "Click 🎙 again to stop")
 
     def _stop(self, pid: int) -> None:
+        # Send the clean stop signal but keep the pidfile until the process
+        # actually exits: it still has to merge, verify and archive, and a
+        # second recording must not start in the meantime.
         try:
             os.kill(pid, signal.SIGINT)
         except ProcessLookupError:
             pass
-        PIDFILE.unlink(missing_ok=True)
-        rumps.notification("zoom-recorder", "Saved",
-                           "Your recording and transcript are in My recordings")
+        rumps.notification("zoom-recorder", "Finishing…",
+                           "Saving your recording and transcript")
 
     @rumps.timer(1)
     def _poll(self, _sender) -> None:

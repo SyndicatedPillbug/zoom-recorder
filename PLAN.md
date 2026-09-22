@@ -540,3 +540,38 @@ and accepted any loopback that merely *opened*, even a silent one.
   disconnection instead of staying stale, the Settings autostart has its own
   status element, and the server sends `Connection: close` to avoid
   hand-rolled keep-alive edge cases.
+- **Pairing vs. activation (`v2.0.2`)**: the Setup output picker called
+  `fix_routing`, which activates the Multi-Output Device as the system default
+  output -- undoing the auto-restore-to-real-device behavior between
+  recordings. New `routing_fix.pair_output()` creates/rebuilds the device for
+  the chosen output and remembers it WITHOUT touching the default output;
+  `fix_routing` (CLI `--fix-routing`, the recorder's loopback startup) keeps
+  the activate-and-verify behavior, and `deactivate_loopback` still hands the
+  real device back at stop. The Control Center's output picker uses `pair`
+  (and the doctor's fix button uses `restore` for the bare-loopback misroute).
+  `doctor.check_routing` is now capability-aware: a real device as the default
+  output is the normal, correct state (it reports "switches automatically
+  while recording") and only a bare loopback default is flagged.
+- **Audit hardening (`v2.1-audit`)**: a full self-audit produced four passes.
+  *Security*: the Control Center's terminal action is a server-side whitelist
+  (the client sends a key, never a command); model downloads are limited to
+  known filenames; `/api/open` only opens files under the recordings folder or
+  the fixed doc set (no `.app`/scripts); HTML carries `Referrer-Policy:
+  no-referrer` + `nosniff` and the token is stripped from the URL via
+  `history.replaceState` (all calls use `X-Auth-Token`); marker files are
+  `chmod 0600`; blocked Terminal automation falls back to a copyable command.
+  *Reliability*: `/api/status` no longer runs the doctor/microphone probe
+  (new on-demand `/api/checks`, and no mic probe while recording); Setup state
+  is applied once so the poll cannot clobber edits; test recordings refuse to
+  start during a real recording; a startup recovery hands the default output
+  back if a crash left the Multi-Output selected; segments are written under
+  `outdir/.work` so a `kill -9` leaves them recoverable; the pidfile is kept
+  until the recorder exits (no second start during merge); a recorder lock
+  prevents concurrent recorders; topology TTL 5s -> 30s (far fewer
+  `system_profiler` calls during a call). *UX*: first run auto-opens Setup and
+  runs the checks; **Quit zoom-recorder** stops and saves before exiting;
+  Settings edits survive tab switches; recordings can be **moved to Trash**
+  (never deleted) and durations are cached; low-disk warnings; the folder
+  picker rejects TCC-protected locations; Bluetooth-headset help; stale test
+  temp dirs are cleaned. *Tests*: whitelist/lock/cache/status-split coverage
+  and test isolation (no more writes to the real state file).

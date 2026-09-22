@@ -104,6 +104,7 @@ class LiveSession:
 
         try:
             HUD_URLFILE.write_text(self.url, encoding="utf-8")
+            os.chmod(str(HUD_URLFILE), 0o600)
         except OSError:
             pass
 

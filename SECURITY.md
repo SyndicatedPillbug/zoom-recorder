@@ -53,10 +53,26 @@ and it is strictly opt-in.
 - Menu-bar log: `~/Library/Logs/zoom-recorder-menubar.log`.
 
 The **Control Center** (Setup / Recordings / Settings / Help) is a local web
-page served on `127.0.0.1` with a random per-run token, exactly like the
+page served on `[IP_ADDRESS]` with a random per-run token, exactly like the
 settings GUI; it shuts itself down when idle, sends no data anywhere, and
 never exposes stored API keys to the browser. See `QUICKSTART.md` for the
 non-technical walkthrough.
+
+Security posture of the local servers (Control Center, settings GUI, live HUD):
+
+- **Loopback only** (`[IP_ADDRESS]`/`localhost`), with a `Host` check against
+  DNS-rebinding.
+- A **random per-run token**; HTML responses carry `Referrer-Policy:
+  no-referrer` and the page strips the token from the URL immediately, sending
+  it in an `X-Auth-Token` header instead.
+- Marker/URL files (`~/.zoom_recorder_*.url`, `*.pid`) are `chmod 0600`.
+- The Control Center's privileged actions are **whitelisted server-side**: the
+  terminal helper runs only fixed install commands (`brew install ...`) and the
+  model downloader accepts only known whisper model filenames. `/api/open` can
+  only open files under the recordings folder or the fixed documentation set.
+- Recordings are **unencrypted** on disk (your own files, as with any audio
+  recorder). API keys are stored plaintext in a `0600` config file; the
+  environment is preferred.
 
 ## Network
 

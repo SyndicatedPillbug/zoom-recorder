@@ -126,7 +126,7 @@ class Topology:
 _CACHE: Dict[str, object] = {"at": 0.0, "topo": None}
 
 
-def load_topology(force: bool = False, ttl: float = 5.0) -> Topology:
+def load_topology(force: bool = False, ttl: float = 30.0) -> Topology:
     now = time.time()
     cached = _CACHE.get("topo")
     if not force and isinstance(cached, Topology) and now - float(_CACHE["at"]) < ttl:

@@ -72,6 +72,8 @@ class SettingsApp:
             try:
                 SETTINGS_PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
                 SETTINGS_URLFILE.write_text(self.url, encoding="utf-8")
+                os.chmod(str(SETTINGS_PIDFILE), 0o600)
+                os.chmod(str(SETTINGS_URLFILE), 0o600)
             except OSError:
                 pass
         self.log("settings GUI at {}".format(self.url))

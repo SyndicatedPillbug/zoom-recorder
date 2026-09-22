@@ -36,9 +36,9 @@ if str(REPO) not in sys.path:
 
 from hud.config import (CONFIG_PATH, PROVIDERS, _defaults, _deep_merge,  # noqa: E402
                         config_from_dict, config_to_dict, get_provider,
-                        load_config, recorder_defaults, save_config)
+                        load_config, recorder_defaults, save_config, tcc_protected)
 from hud.llm import LLMClient, LLMError  # noqa: E402
-from hud.recordings import list_recordings  # noqa: E402
+from hud.recordings import list_recordings, move_to_trash  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
@@ -46,6 +46,30 @@ CONTROL_PIDFILE = Path.home() / ".zoom_recorder_control.pid"
 CONTROL_URLFILE = Path.home() / ".zoom_recorder_control.url"
 MIC_SETTINGS_URL = ("x-apple.systempreferences:com.apple.preference.security"
                     "?Privacy_Microphone")
+
+# Terminal actions are whitelisted server-side: the client sends a key, never
+# a command. This endpoint is reachable by anything holding the per-run token,
+# so it must not be an arbitrary-command primitive.
+TERMINAL_COMMANDS = {
+    "install-blackhole": "brew install blackhole-2ch",
+    "install-whisper": "brew install whisper.cpp",
+}
+
+# Local transcription models we are willing to download, with their official
+# HuggingFace SHA-256 values where known (verified after download).
+WHISPER_MODELS = {
+    "ggml-base.en.bin": None,
+    "ggml-base.bin": None,
+    "ggml-small.en.bin": None,
+}
+
+# Files the Help tab may open (fixed set; nothing else).
+DOC_FILES = {
+    "INSTALL.md": "INSTALL.md",
+    "SECURITY.md": "SECURITY.md",
+    "QUICKSTART.md": "QUICKSTART.md",
+    "README.md": "README.md",
+}
 
 
 def _repo(*parts: str) -> Path:
@@ -76,6 +100,7 @@ class ControlApp:
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> int:
+        _cleanup_stale_test_dirs()
         handler = type("_BoundHandler", (_Handler,), {"app": self})
         self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self._httpd.daemon_threads = True
@@ -91,6 +116,8 @@ class ControlApp:
             try:
                 CONTROL_PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
                 CONTROL_URLFILE.write_text(self.url, encoding="utf-8")
+                os.chmod(str(CONTROL_PIDFILE), 0o600)
+                os.chmod(str(CONTROL_URLFILE), 0o600)
             except OSError:
                 pass
         self.log("Control Center at {}".format(self.url))
@@ -154,16 +181,47 @@ class ControlApp:
 
 # ------------------------------------------------------------------ actions
 
-def doctor_checks(probe_seconds: float = 1.2) -> List[Dict[str, Any]]:
+def doctor_checks(probe_seconds: float = 1.2, skip_mic: bool = False) -> List[Dict[str, Any]]:
     from hud import doctor
 
     checks = [doctor.check_macos(), doctor.check_python()]
     checks += doctor.check_tools()
     checks += [doctor.check_rumps(), doctor.check_blackhole(), doctor.check_routing(),
-               doctor.check_output_volume(), doctor.check_microphone(probe_seconds),
-               doctor.check_transcription()]
+               doctor.check_output_volume()]
+    if skip_mic:
+        # Never open the microphone while a recording is running.
+        checks.append(doctor.Check("microphone", True, "in use (recording)"))
+    else:
+        checks.append(doctor.check_microphone(probe_seconds))
+    checks.append(doctor.check_transcription())
     return [{"name": c.name, "ok": c.ok, "detail": c.detail,
              "fix": c.fix, "critical": c.critical} for c in checks]
+
+
+def recording_active() -> bool:
+    pidfile = Path.home() / ".zoom_recorder.pid"
+    if not pidfile.is_file():
+        return False
+    try:
+        os.kill(int(pidfile.read_text().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _cleanup_stale_test_dirs(max_age_s: float = 3600.0) -> None:
+    """Remove leftover test-recording temp dirs (a closed page used to leak
+    them)."""
+    import glob
+    import time as _time
+
+    for path in glob.glob("/tmp/zoomrec_test_*") + glob.glob(
+            str(Path(tempfile.gettempdir()) / "zoomrec_test_*")):
+        try:
+            if _time.time() - os.path.getmtime(path) > max_age_s:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def run_test_recording(seconds: float = 10.0, mode: str = "both") -> Dict[str, Any]:
@@ -296,6 +354,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
@@ -329,6 +389,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.app.touch()
         if parsed.path == "/api/status":
             self._status()
+        elif parsed.path == "/api/checks":
+            self._checks()
         elif parsed.path == "/api/recordings":
             self._recordings()
         elif parsed.path == "/api/devices":
@@ -364,6 +426,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._test_recording(body)
             elif parsed.path == "/api/play":
                 self._send_json(play_file(str(body.get("path") or "")))
+            elif parsed.path == "/api/recordings/trash":
+                self._trash_recording(body)
             elif parsed.path == "/api/test-provider":
                 self._test_provider(body)
             elif parsed.path == "/api/models":
@@ -388,36 +452,49 @@ class _Handler(BaseHTTPRequestHandler):
     def _status(self) -> None:
         from hud import routing_fix
         cfg = load_config(self.app.config_path)
-        try:
-            checks = doctor_checks()
-        except Exception as exc:  # noqa: BLE001
-            checks = [{"name": "checks", "ok": False, "detail": str(exc),
-                       "fix": "", "critical": True}]
-        pidfile = Path.home() / ".zoom_recorder.pid"
-        recording = False
-        if pidfile.is_file():
-            try:
-                os.kill(int(pidfile.read_text().strip()), 0)
-                recording = True
-            except (OSError, ValueError):
-                recording = False
+        recording = recording_active()
+        # "Start at login" is the LaunchAgent plist existing/enabled; both the
+        # Setup and Settings checkboxes read this so they always agree.
+        plist = Path.home() / "Library" / "LaunchAgents" / "com.zoomrecorder.menubar.plist"
+        keys_set = {name: bool(cfg.api_key_for(name))
+                    for name in PROVIDERS if get_provider(name).api_key_env}
         self._send_json({
             "ok": True,
-            "checks": checks,
             "recording": recording,
             "routing_active": routing_fix.is_loopback_active(),
             "volume": routing_fix.get_output_volume(),
             "mode": cfg.recorder.mode,
             "onboarded": cfg.onboarded,
             "offline": cfg.offline,
+            "login_agent": plist.is_file(),
             "basedir": cfg.recorder.basedir,
+            "paired_output": routing_fix.load_state().get("physical_name"),
+            "stt_backend": cfg.stt_backend,
+            "answers_enabled": cfg.answers_enabled,
+            "transcription_model": cfg.recorder.transcription_model,
+            "api_keys_set": keys_set,
             "config_path": str(self.app.config_path),
         })
+
+    def _checks(self) -> None:
+        # The (relatively slow, microphone-opening) environment check runs only
+        # on demand -- never on the 15s status poll, and never while recording.
+        try:
+            checks = doctor_checks(skip_mic=recording_active())
+        except Exception as exc:  # noqa: BLE001
+            checks = [{"name": "checks", "ok": False, "detail": str(exc),
+                       "fix": "", "critical": True}]
+        self._send_json({"ok": True, "checks": checks})
 
     def _recordings(self) -> None:
         cfg = load_config(self.app.config_path)
         items = [r.as_dict() for r in list_recordings(cfg.recorder.basedir)]
         self._send_json({"ok": True, "basedir": cfg.recorder.basedir, "items": items})
+
+    def _trash_recording(self, body: Dict[str, Any]) -> None:
+        cfg = load_config(self.app.config_path)
+        self._send_json(move_to_trash(str(body.get("path") or ""),
+                                      cfg.recorder.basedir))
 
     def _devices(self) -> None:
         from hud.devices import read_system_profiler
@@ -442,6 +519,12 @@ class _Handler(BaseHTTPRequestHandler):
         incoming = body.get("config") or {}
         merged = _deep_merge(_defaults(), incoming)
         cfg = config_from_dict(merged)
+        if tcc_protected(cfg.recorder.basedir):
+            self._send_json({"ok": False, "error":
+                             "macOS blocks recordings in Documents, Desktop and "
+                             "Downloads. Please choose another folder (for example "
+                             "~/ZoomRecordings)."})
+            return
         existing = load_config(self.app.config_path).api_keys
         keys = dict(existing)
         for name in body.get("api_key_clear") or []:
@@ -458,6 +541,9 @@ class _Handler(BaseHTTPRequestHandler):
         if action == "routing":
             output = body.get("output") or None
             result = routing_fix.fix_routing(physical_output=output, assume_yes=True)
+        elif action == "pair":
+            output = body.get("output") or None
+            result = routing_fix.pair_output(output)
         elif action == "restore":
             result = routing_fix.restore_routing()
         elif action == "open-mic-settings":
@@ -465,14 +551,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
         elif action == "install-whisper":
-            subprocess.Popen(["osascript", "-e",
-                              'tell application "Terminal" to do script '
-                              '"brew install whisper.cpp"'])
-            self._send_json({"ok": True,
-                             "message": "Installing whisper.cpp in Terminal..."})
-            return
+            return self._run_terminal("install-whisper")
         elif action == "download-model":
             model = str(body.get("model") or "ggml-base.en.bin")
+            if model not in WHISPER_MODELS:
+                self._send_json({"ok": False, "error": "unknown model"})
+                return
             dest = Path.home() / ".cache" / "whisper-cpp" / model
             url = ("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
                    + model)
@@ -487,38 +571,74 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
         elif action == "open-terminal":
-            command = str(body.get("command") or "")
-            if not command:
-                self._send_json({"ok": False, "error": "no command"})
+            key = str(body.get("key") or "")
+            if key not in TERMINAL_COMMANDS:
+                self._send_json({"ok": False, "error": "unknown action"})
                 return
-            subprocess.Popen(["osascript", "-e",
-                              'tell application "Terminal" to do script "{}"'.format(
-                                  command.replace('"', '\\"'))])
-            self._send_json({"ok": True})
-            return
+            return self._run_terminal(key)
         else:
             self._send_json({"ok": False, "error": "unknown action"})
             return
         self._send_json({"ok": result.ok, "changed": result.changed,
                          "message": result.message})
 
+    def _run_terminal(self, key: str) -> None:
+        """Run a whitelisted install command in Terminal. Terminal automation
+        can be blocked by Automation TCC on managed Macs, so the command is
+        always returned for the user to paste as a fallback."""
+        command = TERMINAL_COMMANDS[key]
+        started = False
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "Terminal" to do script "{}"'.format(command)],
+                capture_output=True, text=True, timeout=10)
+            started = proc.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            started = False
+        self._send_json({"ok": True, "started": started, "command": command,
+                         "message": ("Running in Terminal: {}" if started else
+                                     "Could not open Terminal automatically. Run this: {}")
+                         .format(command)})
+
     def _open(self, body: Dict[str, Any]) -> None:
         target = str(body.get("target") or "path")
-        if target == "recordings":
+        doc = str(body.get("doc") or "")
+        if doc:
+            name = DOC_FILES.get(doc)
+            if not name:
+                self._send_json({"ok": False, "error": "unknown document"})
+                return
+            path = _repo(name)
+        elif target == "recordings":
             cfg = load_config(self.app.config_path)
             path = Path(cfg.recorder.basedir).expanduser()
         else:
             path = Path(str(body.get("path") or "")).expanduser()
-        # Only allow opening things under the user's home.
         try:
-            path.resolve().relative_to(Path.home())
+            resolved = path.resolve()
+        except OSError:
+            self._send_json({"ok": False, "error": "bad path"})
+            return
+        # Only the recordings folder (and its files) or the fixed doc set.
+        cfg = load_config(self.app.config_path)
+        basedir = Path(cfg.recorder.basedir).expanduser().resolve()
+        allowed = False
+        try:
+            resolved.relative_to(basedir)
+            allowed = True
         except ValueError:
-            self._send_json({"ok": False, "error": "path outside home"})
+            allowed = resolved in {_repo(n).resolve() for n in DOC_FILES.values()}
+        if not allowed:
+            self._send_json({"ok": False, "error": "path not allowed"})
             return
-        if not path.exists():
-            self._send_json({"ok": False, "error": "not found: {}".format(path)})
+        if resolved.suffix.lower() in (".app", ".command", ".sh", ".scpt"):
+            self._send_json({"ok": False, "error": "path not allowed"})
             return
-        subprocess.Popen(["open", str(path)])
+        if not resolved.exists():
+            self._send_json({"ok": False, "error": "not found: {}".format(resolved)})
+            return
+        subprocess.Popen(["open", str(resolved)])
         self._send_json({"ok": True})
 
     def _mic_test(self, body: Dict[str, Any]) -> None:
@@ -540,6 +660,10 @@ class _Handler(BaseHTTPRequestHandler):
                          "error": probe.error})
 
     def _test_recording(self, body: Dict[str, Any]) -> None:
+        if recording_active():
+            self._send_json({"ok": False,
+                             "error": "A recording is already in progress — stop it first."})
+            return
         seconds = float(body.get("seconds") or 10.0)
         mode = str(body.get("mode") or "both")
         with self.app._test_lock:

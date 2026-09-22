@@ -161,14 +161,15 @@ Check my audio setup…                                    (Control Center → S
 Settings…                                                (Control Center → Settings)
 Help                                                     (Control Center → Help)
 Play sound through ▸                                     (device pairing, Reset audio)
-Quit
+Quit zoom-recorder                                       (stops and saves if recording)
 ```
 
 The **Control Center** (`hud/control.py`) is a local, loopback-only page with
 four tabs — Setup (guided checks, microphone test, output picker, a ten-second
 test recording, transcription setup), Recordings (past sessions with
-transcript/summary/play/Show-in-Finder), Settings (Basics + Advanced), and
-Help. The first run opens Setup once.
+transcript/summary/play/Show-in-Finder, plus **Move to Trash** — recordings are
+never permanently deleted), Settings (Basics + Advanced), and
+Help. The first run opens Setup automatically and runs the audio check.
 
 Click "Stop recording" to send the same clean-shutdown signal Ctrl+C would;
 **Open transcript window** re-opens the window in the browser (you can also

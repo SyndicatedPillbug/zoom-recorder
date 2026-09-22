@@ -1530,6 +1530,7 @@ class RoutingFixTests(unittest.TestCase):
                 calls.append(("default", did))
 
         with mock.patch.object(routing_fix, "load_state", return_value=state), \
+                mock.patch.object(routing_fix, "save_state"), \
                 mock.patch.object(routing_fix, "backend", return_value=FakeCA()), \
                 mock.patch.object(routing_fix, "_verified_multi_output",
                                   side_effect=lambda _ca, did, changed, detail:
@@ -1579,6 +1580,7 @@ class RoutingFixTests(unittest.TestCase):
                 calls.append(("default", did))
 
         with mock.patch.object(routing_fix, "load_state", return_value=state), \
+                mock.patch.object(routing_fix, "save_state"), \
                 mock.patch.object(routing_fix, "backend", return_value=FakeCA()), \
                 mock.patch.object(routing_fix, "_verified_multi_output",
                                   side_effect=lambda _ca, did, changed, detail:
@@ -2061,6 +2063,67 @@ class ControlCenterTests(unittest.TestCase):
             self.assertTrue(all(kwargs.get("start_new_session")
                                 for _cmd, kwargs in calls))
 
+    def test_status_reports_login_agent_state(self) -> None:
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "Library" / "LaunchAgents").mkdir(parents=True)
+            app, port = self._server(tmp)
+            url = "http://127.0.0.1:{}/api/status?token={}".format(port, app.token)
+            with mock.patch.object(Path, "home", return_value=home):
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    status = json.loads(resp.read())
+                    self.assertFalse(status["login_agent"])
+                    # the Setup/Settings controls read these back on load
+                    for key in ("mode", "paired_output", "stt_backend",
+                                "answers_enabled", "transcription_model",
+                                "api_keys_set"):
+                        self.assertIn(key, status)
+                # a saved key is reported so the UI can tell the user
+                (Path(tmp) / "config.json").write_text(
+                    json.dumps({"api_keys": {"groq": "test-key"}}), encoding="utf-8")
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    keys = json.loads(resp.read())["api_keys_set"]
+                    self.assertTrue(keys["groq"])
+                    self.assertFalse(keys["openai"])
+                (home / "Library" / "LaunchAgents" /
+                 "com.zoomrecorder.menubar.plist").write_text("<plist/>", encoding="utf-8")
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    self.assertTrue(json.loads(resp.read())["login_agent"])
+
+    def test_status_and_checks_are_split(self) -> None:
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:{}/api/status?token={}".format(port, app.token),
+                    timeout=5) as resp:
+                status = json.loads(resp.read())
+            self.assertNotIn("checks", status)          # no mic probe on the poll
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:{}/api/checks?token={}".format(port, app.token),
+                    timeout=30) as resp:
+                checks = json.loads(resp.read())
+            self.assertTrue(checks["ok"])
+            self.assertTrue(checks["checks"])
+
+    def test_test_recording_refused_while_recording(self) -> None:
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            with mock.patch("hud.control.recording_active", return_value=True):
+                req = urllib.request.Request(
+                    "http://127.0.0.1:{}/api/test-recording?token={}".format(port, app.token),
+                    method="POST", data=b'{"seconds": 1}',
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    out = json.loads(resp.read())
+            self.assertFalse(out["ok"])
+            self.assertIn("already in progress", out["error"])
+
     def test_autostart_script_dry_runs(self) -> None:
         import platform
         import subprocess
@@ -2073,6 +2136,205 @@ class ControlCenterTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=30)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("dry-run", proc.stdout)
+
+
+class PairingTests(unittest.TestCase):
+    def _topo(self):
+        from hud import devices
+
+        topo = devices.Topology(default_output="MacBook Air Speakers")
+        topo.devices = [
+            devices.AudioDevice(name="BlackHole 2ch", transport="virtual",
+                                input_channels=2, output_channels=2),
+            devices.AudioDevice(name="MacBook Air Speakers", transport="builtin",
+                                output_channels=2),
+        ]
+        return topo
+
+    def test_pair_output_does_not_touch_default_output(self) -> None:
+        """Regression: choosing an output must not activate the Multi-Output
+        Device (that undid the auto-restore-to-real-device behavior)."""
+        from hud import routing_fix
+
+        calls = []
+
+        class FakeCA:
+            def devices(self):
+                return [routing_fix.CaDevice(1, "BlackHole 2ch", "bh"),
+                        routing_fix.CaDevice(2, "MacBook Air Speakers", "spk")]
+
+            def create_multi_output(self, name, subs, master):
+                calls.append(("create", name, tuple(subs), master))
+                return 42
+
+            def destroy_aggregate(self, did):
+                calls.append(("destroy", did))
+
+            def set_default_output(self, did):
+                calls.append(("default", did))
+
+        with mock.patch.object(routing_fix, "backend", return_value=FakeCA()), \
+                mock.patch.object(routing_fix, "load_state", return_value={}), \
+                mock.patch.object(routing_fix, "save_state") as save:
+            result = routing_fix.pair_output("MacBook Air Speakers", topo=self._topo())
+
+        self.assertTrue(result.ok)
+        self.assertIn(("create", routing_fix.MULTI_OUTPUT_NAME,
+                       ("bh", "spk"), "spk"), calls)
+        self.assertNotIn(("default", 42), calls)
+        self.assertFalse(any(c[0] == "default" for c in calls))
+        save.assert_called_once()
+
+    def test_pair_output_rebuilds_when_stored_pairing_changed(self) -> None:
+        from hud import routing_fix
+
+        calls = []
+
+        class FakeCA:
+            def devices(self):
+                return [routing_fix.CaDevice(1, "BlackHole 2ch", "bh"),
+                        routing_fix.CaDevice(2, "MacBook Air Speakers", "spk"),
+                        routing_fix.CaDevice(3, routing_fix.MULTI_OUTPUT_NAME, "agg")]
+
+            def create_multi_output(self, *args):
+                calls.append("create")
+                return 42
+
+            def destroy_aggregate(self, did):
+                calls.append(("destroy", did))
+
+            def set_default_output(self, did):
+                calls.append(("default", did))
+
+        state = {"multi_output_name": routing_fix.MULTI_OUTPUT_NAME,
+                 "loopback_uid": "bh", "physical_uid": "old-device"}
+        with mock.patch.object(routing_fix, "backend", return_value=FakeCA()), \
+                mock.patch.object(routing_fix, "load_state", return_value=state), \
+                mock.patch.object(routing_fix, "save_state"):
+            result = routing_fix.pair_output("MacBook Air Speakers", topo=self._topo())
+        self.assertTrue(result.ok)
+        self.assertTrue(result.changed)
+        self.assertIn(("destroy", 3), calls)
+        self.assertIn("create", calls)
+        self.assertFalse(any(c == "default" or (isinstance(c, tuple) and c[0] == "default")
+                             for c in calls))
+
+    def test_doctor_routing_is_capability_aware(self) -> None:
+        from hud import doctor, devices
+
+        def topo(default_name, aggregate=False):
+            t = devices.Topology(default_output=default_name)
+            t.devices = [
+                devices.AudioDevice(name="BlackHole 2ch", transport="virtual",
+                                    input_channels=2, output_channels=2),
+                devices.AudioDevice(name="MacBook Air Speakers", transport="builtin",
+                                    output_channels=2),
+                devices.AudioDevice(name=default_name, transport="aggregate",
+                                    input_channels=2, output_channels=2),
+            ]
+            return t
+
+        with mock.patch.object(doctor, "read_system_profiler",
+                               return_value=topo("MacBook Air Speakers")):
+            self.assertTrue(doctor.check_routing().ok)          # real device = normal
+        with mock.patch.object(doctor, "read_system_profiler",
+                               return_value=topo("BlackHole 2ch")):
+            check = doctor.check_routing()
+            self.assertFalse(check.ok)                          # bare loopback = problem
+            self.assertFalse(check.critical)
+        with mock.patch.object(doctor, "read_system_profiler",
+                               return_value=topo("zoom-recorder Multi-Output", True)):
+            self.assertTrue(doctor.check_routing().ok)          # active setup
+
+
+class AuditHardeningTests(unittest.TestCase):
+    def _server(self, tmp):
+        from hud.control import ControlApp
+
+        app = ControlApp(port=0, config_path=Path(tmp) / "config.json",
+                         markers=False, idle_timeout=0, open_browser=False)
+        app.start()
+        self.addCleanup(app.stop)
+        return app, app.port
+
+    def _post(self, port, token, path, body):
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:{}/{}?token={}".format(port, path, token),
+            method="POST", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+
+    def test_terminal_commands_are_whitelisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            bad = self._post(port, app.token, "api/fix",
+                             {"action": "open-terminal", "key": "rm -rf /"})
+            self.assertFalse(bad["ok"])
+            good = self._post(port, app.token, "api/fix",
+                              {"action": "open-terminal", "key": "install-blackhole"})
+            self.assertTrue(good["ok"])
+            self.assertEqual(good["command"], "brew install blackhole-2ch")
+
+    def test_download_model_rejects_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            out = self._post(port, app.token, "api/fix",
+                             {"action": "download-model", "model": "../../evil"})
+            self.assertFalse(out["ok"])
+
+    def test_open_is_restricted_to_recordings_and_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            outside = self._post(port, app.token, "api/open",
+                                 {"path": str(Path.home() / ".ssh")})
+            self.assertFalse(outside["ok"])
+            unknown_doc = self._post(port, app.token, "api/open", {"doc": "passwd"})
+            self.assertFalse(unknown_doc["ok"])
+            good_doc = self._post(port, app.token, "api/open", {"doc": "SECURITY.md"})
+            self.assertTrue(good_doc["ok"])
+
+    def test_recorder_lock(self) -> None:
+        from zoom_record import (acquire_recorder_lock, recorder_lock_path,
+                                 recorder_running, release_recorder_lock)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.assertFalse(recorder_running(base))
+            self.assertTrue(acquire_recorder_lock(base))
+            self.assertTrue(recorder_running(base))          # our own live pid
+            release_recorder_lock(base)
+            self.assertFalse(recorder_running(base))
+            # a stale pid is cleaned up
+            recorder_lock_path(base).write_text("999999", encoding="utf-8")
+            self.assertFalse(recorder_running(base))
+
+    def test_tcc_protected(self) -> None:
+        from hud.config import tcc_protected
+
+        home = Path.home()
+        self.assertTrue(tcc_protected(home / "Documents" / "ZoomRecordings"))
+        self.assertTrue(tcc_protected(home / "Downloads"))
+        self.assertFalse(tcc_protected(home / "ZoomRecordings"))
+
+    def test_recordings_duration_cache(self) -> None:
+        from hud import recordings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            day = Path(tmp) / "2026-09-18"
+            session = day / "10-00-00_abcd1234"
+            (session / "derived").mkdir(parents=True)
+            mixed = session / "derived" / "recording_mixed.wav"
+            mixed.write_bytes(b"RIFF")
+            # seed the cache with this file's mtime
+            mtime = mixed.stat().st_mtime
+            (Path(tmp) / ".recordings_index.json").write_text(json.dumps({
+                str(session): {"mtime": mtime, "duration": 42.0}}), encoding="utf-8")
+            with mock.patch.object(recordings, "_probe_duration") as probe:
+                items = recordings.list_recordings(tmp)
+            probe.assert_not_called()
+            self.assertEqual(items[0].duration_s, 42.0)
 
 
 if __name__ == "__main__":

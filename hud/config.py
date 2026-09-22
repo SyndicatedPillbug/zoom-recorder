@@ -25,6 +25,25 @@ CONFIG_PATH = Path.home() / ".config" / "zoom-recorder" / "config.json"
 DEFAULT_TRANSCRIPTION_MODEL = "~/.cache/whisper-cpp/ggml-base.en.bin"
 RECORDING_MODES = ("both", "mic", "system")
 
+# Directories macOS protects with TCC: a launchd-spawned recorder is denied
+# writing there, so recordings must not be saved inside them.
+TCC_PROTECTED_DIRS = ("Documents", "Desktop", "Downloads")
+
+
+def tcc_protected(path: Any) -> bool:
+    try:
+        target = Path(str(path)).expanduser().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return False
+    for name in TCC_PROTECTED_DIRS:
+        try:
+            target.relative_to(home / name)
+            return True
+        except ValueError:
+            continue
+    return False
+
 
 @dataclass
 class RecorderDefaults:

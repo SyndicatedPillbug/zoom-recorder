@@ -1266,6 +1266,49 @@ def fallback_tap_to_loopback(cfg: Config, rec: "Recorder", log: "Log",
     return sys_cands, inputs
 
 
+def recorder_lock_path(basedir: Path) -> Path:
+    return Path(basedir) / ".zoom-recorder.lock"
+
+
+def recorder_running(basedir: Path) -> bool:
+    """True when another recorder holds the lock for this recordings folder."""
+    lock = recorder_lock_path(basedir)
+    if not lock.is_file():
+        return False
+    try:
+        pid = int(lock.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def acquire_recorder_lock(basedir: Path) -> bool:
+    lock = recorder_lock_path(basedir)
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def release_recorder_lock(basedir: Path) -> None:
+    lock = recorder_lock_path(basedir)
+    try:
+        if lock.is_file() and lock.read_text().strip() == str(os.getpid()):
+            lock.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def wait_for_first_segment(rec: "Recorder", timeout: float = 6.0,
                            expect_mic: bool = True) -> bool:
     """True once ffmpeg has written its first segment (capture actually
@@ -1412,8 +1455,22 @@ def main(argv: List[str]) -> int:
         print("ERROR: could not find an unused session folder under {} after "
               "several tries.".format(day_dir), file=sys.stderr)
         return 1
-    workdir = Path(tempfile.mkdtemp(prefix="zoomrec_"))
+    # Segments are written under the session folder itself (not a temp dir) so
+    # a crash or kill -9 leaves them recoverable next to capture.log. On a
+    # clean finish they are moved to .segments/ and .work is removed.
+    workdir = outdir / ".work"
+    workdir.mkdir(parents=True, exist_ok=True)
     log = Log(outdir / "capture.log")
+
+    try:
+        free_gb = shutil.disk_usage(basedir).free / 1e9
+        if free_gb < 2.0:
+            log.warn("Low disk space: {:.1f} GB free in {} — long recordings may "
+                     "fail.".format(free_gb, basedir))
+            notify_user("Low disk space ({:.1f} GB free) — long recordings may "
+                        "fail.".format(free_gb), title="zoom-recorder: disk space")
+    except OSError:
+        pass
 
     cfg = Config(
         segment_seconds=segment_seconds,
@@ -1548,6 +1605,13 @@ def main(argv: List[str]) -> int:
             log.warn("Live HUD unavailable ({}); recording continues normally.".format(exc))
             live = None
 
+    if recorder_running(basedir):
+        log.error("Another recording is already in progress in {} — refusing to "
+                  "start a second one.".format(basedir))
+        log.close()
+        return 1
+    acquire_recorder_lock(basedir)
+
     mic_device = mic.device if mic is not None else None
     rec.start(mic_device, system.device if system else None, pcm_source=pcm_source)
     healthy = wait_for_first_segment(rec, expect_mic=record_mic)
@@ -1579,6 +1643,7 @@ def main(argv: List[str]) -> int:
     finally:
         log.info("Stopping recording...")
         rec.stop()
+        release_recorder_lock(basedir)
         if pcm_source is not None:
             try:
                 pcm_source.stop()

@@ -110,9 +110,10 @@
 
     <section>
       <h2>2. Where should the sound play?</h2>
-      <p class="sub">Pick what you listen with (speakers or headphones). Recording needs a
-        special audio setup, so macOS's own volume keys won't work during calls — use the
-        <b>Volume</b> menu in the menu bar instead.</p>
+      <p class="sub">Pick what you listen with (speakers or headphones). This only affects
+        recordings — your Mac keeps playing sound normally the rest of the time. During calls
+        macOS's own volume keys can't control the recording setup, so use the <b>Volume</b>
+        menu in the menu bar.</p>
       <div class="row">
         <select id="outputSelect"></select>
         <button id="useOutput">Use this</button>
@@ -184,6 +185,7 @@
             <span class="status" id="keyStatus"></span>
           </div>
         </div>
+        <p class="note" id="keySaved"></p>
         <p class="note">Audio is sent to this service while recording. You can turn it off
           any time, or use Offline mode in Settings to block all network access.</p>
       </div>
@@ -267,6 +269,10 @@
       <p><b>Volume keys don't work during calls</b><br/>That's macOS: the special audio
         setup has no volume of its own. Use the <b>Volume</b> menu in the menu bar (or the
         optional Karabiner mapping in <code>karabiner/</code>).</p>
+      <p><b>Bluetooth headphones cut out or go silent</b><br/>When a Bluetooth headset
+        switches to call mode, macOS changes its audio format and the recording setup can
+        stop using it. Click 🎙 → <b>Play sound through ▸</b> and pick the headset again
+        after it connects, or use wired speakers/headphones for calls you record.</p>
       <p><b>Does it record my screen?</b><br/>No. It records your microphone and the other
         person's audio, and only sends audio to a service if you choose Online
         transcription.</p>
@@ -280,7 +286,15 @@
 
 <script>
 (function () {
-  const TOKEN = new URLSearchParams(location.search).get('token') || '';
+  const params = new URLSearchParams(location.search);
+  const TOKEN = params.get('token') || '';
+  // Keep the token out of the address bar / history / any future Referer;
+  // every request carries it in the X-Auth-Token header instead.
+  if (params.get('token')) {
+    params.delete('token');
+    const qs = params.toString();
+    history.replaceState({}, '', location.pathname + (qs ? '?' + qs : ''));
+  }
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g,
     c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
@@ -331,30 +345,84 @@
     ['setup','recordings','settings','help'].forEach(t =>
       $('tab-' + t).classList.toggle('hidden', t !== tab));
     if (tab === 'recordings') loadRecordings();
-    if (tab === 'settings') loadSettings();
+    if (tab === 'settings' && !settingsDirty) loadSettings();
   }
 
   // ---- status + checks -------------------------------------------------
+  let stateCache = {};
   async function refreshState() {
     const s = await api('/api/status');
     if (!s.ok) {
       setStatus($('statePill'), s.error || 'unavailable', 'bad');
       return;
     }
+    stateCache = s;
     setStatus($('statePill'),
       (s.recording ? 'recording' : 'ready') + (s.offline ? ' · offline' : ''), 'muted');
-    renderChecks(s.checks || []);
-    if (!s.onboarded) { /* stay on setup */ }
-    if (s.checks) {
-      $('outputSelect').dataset.ready = '1';
+    // Both "Start at login" checkboxes mirror the real LaunchAgent state.
+    ['loginAgent', 'loginAgent2'].forEach(id => {
+      const box = $(id);
+      if (box && document.activeElement !== box) box.checked = !!s.login_agent;
+    });
+    applySetupState();
+    if (!s.onboarded && !setupChecked) { setupChecked = true; runChecks(); }
+  }
+
+  let setupApplied = false;
+  let setupChecked = false;
+  // Every Setup control reflects the saved configuration -- but only once, so
+  // the 15s poll never overwrites choices the user is still making.
+  function applySetupState() {
+    if (setupApplied) return;
+    const s = stateCache;
+    if (!s || !s.ok) return;
+    setupApplied = true;
+    if ($('testMode') && s.mode) $('testMode').value = s.mode;
+    const backend = (s.stt_backend || '').toLowerCase();
+    let live = 'off';
+    if (backend === 'local' || backend === 'whisper') live = 'local';
+    else if (s.answers_enabled) live = 'online';
+    const radio = document.querySelector('input[name=live][value="' + live + '"]');
+    if (radio && !radio.checked) radio.checked = true;
+    $('liveLocal').classList.toggle('hidden', live !== 'local');
+    $('liveOnline').classList.toggle('hidden', live !== 'online');
+    const model = s.transcription_model || '';
+    if ($('modelChoice')) {
+      $('modelChoice').value = model.includes('.en.bin') ? 'ggml-base.en.bin' : 'ggml-base.bin';
+    }
+    if ($('provider') && ['groq', 'openai', 'openrouter'].includes(backend)) {
+      $('provider').value = backend;
+    }
+    updateKeyHint();
+    if ($('outputSelect') && $('outputSelect').options.length && s.paired_output) {
+      $('outputSelect').value = s.paired_output;
+    }
+  }
+
+  // Tell the user whether a key is already saved for the chosen service.
+  function updateKeyHint() {
+    const provider = $('provider') ? $('provider').value : '';
+    const saved = !!(stateCache.api_keys_set || {})[provider];
+    const field = $('apiKey');
+    const hint = $('keySaved');
+    if (field) {
+      field.placeholder = saved ? 'Saved — leave blank to keep it'
+        : 'Paste your API key';
+    }
+    if (hint) {
+      hint.innerHTML = saved
+        ? 'A key is saved for <b>' + esc(provider) + '</b>. Leave the box empty to '
+          + 'keep it, or paste a new one to replace it.'
+        : 'No key saved yet for <b>' + esc(provider) + '</b>. Paste one to turn on '
+          + 'live transcript and answers.';
     }
   }
 
   function fixButton(check) {
     const name = (check.name || '').toLowerCase();
-    if (name.includes('routing')) return { action:'routing', label:'Fix automatically' };
+    if (name.includes('routing')) return { action:'restore', label:'Fix automatically' };
     if (name.includes('blackhole')) return { action:'open-terminal',
-      command:'brew install blackhole-2ch', label:'Install BlackHole' };
+      key:'install-blackhole', label:'Install BlackHole' };
     if (name.includes('microphone')) return { action:'open-mic-settings', label:'Open Microphone settings' };
     if (name.includes('transcription')) return { action:'install-whisper', label:'Install transcriber' };
     return null;
@@ -380,11 +448,17 @@
       b.textContent = btn.label;
       b.onclick = async () => {
         b.disabled = true;
-        if (btn.action === 'open-terminal') {
-          await api('/api/fix', 'POST', { action:'open-terminal', command: btn.command });
+        const body = { action: btn.action };
+        if (btn.key) body.key = btn.key;
+        const r = await api('/api/fix', 'POST', body);
+        if (r && r.command && !r.started) {
+          // Terminal automation was blocked; hand the user the command.
+          try { await navigator.clipboard.writeText(r.command); } catch (e) {}
+          setStatus($('checksStatus'),
+            r.command + ' (copied to clipboard)', 'warn');
         } else {
-          const r = await api('/api/fix', 'POST', { action: btn.action });
-          setStatus($('checksStatus'), r.message || (r.ok ? 'Done.' : r.error), r.ok ? 'ok' : 'bad');
+          setStatus($('checksStatus'), (r && r.message) || (r && r.ok ? 'Done.' : (r && r.error)),
+            r && r.ok ? 'ok' : 'bad');
         }
         setTimeout(refreshState, 800);
         b.disabled = false;
@@ -393,13 +467,14 @@
     });
   }
 
-  $('runChecks').onclick = async () => {
+  async function runChecks() {
     await guarded($('checksStatus'), 'Checking…', async () => {
-      await refreshState();
-      setStatus($('checksStatus'), '');
-      return { ok: true };
+      const r = await api('/api/checks');
+      if (r && r.ok) { renderChecks(r.checks || []); setStatus($('checksStatus'), ''); }
+      return r;
     });
-  };
+  }
+  $('runChecks').onclick = runChecks;
 
   // ---- mic test --------------------------------------------------------
   $('micTest').onclick = async () => {
@@ -428,12 +503,14 @@
     const sel = $('micSelect');
     sel.innerHTML = '<option value="">Automatic</option>' +
       (d.microphones || []).map(n => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('');
+    if (stateCache.paired_output) $('outputSelect').value = stateCache.paired_output;
+    if (stateCache.mode) $('testMode').value = stateCache.mode;
   }
   $('useOutput').onclick = async () => {
-    const r = await guarded($('outputStatus'), 'Setting up…',
+    const r = await guarded($('outputStatus'), 'Saving…',
       () => api('/api/fix', 'POST',
-        { action:'routing', output: $('outputSelect').value }));
-    if (r && r.ok) setStatus($('outputStatus'), r.message || 'Done', 'ok');
+        { action:'pair', output: $('outputSelect').value }));
+    if (r && r.ok) setStatus($('outputStatus'), r.message || 'Saved', 'ok');
   };
 
   // ---- test recording --------------------------------------------------
@@ -493,6 +570,7 @@
         { provider: $('provider').value, api_key: $('apiKey').value }));
     if (r && r.ok) setStatus($('keyStatus'), 'Key works (' + r.count + ' models)', 'ok');
   };
+  if ($('provider')) $('provider').onchange = () => { updateKeyHint(); setStatus($('keyStatus'), ''); };
 
   // ---- login agent -----------------------------------------------------
   async function setLogin(enabled, statusEl) {
@@ -501,6 +579,14 @@
     if (r && r.ok) {
       setStatus(statusEl, enabled ? 'Will start at login'
         : 'Will not start at login', 'ok');
+      // Keep the other checkbox in sync immediately.
+      ['loginAgent', 'loginAgent2'].forEach(id => {
+        const box = $(id);
+        if (box) box.checked = enabled;
+      });
+    } else {
+      // Reflect the real state if the change failed.
+      refreshState();
     }
   }
   $('loginAgent').onchange = (e) => setLogin(e.target.checked, $('loginStatus'));
@@ -558,17 +644,30 @@
       const add = (label, fn) => { const b = document.createElement('button');
         b.className = 'secondary mini'; b.textContent = label; b.onclick = fn;
         slot.appendChild(b); };
-      if (it.transcript) add('Open transcript', () => api('/api/open','POST',{ path: it.transcript }));
-      if (it.summary) add('Open summary', () => api('/api/open','POST',{ path: it.summary }));
+      if (it.transcript) add('Open transcript', () => openPath(it.transcript));
+      if (it.summary) add('Open summary', () => openPath(it.summary));
       if (it.mixed) add('Play', () => api('/api/play','POST',{ path: it.mixed }));
-      add('Show in Finder', () => api('/api/open','POST',{ path: it.path }));
+      add('Show in Finder', () => openPath(it.path));
+      add('Move to Trash', async () => {
+        if (!confirm('Move this recording to the Trash? You can recover it from the Trash.')) return;
+        const res = await api('/api/recordings/trash', 'POST', { path: it.path });
+        if (!res.ok) { alert(res.error || 'Could not move it'); return; }
+        loadRecordings();
+      });
     });
   }
+  async function openPath(path) {
+    const r = await api('/api/open', 'POST', { path: path });
+    if (r && r.ok === false) setStatus($('recordingsPath'), r.error || 'Could not open it', 'bad');
+  }
   $('refreshRecordings').onclick = loadRecordings;
-  $('openFolder').onclick = () => api('/api/open','POST',{ target:'recordings' });
-  $('openRecordings').onclick = () => api('/api/open','POST',{ target:'recordings' });
+  $('openFolder').onclick = () => guarded($('recordingsPath'), 'Opening…',
+    () => api('/api/open', 'POST', { target:'recordings' }));
+  $('openRecordings').onclick = () => guarded($('recordingsPath'), 'Opening…',
+    () => api('/api/open', 'POST', { target:'recordings' }));
 
   // ---- settings --------------------------------------------------------
+  let settingsDirty = false;
   async function loadSettings() {
     const r = await api('/api/config');
     if (!r.ok) return;
@@ -581,7 +680,15 @@
     $('micSelect').value = rec.mic || '';
     await loadDevices();
     $('micSelect').value = rec.mic || '';
+    settingsDirty = false;
+    setStatus($('settingsStatus'), '');
   }
+  // Keep edits across tab switches instead of silently reloading over them.
+  ['basedir', 'micSelect', 'modeSelect', 'modelPath', 'notifications', 'offline']
+    .forEach(id => { const el = $(id); if (el) el.addEventListener('change', () => {
+      settingsDirty = true;
+      setStatus($('settingsStatus'), 'Unsaved changes — press Save', 'warn');
+    }); });
   $('pickDir').onclick = async () => {
     const r = await guarded($('settingsStatus'), 'Waiting for the folder…',
       () => api('/api/pick-dir', 'POST', {}));
@@ -602,20 +709,22 @@
     };
     const r = await guarded($('settingsStatus'), 'Saving…',
       () => api('/api/config', 'POST', { config: cfg }));
-    if (r && r.ok) setStatus($('settingsStatus'), 'Saved', 'ok');
+    if (r && r.ok) { settingsDirty = false; setStatus($('settingsStatus'), 'Saved', 'ok'); }
   };
   $('advancedSettings').onclick = () => api('/api/fix','POST',{ action:'open-advanced' });
 
   document.querySelectorAll('[data-open]').forEach(b => b.onclick = () => {
-    // repo docs live next to this app; the server only opens paths under home
-    api('/api/open', 'POST', { path: b.dataset.open });
+    // Help opens a fixed set of repo docs (server-side whitelist).
+    api('/api/open', 'POST', { doc: b.dataset.open });
   });
 
   // ---- boot ------------------------------------------------------------
-  refreshState();
-  loadDevices();
-  const initial = new URLSearchParams(location.search).get('tab');
-  if (initial) show(initial);
+  (async () => {
+    await refreshState();
+    await loadDevices();
+    const initial = new URLSearchParams(location.search).get('tab');
+    if (initial) show(initial);
+  })();
   setInterval(refreshState, 15000);
 })();
 </script>
