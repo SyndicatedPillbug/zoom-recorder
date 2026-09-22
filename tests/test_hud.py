@@ -30,6 +30,7 @@ from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
                          verify_answer_claims, is_ambiguous_question, parse_bullets,
                          parse_point_objects)
 from hud.audio_benchmark import _load_reference, _percentile, _window_reference  # noqa: E402
+from hud.benchmark_manifest import ManifestError, load_manifest, write_result  # noqa: E402
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
@@ -40,6 +41,7 @@ from hud.evaluation import (first_stable_publication_stats, normalize_words,  # 
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
 from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
+from hud.lifecycle import run_fixture  # noqa: E402
 from hud.local_http import host_from_header, url_host  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
 from hud.memory import extract_memory, format_memory  # noqa: E402
@@ -352,6 +354,19 @@ class SttPipelineTests(unittest.TestCase):
         self.assertEqual(event["segment_id"], "Client:1")
         self.assertEqual(event["revision"], 0)
         self.assertFalse(event["finalized"])
+
+    def test_transcript_events_keep_capture_and_publication_clocks_distinct(self) -> None:
+        tr = self._transcriber(HudConfig(stt_backend="local",
+                                         stt_hallucination_filter=False))
+        src = _Source("Client", [], "remote")
+        tr._publish_committed(src, "the rollout plan", started=12.0,
+                              finalized=False, captured_at=10.0)
+        event = tr.state.snapshot()["transcript"][0]
+        self.assertEqual(event["captured_at"], 10.0)
+        self.assertEqual(event["window_end_at"], 10.0)
+        self.assertGreaterEqual(event["published_at"], event["captured_at"])
+        self.assertGreaterEqual(event["capture_to_publish_seconds"], 0.0)
+        self.assertGreaterEqual(event["inference_seconds"], 0.0)
 
     def test_transcript_events_explain_channel_attribution(self) -> None:
         tr = self._transcriber(HudConfig(stt_backend="local",
@@ -865,6 +880,69 @@ class IdentityTests(unittest.TestCase):
 
 
 class MemoryAndReplayTests(unittest.TestCase):
+    def test_fixture_lifecycle_keeps_partial_out_of_canonical_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = [
+                {"type": "transcript_partial", "source_key": "mic",
+                 "text": "We agreed to ship", "speaker": "You", "revision": 1},
+                {"type": "transcript", "finalized": True,
+                 "text": "We agreed to ship next week.", "speaker": "You"},
+            ]
+            result = run_fixture(events, root / "fixture_abc123", root / "mirror")
+            outdir = Path(result["outdir"])
+            transcript = (outdir / "derived" / "live_transcript.txt").read_text()
+            events_text = (outdir / "derived" / "live_events.jsonl").read_text()
+            mirror = next((root / "mirror").glob("*-live-transcript.md")).read_text()
+            self.assertIn("We agreed to ship next week", transcript)
+            self.assertNotIn("We agreed to ship\n", transcript)
+            self.assertIn("transcript_partial", events_text)
+            self.assertNotIn("We agreed to ship\n", mirror)
+            self.assertTrue((outdir / "session.json").is_file())
+            diagnostics = json.loads(
+                (outdir / "derived" / "live_diagnostics.json").read_text())
+            self.assertEqual(diagnostics["meta"]["shutdown_reason"], "requested")
+            self.assertIn("stt_stop", diagnostics["meta"]["lifecycle_stages"])
+
+    def test_fixture_lifecycle_failure_injection_preserves_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = [{"type": "transcript", "finalized": True,
+                       "text": "We agreed to ship next week.", "speaker": "Client"}]
+            failures = ("provider", "stt", "writeback", "permission")
+            for index in range(20):
+                failure = failures[index % len(failures)]
+                run_root = root / "run-{}-{}".format(index, failure)
+                result = run_fixture(events, run_root, root / "mirrors" / str(index),
+                                     inject_failure=failure)
+                outdir = Path(result["outdir"])
+                self.assertTrue((outdir / "session.json").is_file())
+                self.assertTrue((outdir / "derived" / "live_events.jsonl").is_file())
+                self.assertEqual(result["status"], "stopped")
+
+    def test_benchmark_manifest_loads_external_audio_without_claiming_readiness(self) -> None:
+        manifest = Path(__file__).resolve().parent.parent / "fixtures/manifest.json"
+        specs = load_manifest(manifest)
+        self.assertEqual([spec.fixture_id for spec in specs], ["ami-es2002a-50-80"])
+        self.assertFalse(specs[0].audio_exists)
+        self.assertTrue(specs[0].reference_exists)
+        with self.assertRaises(ManifestError):
+            load_manifest(manifest, require_files=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "ami-es2002a-50-80.wav"
+            audio.write_bytes(b"external fixture")
+            ready = load_manifest(manifest, require_files=True, asset_root=Path(tmp))
+            self.assertTrue(ready[0].audio_exists)
+
+    def test_benchmark_result_is_atomic_and_versioned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "nested" / "result.json"
+            write_result(target, {"fixture": "speech", "wer": 0.2})
+            saved = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(saved["result_schema_version"], 1)
+            self.assertEqual(saved["fixture"], "speech")
+            self.assertEqual(list(target.parent.glob("*.tmp")), [])
+
     def test_audio_benchmark_percentile_is_deterministic(self) -> None:
         self.assertEqual(_percentile([0.2, 0.1, 0.4, 0.3], 50), 0.2)
         self.assertIsNone(_percentile([], 95))
@@ -1661,6 +1739,12 @@ class AnswerEngineTests(unittest.TestCase):
         answers = state.snapshot()["answers"]
         self.assertEqual(answers[0]["bullets"], ["first point", "second point"])
         self.assertEqual(answers[0]["kind"], "question")
+        self.assertTrue(answers[0]["trace_id"])
+        traces = [event for event in state.since(0) if event["type"] == "answer_trace"]
+        self.assertEqual([event["stage"] for event in traces],
+                         ["started", "assembled", "provider_complete"])
+        self.assertIn("prompt_estimated_tokens", traces[1])
+        self.assertIn("provider_ttft_seconds", traces[2])
 
     def test_rate_limited_primary_uses_answer_fallback(self) -> None:
         class RateLimitedClient:

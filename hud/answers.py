@@ -20,6 +20,7 @@ import json
 import math
 import queue
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -758,10 +759,16 @@ class AnswerEngine:
 
     def _put(self, priority: int, job: Dict[str, Any]) -> None:
         job.setdefault("queued_at", time.time())
+        job.setdefault("trace_id", "answer-{}".format(secrets.token_hex(6)))
+        self._trace(job["trace_id"], "queued", kind=job.get("kind", "question"),
+                    queued_at=job["queued_at"])
         self._queue.put((priority, next(self._job_seq), job))
 
     def _put_rolling(self, job: Dict[str, Any]) -> None:
         job.setdefault("queued_at", time.time())
+        job.setdefault("trace_id", "talking-points-{}".format(secrets.token_hex(6)))
+        self._trace(job["trace_id"], "queued", kind="rolling",
+                    queued_at=job["queued_at"])
         try:
             self._rolling_queue.put_nowait(job)
         except queue.Full:
@@ -773,6 +780,12 @@ class AnswerEngine:
                 self._rolling_queue.put_nowait(job)
             except queue.Full:
                 pass
+
+    def _trace(self, trace_id: str, stage: str, **fields: Any) -> None:
+        """Record a redacted, stage-level answer/talking-point trace."""
+        payload = {"trace_id": str(trace_id), "stage": str(stage)}
+        payload.update(fields)
+        self.state.add("answer_trace", **payload)
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -891,10 +904,12 @@ class AnswerEngine:
         self._last_rolling_hash = digest
         self._words_since_rolling = 0
         with self._lock:
-            self._rolling_payload = {"window": window, "queued_at": time.time()}
+            trace_id = "talking-points-{}".format(secrets.token_hex(6))
+            self._rolling_payload = {"window": window, "queued_at": time.time(),
+                                     "trace_id": trace_id}
             if not self._rolling_queued:
                 self._rolling_queued = True
-                self._put_rolling({"kind": "rolling"})
+                self._put_rolling({"kind": "rolling", "trace_id": trace_id})
 
     def _should_answer(self, detected: Dict[str, Any]) -> bool:
         question = detected.get("question", "")
@@ -1194,6 +1209,9 @@ class AnswerEngine:
         detected_at = float(job.get("detected_at") or time.time())
         queued_at = float(job.get("queued_at") or detected_at)
         started_at = time.time()
+        trace_id = str(job.get("trace_id") or "answer-{}".format(secrets.token_hex(6)))
+        self._trace(trace_id, "started", detected_at=detected_at,
+                    queued_at=queued_at, started_at=started_at)
         question = job.get("question") or ""
         context = job.get("context") or ""
         window = job.get("window") or self._context_text()
@@ -1224,9 +1242,17 @@ class AnswerEngine:
         prompt = self._build_prompt("question", effective, context, window, snippets,
                                     qa=self._qa_recent())
         assembly_seconds = round(time.time() - assembly_started, 3)
-        self.state.observe_metric("answer_queue_wait", max(0.0, started_at - queued_at))
+        queue_wait = max(0.0, started_at - queued_at)
+        prompt_chars = len(system) + len(prompt)
+        prompt_tokens = estimate_tokens(system + prompt, 0)
+        reference_chars = sum(len(getattr(s, "text", "") or "") for s in snippets)
+        self.state.observe_metric("answer_queue_wait", queue_wait)
         self.state.observe_metric("prompt_assembly_seconds", assembly_seconds)
-        self.state.observe_metric("prompt_chars", len(system) + len(prompt))
+        self.state.observe_metric("prompt_chars", prompt_chars)
+        self._trace(trace_id, "assembled", queue_wait_seconds=round(queue_wait, 4),
+                    assembly_seconds=assembly_seconds, prompt_chars=prompt_chars,
+                    prompt_estimated_tokens=prompt_tokens,
+                    context_chars=len(window), reference_chars=reference_chars)
 
         # Create a placeholder answer event so the UI shows the question is
         # being answered immediately, then stream the raw text in.
@@ -1234,12 +1260,13 @@ class AnswerEngine:
             "answer", kind="question", question=question,
             rewritten_question=rewritten or None, bullets=[],
             sources=[s.source for s in snippets], model="", streaming=True,
-            answer_queue_wait=round(max(0.0, started_at - queued_at), 2),
+            trace_id=trace_id,
+            answer_queue_wait=round(queue_wait, 2),
             prompt_assembly_seconds=assembly_seconds,
-            prompt_chars=len(system) + len(prompt),
-            prompt_estimated_tokens=estimate_tokens(system + prompt, 0),
+            prompt_chars=prompt_chars,
+            prompt_estimated_tokens=prompt_tokens,
             context_chars=len(window),
-            reference_chars=sum(len(getattr(s, "text", "") or "") for s in snippets))
+            reference_chars=reference_chars)
         event_id = placeholder["id"]
         accumulated = []
 
@@ -1249,40 +1276,56 @@ class AnswerEngine:
 
         result = self._chat_stream("question", system, prompt, on_chunk=_on_chunk)
         if result is None:
+            total_seconds = max(0.0, time.time() - detected_at)
+            self.state.observe_metric("answer_total_seconds", total_seconds)
+            self._trace(trace_id, "failed", reason="all providers failed",
+                        total_seconds=round(total_seconds, 4))
             self.state.update_answer(event_id, bullets=[], model="",
                                       streaming=False, error="all providers failed",
                                       provider_ttft=None, provider_seconds=None,
-                                      answer_latency=round(time.time() - detected_at, 2))
+                                      trace_id=trace_id,
+                                      answer_latency=round(total_seconds, 2))
             return
+
+        provider_finished_at = time.time()
+        total_seconds = max(0.0, provider_finished_at - detected_at)
+        self._trace(trace_id, "provider_complete",
+                    provider_ttft_seconds=result.ttft_seconds,
+                    provider_request_seconds=result.request_seconds,
+                    total_seconds=round(total_seconds, 4))
 
         claims = parse_answer_claims(result.text)
         bullets, evidence, dropped_claims = verify_answer_claims(
             claims, "{}\n{}".format(window, context), snippets)
         if not bullets:
+            self.state.observe_metric("answer_total_seconds", total_seconds)
             self.state.update_answer(event_id, bullets=[], model=result.model,
                                       streaming=False, error="no answer produced",
                                       evidence=evidence, dropped_claims=dropped_claims,
                                       grounding="unverified" if dropped_claims else "none",
+                                      trace_id=trace_id,
                                       provider_ttft=result.ttft_seconds,
                                       provider_seconds=result.request_seconds,
-                                      answer_latency=round(time.time() - detected_at, 2))
+                                      answer_latency=round(total_seconds, 2))
             return
 
         parent_id = None
         if parse_follow_up(result.text):
             with self._lock:
                 parent_id = self._last_answer_id or None
+        self.state.observe_metric("answer_total_seconds", total_seconds)
         self.state.update_answer(
             event_id, bullets=bullets, model=result.model,
             usage=result.usage, parent_id=parent_id, streaming=False,
             streaming_text=None,
             evidence=evidence,
             dropped_claims=dropped_claims,
+            trace_id=trace_id,
             grounding="verified" if evidence and not dropped_claims else (
                 "partial" if evidence or dropped_claims else "provider_unverified"),
             provider_ttft=result.ttft_seconds,
             provider_seconds=result.request_seconds,
-            answer_latency=round(time.time() - detected_at, 2))
+            answer_latency=round(total_seconds, 2))
         if result.ttft_seconds is not None:
             self.state.observe_metric("provider_ttft_seconds", result.ttft_seconds)
         if result.request_seconds is not None:

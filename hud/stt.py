@@ -1071,7 +1071,9 @@ class LiveTranscriber:
                     source.partial_revision += 1
                     provisional = source.partial_decoder.provisional_text
                     if committed:
-                        self._publish_committed(source, committed, started, finalized=False)
+                        self._publish_committed(source, committed, started, finalized=False,
+                                                 captured_at=captured_at)
+                    published_at = time.time()
                     self.state.set_transcript_partial(
                         source.speaker_id, provisional,
                         self.state.speaker_label(source.speaker_id, source.speaker),
@@ -1079,12 +1081,18 @@ class LiveTranscriber:
                         speaker_source=("channel" if source.speaker_id != "unknown" else "unknown"),
                         speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
                         speaker_revision=0,
-                        latency=round(time.time() - started, 2),
-                        captured_at=captured_at)
+                        latency=round(published_at - started, 2),
+                        inference_seconds=round(max(0.0, published_at - started), 4),
+                        capture_to_publish_seconds=round(
+                            max(0.0, published_at - captured_at), 4),
+                        captured_at=captured_at, published_at=published_at,
+                        window_end_at=captured_at)
                     self.state.set_meta(
-                        stt_partial_latency=round(max(0.0, time.time() - captured_at), 2))
+                        stt_partial_latency=round(max(0.0, published_at - captured_at), 2))
                     self.state.observe_metric("stt_partial_latency_seconds",
-                                              max(0.0, time.time() - captured_at))
+                                              max(0.0, published_at - captured_at))
+                    self.state.observe_metric("stt_partial_inference_seconds",
+                                              max(0.0, published_at - started))
             except Exception as exc:  # noqa: BLE001
                 # Partial recognition is an enhancement. A failed interim
                 # request must never disable final transcription.
@@ -1092,7 +1100,8 @@ class LiveTranscriber:
 
     def _publish_committed(self, source: "_Source", text: str,
                            started: Optional[float] = None,
-                           finalized: bool = True) -> None:
+                           finalized: bool = True,
+                           captured_at: Optional[float] = None) -> None:
         delta = self._delta_text(source, text)
         if not delta:
             return
@@ -1102,16 +1111,28 @@ class LiveTranscriber:
         source.last_segment_id = "{}:{}".format(
             source.speaker_id, source.segment_seq)
         speaker = self.state.speaker_label(source.speaker_id, source.speaker)
+        published_at = time.time()
+        inference_seconds = (max(0.0, published_at - started)
+                             if started is not None else None)
+        capture_to_publish = (max(0.0, published_at - captured_at)
+                              if captured_at is not None else None)
         self.state.add("transcript", text=delta, source="live",
                        speaker=speaker, speaker_id=source.speaker_id,
                        speaker_source=("channel" if source.speaker_id != "unknown" else "unknown"),
                        speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
                        speaker_revision=0,
-                       latency=round(time.time() - started, 2) if started else None,
+                       ts=published_at,
+                       latency=round(inference_seconds, 2) if inference_seconds is not None else None,
+                       inference_seconds=round(inference_seconds, 4)
+                       if inference_seconds is not None else None,
+                       capture_to_publish_seconds=round(capture_to_publish, 4)
+                       if capture_to_publish is not None else None,
                        stable_partial=not finalized, finalized=finalized,
                        segment_id=source.last_segment_id,
                        revision=source.partial_revision,
-                       captured_at=started)
+                       captured_at=captured_at if captured_at is not None else started,
+                       published_at=published_at,
+                       window_end_at=captured_at if captured_at is not None else started)
         if not finalized:
             self.state.add("transcript_revision", text=delta, source="live",
                            speaker=speaker, speaker_id=source.speaker_id,
@@ -1200,7 +1221,8 @@ class LiveTranscriber:
                 compression_ratio_max=self.cfg.stt_compression_ratio_max):
             self.log("live STT: dropped likely hallucination ({!r}...)".format(text[:40]))
             return
-        self._publish_committed(source, text, started, finalized=True)
+        self._publish_committed(source, text, started, finalized=True,
+                                captured_at=captured_at)
         if self._partial_enabled():
             speaker = self.state.speaker_label(source.speaker_id, source.speaker)
             self.state.add("transcript_boundary", source_key=source.speaker_id,
@@ -1218,10 +1240,13 @@ class LiveTranscriber:
                 speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
                 speaker_revision=0, finalized=True)
         if captured_at is not None:
+            final_published = time.time()
             self.state.observe_metric("stt_final_latency_seconds",
-                                      max(0.0, time.time() - captured_at))
+                                      max(0.0, final_published - captured_at))
+            self.state.observe_metric("stt_final_inference_seconds",
+                                      max(0.0, final_published - started))
             self.state.set_meta(
-                stt_lag_seconds=round(max(0.0, time.time() - captured_at), 1),
+                stt_lag_seconds=round(max(0.0, final_published - captured_at), 1),
                 stt_final_inferences=self._final_inference_count,
                 stt_partial_dropped=self._partial_dropped,
                 stt_partial_suppressed=self._partial_suppressed,

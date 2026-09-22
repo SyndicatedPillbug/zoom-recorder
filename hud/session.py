@@ -58,6 +58,10 @@ class LiveSession:
         self._stop = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
         self._writeback: Optional[TranscriptWriteback] = None
+        self._lifecycle_stages: Dict[str, float] = {}
+
+    def _record_lifecycle_stage(self, name: str, started_at: float) -> None:
+        self._lifecycle_stages[str(name)] = round(max(0.0, time.time() - started_at), 4)
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> Optional[int]:
@@ -137,47 +141,69 @@ class LiveSession:
             return
         self._started = False
         self._stop.set()
+        stop_started = time.time()
         if self._flush_thread is not None:
+            stage_started = time.time()
             self._flush_thread.join(timeout=2.5)
+            self._record_lifecycle_stage("flush_thread_join", stage_started)
 
         # Stop capture/STT before generating a summary so the final recognized
         # words are present in both the summary and the identity record.
         if self.stt is not None:
+            stage_started = time.time()
             try:
                 self.stt.stop()
             except Exception:  # noqa: BLE001
                 pass
+            self._record_lifecycle_stage("stt_stop", stage_started)
         summary = None
         if self.answers is not None:
+            stage_started = time.time()
             try:
                 summary = self.answers.finish()
             except Exception as exc:  # noqa: BLE001
                 self.log("live HUD: summary failed ({})".format(exc))
+            self._record_lifecycle_stage("answer_finish", stage_started)
         if self.answers is not None:
+            stage_started = time.time()
             try:
                 self.answers.stop()
             except Exception:  # noqa: BLE001
                 pass
+            self._record_lifecycle_stage("answer_stop", stage_started)
         if self._writeback is not None:
+            stage_started = time.time()
             try:
                 self._writeback.stop()
             except Exception as exc:  # noqa: BLE001
                 self.log("live transcript writeback shutdown failed ({})".format(exc))
+            self._record_lifecycle_stage("writeback_stop", stage_started)
         identity = self._finalize_identity()
+        self._record_lifecycle_stage("identity_finalize", stop_started)
         if self._writeback is not None:
+            stage_started = time.time()
             self._writeback.finalize_name(str(identity.get("slug") or ""))
+            self._record_lifecycle_stage("writeback_rename", stage_started)
             self._writeback = None
+        self.state.set_meta(
+            shutdown_reason="requested",
+            lifecycle_stages=dict(self._lifecycle_stages),
+            lifecycle_total_seconds=round(max(0.0, time.time() - stop_started), 4))
+        stage_started = time.time()
         self._persist(summary=summary)
+        self._record_lifecycle_stage("persist", stage_started)
         self.state.set_status("stopped")
         try:
             HUD_URLFILE.unlink(missing_ok=True)
         except OSError:
             pass
         if self.server is not None:
+            stage_started = time.time()
             try:
                 self.server.stop()
             except Exception:  # noqa: BLE001
                 pass
+            self._record_lifecycle_stage("server_stop", stage_started)
 
     def _finalize_identity(self) -> Dict[str, Any]:
         """Write evidence-backed metadata and add a readable folder slug."""

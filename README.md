@@ -549,6 +549,24 @@ be replayed without audio or network access:
 python3 -m hud.replay ~/ZoomRecordings/2026-09-22/14-32-08_enrollment-planning_a1b2c3d4/derived/live_events.jsonl
 ```
 
+For a provider-free end-to-end lifecycle check, feed a JSONL event fixture
+through the production session shutdown, identity, persistence, and optional
+writeback paths:
+
+```bash
+python3 -m hud.lifecycle /path/to/events.jsonl \
+  --outdir /tmp/zoom-recorder-fixture-run \
+  --writeback-dir /tmp/zoom-recorder-fixture-mirror
+```
+
+The same harness accepts `--inject-failure provider|stt|writeback|permission`
+for deterministic recovery checks.
+
+Provisional events remain in the replayable event log but are excluded from
+canonical transcript and writeback artifacts. The resulting diagnostics include
+shutdown stage durations and the answer pipeline emits trace IDs connecting
+queue wait, prompt assembly, provider TTFT, and final answer state.
+
 For a paced local rolling-window benchmark, use the offline audio harness. It
 uses the same local Whisper backend and stable-prefix decoder as live mode, but
 does not touch capture, providers, or meeting state:
@@ -556,7 +574,8 @@ does not touch capture, providers, or meeting state:
 ```bash
 python3 -m hud.audio_benchmark /path/to/fixture.wav \
   --model ~/.cache/whisper-cpp/ggml-base.en.bin \
-  --reference fixtures/ami-es2002a-50-80.reference.json
+  --reference fixtures/ami-es2002a-50-80.reference.json \
+  --output /tmp/zoom-recorder-bench.json
 ```
 
 The checked AMI reference slice is derived from the corpus's CC BY 4.0 manual
@@ -567,6 +586,18 @@ first stable word's window-to-publication timing.
 Stable-only WER is expected to include deletions while the rolling window is
 still withholding its newest unstable suffix; true per-window WER requires a
 timestamped reference manifest.
+
+The checked-in `fixtures/manifest.json` records fixture identity, reference,
+timing bounds, and source provenance. Large external audio is intentionally not
+committed. Validate the manifest without requiring audio with:
+
+```bash
+python3 -m hud.benchmark_manifest fixtures/manifest.json
+```
+
+Use `--asset-root /path/to/assets --require-files` after provisioning the
+external audio; the command then fails instead of silently treating a missing
+fixture as ready.
 
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your

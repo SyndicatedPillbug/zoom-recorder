@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "description": "Offline meeting-audio benchmark fixtures. Large audio files are external assets.",
+  "fixtures": [
+    {
+      "id": "ami-es2002a-50-80",
+      "audio": "ami-es2002a-50-80.wav",
+      "reference": "ami-es2002a-50-80.reference.json",
+      "kind": "speech",
+      "duration_seconds": 30.0,
+      "speech_bounds": [0.0, 30.0],
+      "source_url": "https://groups.inf.ed.ac.uk/ami/download/",
+      "notes": "Official AMI ES2002a excerpt; audio is kept outside git and must be provisioned locally."
+    }
+  ]
+}

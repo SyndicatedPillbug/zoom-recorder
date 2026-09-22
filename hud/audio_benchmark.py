@@ -12,6 +12,7 @@ import wave
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .benchmark_manifest import write_result
 from .evaluation import word_error_stats
 from .stt import LocalWhisperSTT, StablePartialDecoder
 
@@ -135,6 +136,7 @@ def run_benchmark(audio: Path, model: Path, reference: Optional[Path] = None,
 
     committed_text = " ".join(committed).strip()
     output: Dict[str, object] = {
+        "benchmark_schema_version": 1,
         "audio": str(audio),
         "model": str(model),
         "duration_seconds": round(duration, 6),
@@ -174,6 +176,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--window-seconds", type=float, default=4.0)
     parser.add_argument("--interval-seconds", type=float, default=0.8)
+    parser.add_argument("--output", type=Path,
+                        help="atomically write the complete JSON result to this path")
     parser.add_argument("--no-pace", action="store_true",
                         help="run as fast as possible instead of simulating live audio")
     args = parser.parse_args(argv)
@@ -184,7 +188,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         pace=not args.no_pace,
         log=lambda message: print(message, flush=True),
     )
-    print(json.dumps(result, indent=2, sort_keys=True))
+    rendered = json.dumps(result, indent=2, sort_keys=True)
+    if args.output:
+        write_result(args.output, result)
+    print(rendered)
     return 0
 
 
