@@ -31,6 +31,7 @@ from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
                          parse_point_objects)
 from hud.audio_benchmark import _load_reference, _percentile, _window_reference  # noqa: E402
 from hud.benchmark_manifest import ManifestError, load_manifest, write_result  # noqa: E402
+from hud.benchmark_suite import run_suite  # noqa: E402
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
@@ -980,6 +981,35 @@ class MemoryAndReplayTests(unittest.TestCase):
             self.assertEqual(saved["result_schema_version"], 1)
             self.assertEqual(saved["fixture"], "speech")
             self.assertEqual(list(target.parent.glob("*.tmp")), [])
+
+    def test_benchmark_suite_records_completed_and_skipped_fixtures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "speech.wav"
+            reference = root / "speech.reference.txt"
+            audio.write_bytes(b"not decoded by the mocked runner")
+            reference.write_text("hello world", encoding="utf-8")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "schema_version": 1,
+                "fixtures": [
+                    {"id": "speech", "audio": "speech.wav",
+                     "reference": "speech.reference.txt", "kind": "speech"},
+                    {"id": "missing", "audio": "missing.wav", "kind": "silence"},
+                ],
+            }), encoding="utf-8")
+
+            def fake_runner(audio_path, model, **kwargs):
+                return {"audio": str(audio_path), "model": str(model),
+                        "stable_only_wer": {"wer": 0.0}}
+
+            suite = run_suite(manifest, Path("model.bin"), require_files=False,
+                              runner=fake_runner)
+            self.assertEqual(suite["fixture_count"], 2)
+            self.assertEqual(suite["completed_count"], 1)
+            self.assertEqual(suite["skipped_count"], 1)
+            self.assertEqual(suite["results"][0]["fixture_id"], "speech")
+            self.assertEqual(suite["skipped"][0]["reason"], "audio_missing")
 
     def test_audio_benchmark_percentile_is_deterministic(self) -> None:
         self.assertEqual(_percentile([0.2, 0.1, 0.4, 0.3], 50), 0.2)

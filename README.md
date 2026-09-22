@@ -599,6 +599,18 @@ Use `--asset-root /path/to/assets --require-files` after provisioning the
 external audio; the command then fails instead of silently treating a missing
 fixture as ready.
 
+For a manifest-driven comparison across all provisioned fixtures, use:
+
+```bash
+python3 -m hud.benchmark_suite fixtures/manifest.json \
+  --asset-root /path/to/assets \
+  --model ~/.cache/whisper-cpp/ggml-base.en.bin \
+  --output /tmp/zoom-recorder-suite.json
+```
+
+The suite fails on missing assets by default. `--allow-missing` records them as
+skipped so an incomplete corpus cannot be mistaken for a clean accuracy run.
+
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your
 `.md` files) is sent to the answer provider. If `kb.embed_backend` is `openai`,

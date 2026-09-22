@@ -68,8 +68,9 @@ Make the benchmark write one JSON result per run and a compact summary suitable 
 models/settings. Preserve the complete configuration used to generate it.
 
 Gate: two runs with different windows/models cannot overwrite one another and can be compared by
-fixture, model, and settings. **Met for atomic/schema-safe persistence; comparison aggregation
-remains open until the multi-fixture runner exists.**
+fixture, model, and settings. **Met.** `hud.benchmark_suite` now provides manifest-driven
+comparison output with explicit completed/skipped counts. Corpus coverage remains an open accuracy
+gate until more speech fixtures are provisioned.
 
 ### Step 0.4 — Define initial numeric gates — complete
 
