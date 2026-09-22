@@ -491,10 +491,28 @@ class LocalWhisperSTT:
                    "-otxt", "-of", str(out_base), "-np"]
             if prompt:
                 cmd += ["--prompt", prompt]
-            subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            out_file = out_base.with_suffix(".txt")
-            if out_file.is_file():
-                return out_file.read_text(encoding="utf-8", errors="replace").strip()
+            # Metal is substantially faster on Apple Silicon, but a process
+            # launched from a restricted/background context can fail to
+            # allocate a Metal buffer (or even exit by signal).  Never turn
+            # that into a silent empty transcript: retry once on CPU and
+            # preserve the normal GPU-first path for ordinary launches.
+            attempts = [(cmd, "GPU")]
+            if "-ng" not in cmd:
+                attempts.append((cmd + ["-ng"], "CPU fallback"))
+            for attempt, label in attempts:
+                try:
+                    completed = subprocess.run(
+                        attempt, capture_output=True, text=True, timeout=120)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.log("local STT: {} failed ({})".format(label, exc))
+                    continue
+                out_file = out_base.with_suffix(".txt")
+                if completed.returncode == 0 and out_file.is_file():
+                    return out_file.read_text(
+                        encoding="utf-8", errors="replace").strip()
+                detail = (completed.stderr or "").strip().splitlines()
+                detail = detail[-1] if detail else "exit {}".format(completed.returncode)
+                self.log("local STT: {} failed ({}); trying fallback".format(label, detail))
         return ""
 
     def close(self) -> None:

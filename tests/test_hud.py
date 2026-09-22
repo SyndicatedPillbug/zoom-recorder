@@ -32,7 +32,8 @@ from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
-from hud.diarization import run_post_call_diarization  # noqa: E402
+from hud.diarization import (diarization_readiness,  # noqa: E402
+                             run_post_call_diarization)
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
 from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
@@ -43,8 +44,9 @@ from hud.menu_state import describe  # noqa: E402
 from hud.replay import benchmark, replay  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
-from hud.stt import (Chunker, LiveTranscriber, _Source, frame_rms_dbfs,  # noqa: E402
-                     StablePartialDecoder, fuzzy_overlap, looks_hallucinated,
+from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, _Source,  # noqa: E402
+                     frame_rms_dbfs, StablePartialDecoder, fuzzy_overlap,
+                     looks_hallucinated,
                      overlap_suffix_prefix,
                      pcm_to_wav, split_words)
 from hud.transcript_writeback import TranscriptWriteback  # noqa: E402
@@ -144,6 +146,23 @@ class ChunkerTests(unittest.TestCase):
 class SttPipelineTests(unittest.TestCase):
     def _transcriber(self, cfg):
         return LiveTranscriber(LiveState(), lambda _m: None, cfg, "Mic", None)
+
+    def test_local_cli_retries_without_metal_after_process_failure(self) -> None:
+        logs = []
+
+        def fake_run(command, **_kwargs):
+            if "-ng" in command:
+                out_base = Path(command[command.index("-of") + 1])
+                out_base.with_suffix(".txt").write_text("recovered text", encoding="utf-8")
+                return mock.Mock(returncode=0, stderr="")
+            return mock.Mock(returncode=-11, stderr="Metal buffer allocation failed")
+
+        stt = LocalWhisperSTT(Path("/tmp/model.bin"), logs.append, "not-installed")
+        stt._cli = "whisper-cli"
+        with mock.patch("hud.stt.subprocess.run", side_effect=fake_run):
+            result = stt.transcribe(b"\x00\x00" * 1600)
+        self.assertEqual(result.text, "recovered text")
+        self.assertTrue(any("GPU failed" in item for item in logs))
 
     def test_enqueue_drops_oldest_when_full(self) -> None:
         tr = self._transcriber(HudConfig(stt_queue_chunks=1))
@@ -626,12 +645,26 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(slugify("Résumé: Q3 / enrollment?"), "resume-q3-enrollment")
         self.assertLessEqual(len(slugify("word " * 100)), 64)
 
-    def test_post_call_diarization_is_disabled_by_default(self) -> None:
+    def test_post_call_diarization_is_enabled_by_default_but_safe_when_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = HudConfig()
+            self.assertTrue(cfg.diarization_enabled)
             self.assertIsNone(run_post_call_diarization(
                 Path(tmp) / "remote.wav", [], Path(tmp) / "derived", cfg,
                 lambda _m: None))
+
+    def test_diarization_readiness_is_secret_free_and_reflects_setup(self) -> None:
+        with mock.patch("hud.diarization._whisperx_binary", return_value="/tmp/whisperx"), \
+                mock.patch("hud.diarization._resolve_hf_token", return_value="hf_secret"):
+            status = diarization_readiness()
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["state"], "ready")
+        self.assertNotIn("hf_secret", json.dumps(status))
+
+        with mock.patch("hud.diarization._whisperx_binary", return_value=None):
+            status = diarization_readiness()
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["state"], "not_installed")
 
     def test_post_call_diarization_writes_derived_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2699,7 +2732,7 @@ class ControlCenterTests(unittest.TestCase):
                     # the Setup/Settings controls read these back on load
                     for key in ("mode", "paired_output", "stt_backend",
                                 "answers_enabled", "transcription_model",
-                                "api_keys_set"):
+                                "diarization", "api_keys_set"):
                         self.assertIn(key, status)
                 # a saved key is reported so the UI can tell the user
                 (Path(tmp) / "config.json").write_text(
@@ -2894,9 +2927,13 @@ class AuditHardeningTests(unittest.TestCase):
                              {"action": "open-terminal", "key": "rm -rf /"})
             self.assertFalse(bad["ok"])
             good = self._post(port, app.token, "api/fix",
-                              {"action": "open-terminal", "key": "install-blackhole"})
+                             {"action": "open-terminal", "key": "install-blackhole"})
             self.assertTrue(good["ok"])
             self.assertEqual(good["command"], "brew install blackhole-2ch")
+            setup = self._post(port, app.token, "api/fix",
+                               {"action": "open-terminal", "key": "setup-diarization"})
+            self.assertTrue(setup["ok"])
+            self.assertIn("install-diarization", setup["command"])
 
     def test_download_model_rejects_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

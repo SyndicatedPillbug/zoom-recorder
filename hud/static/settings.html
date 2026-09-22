@@ -173,7 +173,7 @@
     <div class="row"><label>Others (loopback)</label><div class="ctl">
       <input type="text" id="speakers.remote_name" /></div></div>
     <div class="hint">Mic and loopback are captured separately, so each is labelled. Multiple remote speakers share the loopback label.</div>
-    <div class="row"><label>Post-call diarization</label><div class="ctl">
+    <div class="row"><label>Identify participants after calls</label><div class="ctl">
       <input type="checkbox" id="diarization.enabled" /></div></div>
     <div class="row"><label>Diarization backend</label><div class="ctl">
       <select id="diarization.backend"><option value="auto">auto</option><option value="whisperx">WhisperX</option><option value="off">off</option></select></div></div>
@@ -185,7 +185,7 @@
       <input type="number" step="0.01" min="0.5" max="0.99" id="diarization.voice_profiles.threshold" /></div></div>
     <div class="row"><label>Voice profile file</label><div class="ctl">
       <input type="text" id="diarization.voice_profiles.path" placeholder="default: app config folder" /></div></div>
-    <div class="hint">Optional and never part of the live path. Requires WhisperX plus a Hugging Face token; it writes only derived/ files after recording.</div>
+    <div class="hint">Enabled by default and never part of the live path. It requires the optional WhisperX setup and writes only derived/ files after recording.</div>
   </section>
 
   <section>

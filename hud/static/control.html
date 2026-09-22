@@ -245,6 +245,24 @@
       <div class="row"><label>Offline mode</label>
         <div class="ctl"><input type="checkbox" id="offline" />
           <span class="note">Blocks all internet access (local transcript only)</span></div></div>
+      <div class="card" id="diarizationCard">
+        <div class="top"><span class="when">Identify participants</span>
+          <span class="badge" id="diarizationStatus">Checking…</span></div>
+        <p class="note">On by default. After the call, the app separates different remote
+          speakers and improves future matches from names you confirm. It never slows the
+          live transcript or answers.</p>
+        <div class="row"><label>Speaker identification</label>
+          <div class="ctl"><input type="checkbox" id="diarizationEnabled" />
+            <span class="note">Process the saved audio after each call</span></div></div>
+        <div class="row"><label>Reuse confirmed voices</label>
+          <div class="ctl"><input type="checkbox" id="voiceProfilesEnabled" />
+            <span class="note">Stores voice signatures, never audio</span></div></div>
+        <div class="note" id="diarizationDetail"></div>
+        <div class="actions">
+          <button class="secondary mini hidden" id="setupDiarization">Set up participant identification</button>
+          <span class="status" id="diarizationSetupStatus"></span>
+        </div>
+      </div>
       <div class="row"><label>Start at login</label>
         <div class="ctl"><input type="checkbox" id="loginAgent2" />
           <span class="status" id="loginStatus2"></span></div></div>
@@ -360,6 +378,7 @@
       return;
     }
     stateCache = s;
+    renderDiarizationStatus(s.diarization);
     setStatus($('statePill'),
       (s.recording ? 'recording' : 'ready') + (s.offline ? ' · offline' : ''), 'muted');
     // Both "Start at login" checkboxes mirror the real LaunchAgent state.
@@ -370,6 +389,36 @@
     applySetupState();
     if (!s.onboarded && !setupChecked) { setupChecked = true; runChecks(); }
   }
+
+  function renderDiarizationStatus(info) {
+    const badge = $('diarizationStatus');
+    const detail = $('diarizationDetail');
+    if (!badge || !detail) return;
+    const value = info || {};
+    badge.textContent = value.label || 'Checking…';
+    badge.className = 'badge ' + (value.ready ? 'ok' : 'warn');
+    detail.textContent = value.detail || '';
+    const setup = $('setupDiarization');
+    if (setup) setup.classList.toggle('hidden', !!value.ready);
+  }
+
+  $('setupDiarization').onclick = async () => {
+    const status = $('diarizationSetupStatus');
+    const button = $('setupDiarization');
+    button.disabled = true;
+    const r = await guarded(status, 'Opening setup…',
+      () => api('/api/fix', 'POST', {
+        action: 'open-terminal', key: 'setup-diarization'
+      }));
+    if (r && r.command && !r.started) {
+      try { await navigator.clipboard.writeText(r.command); } catch (e) {}
+      setStatus(status, 'Setup command copied to clipboard', 'warn');
+    } else if (r && r.ok) {
+      setStatus(status, 'Setup is running in Terminal', 'ok');
+    }
+    setTimeout(refreshState, 1200);
+    button.disabled = false;
+  };
 
   let setupApplied = false;
   let setupChecked = false;
@@ -688,6 +737,9 @@
     $('modeSelect').value = rec.mode || 'both';
     $('notifications').checked = !(c.privacy && c.privacy.notifications === false);
     $('offline').checked = !!(c.privacy && c.privacy.offline);
+    const diar = c.diarization || {};
+    $('diarizationEnabled').checked = diar.enabled !== false;
+    $('voiceProfilesEnabled').checked = !((diar.voice_profiles || {}).enabled === false);
     $('micSelect').value = rec.mic || '';
     await loadDevices();
     $('micSelect').value = rec.mic || '';
@@ -695,7 +747,8 @@
     setStatus($('settingsStatus'), '');
   }
   // Keep edits across tab switches instead of silently reloading over them.
-  ['basedir', 'micSelect', 'modeSelect', 'modelPath', 'notifications', 'offline']
+  ['basedir', 'micSelect', 'modeSelect', 'modelPath', 'notifications', 'offline',
+   'diarizationEnabled', 'voiceProfilesEnabled']
     .forEach(id => { const el = $(id); if (el) el.addEventListener('change', () => {
       settingsDirty = true;
       setStatus($('settingsStatus'), 'Unsaved changes — press Save', 'warn');
@@ -716,6 +769,10 @@
       privacy: {
         notifications: $('notifications').checked,
         offline: $('offline').checked,
+      },
+      diarization: {
+        enabled: $('diarizationEnabled').checked,
+        voice_profiles: { enabled: $('voiceProfilesEnabled').checked },
       },
     };
     const r = await guarded($('settingsStatus'), 'Saving…',

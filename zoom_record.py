@@ -1135,7 +1135,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--no-speaker-labels", action="store_true",
                         help="mix mic+system into one unlabelled stream")
     parser.add_argument("--diarize", action="store_true",
-                        help="after the call, optionally split remote speakers with WhisperX")
+                        help="compatibility override: enable post-call WhisperX speaker splitting")
     parser.add_argument("--diarization-backend", default=None,
                         help="post-call attribution backend: auto | whisperx | off")
     return parser.parse_args(argv)

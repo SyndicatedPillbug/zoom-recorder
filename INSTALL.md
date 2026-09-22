@@ -15,7 +15,7 @@ cd ~/zoom-recorder
 # ...or install what is missing (Homebrew ffmpeg + BlackHole, pip rumps):
 ./install.sh --install-deps
 
-# Optional post-call speaker diarization and reusable voice matching:
+# Post-call speaker diarization and reusable voice matching (enabled by default):
 ./install.sh --install-diarization
 ./.venv-diarization/bin/hf auth login
 ```
@@ -82,13 +82,14 @@ Open **Setup** (menu: *Check my audio setup…*) and choose step 4:
 - **Online** — Groq / OpenAI / OpenRouter with an API key for the best
   accuracy and for Suggestions/answers.
 
-Optional multi-speaker attribution is a separate, post-call feature. It is
-disabled by default so it cannot affect live capture or answer latency. The
+Multi-speaker attribution is a separate, post-call feature. It is enabled by
+default in the Control Center and cannot affect live capture or answer
+latency. The
 supported setup creates a repo-local `.venv-diarization` environment with
 WhisperX and `pyannote.audio`; the recorder discovers its `whisperx` command
 automatically. Authenticate that environment with `hf auth login` or provide
 the model credential through `HF_TOKEN`, then start a live session with
-`./zoom_record.py --live --diarize`. The result is written under `derived/`;
+`./zoom_record.py --live`. The result is written under `derived/`;
 missing dependencies or a failed pass leave the ordinary transcript intact.
 
 During any live session, click a speaker label in the transcript to enter a

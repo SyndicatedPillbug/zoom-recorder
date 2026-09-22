@@ -77,7 +77,7 @@ if [[ "$INSTALL_DIARIZATION" == "1" ]]; then
     run "$DIAR_PYTHON" -m venv "$DIAR_VENV"
     run "$DIAR_VENV/bin/python" -m pip install --upgrade pip setuptools wheel
     run "$DIAR_VENV/bin/python" -m pip install whisperx pyannote.audio
-    say "Authenticate it before using --diarize: $DIAR_VENV/bin/hf auth login"
+    say "Authenticate it before the next recording: $DIAR_VENV/bin/hf auth login"
   else
     say "ERROR: Python 3.12 could not be located after installation" >&2
   fi

@@ -20,6 +20,7 @@ import os
 import secrets
 import shutil
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,8 @@ MIC_SETTINGS_URL = ("x-apple.systempreferences:com.apple.preference.security"
 TERMINAL_COMMANDS = {
     "install-blackhole": "brew install blackhole-2ch",
     "install-whisper": "brew install whisper.cpp",
+    "setup-diarization": "cd {} && ./install.sh --install-diarization && ./.venv-diarization/bin/hf auth login".format(
+        shlex.quote(str(REPO))),
 }
 
 # Local transcription models we are willing to download, with their official
@@ -456,6 +459,7 @@ class _Handler(BaseHTTPRequestHandler):
     # -- handlers ----------------------------------------------------------
     def _status(self) -> None:
         from hud import routing_fix
+        from hud.diarization import diarization_readiness
         cfg = load_config(self.app.config_path)
         recording = recording_active()
         # "Start at login" is the LaunchAgent plist existing/enabled; both the
@@ -463,6 +467,15 @@ class _Handler(BaseHTTPRequestHandler):
         plist = Path.home() / "Library" / "LaunchAgents" / "com.zoomrecorder.menubar.plist"
         keys_set = {name: bool(cfg.api_key_for(name))
                     for name in PROVIDERS if get_provider(name).api_key_env}
+        try:
+            diarization_status = diarization_readiness()
+        except Exception as exc:  # noqa: BLE001
+            diarization_status = {
+                "ready": False,
+                "state": "error",
+                "label": "Check setup",
+                "detail": str(exc),
+            }
         self._send_json({
             "ok": True,
             "recording": recording,
@@ -477,6 +490,10 @@ class _Handler(BaseHTTPRequestHandler):
             "stt_backend": cfg.stt_backend,
             "answers_enabled": cfg.answers_enabled,
             "transcription_model": cfg.recorder.transcription_model,
+            "diarization": {
+                "enabled": cfg.diarization_enabled,
+                **diarization_status,
+            },
             "api_keys_set": keys_set,
             "config_path": str(self.app.config_path),
         })

@@ -22,7 +22,7 @@ selection, continuous capture verification, dynamic failover, and transcription.
 git clone <this repo> ~/zoom-recorder
 cd ~/zoom-recorder
 ./install.sh --install-deps   # checks/installs ffmpeg, BlackHole, rumps
-# Optional post-call speaker attribution and reusable voice profiles:
+# Post-call speaker attribution and reusable voice profiles (enabled by default):
 ./install.sh --install-diarization
 ./.venv-diarization/bin/hf auth login
 ./run-menubar.command         # start the menu bar
@@ -236,8 +236,8 @@ recording stops. These files are written under `derived/` (flushed every
 | `live_conversation.md` | Transcript **and** answers interleaved in order, so each answer sits next to the speech that prompted it |
 | `live_answers.md` | Just the AI answers and talking points |
 | `live_summary.md` | End-of-call summary, action items and a follow-up email draft |
-| `diarization.json` | Optional post-call speaker turns and confidence metadata |
-| `diarized_transcript.md` | Optional derived transcript with generic remote speaker IDs |
+| `diarization.json` | Post-call speaker turns and confidence metadata when the backend is ready |
+| `diarized_transcript.md` | Derived transcript with generic remote speaker IDs when the backend is ready |
 
 The live session also writes `live_events.jsonl` (a provider-free replay
 fixture), `meeting_memory.json` (decisions, commitments and numeric facts with
@@ -291,15 +291,15 @@ instant, does not call an AI provider, and changes historical display/writeback
 views without rewriting raw audio or transcript events. The mapping is saved in
 `session.json`.
 
-**Optional post-call diarization.** For calls with several people sharing one
-remote/system channel, the safe first step is an opt-in background pass after
-capture. It never delays live STT, question detection, or answer TTFT. The
+**Post-call diarization.** For calls with several people sharing one
+remote/system channel, the app runs a background pass after capture by default.
+It never delays live STT, question detection, or answer TTFT. The
 supported setup installs WhisperX and its diarization dependencies in the
 repo-local `.venv-diarization` environment; the app finds that environment
 automatically. Authenticate with `hf auth login` or set `HF_TOKEN`, then run:
 
 ```bash
-./zoom_record.py --live --diarize --self-name "Dana"
+./zoom_record.py --live --self-name "Dana"
 ```
 
 The pass processes only the saved remote track when one exists, uses fixed
@@ -503,7 +503,7 @@ to drift minutes behind the call.
   "kb":      {"dirs": ["~/notes"], "top_k": 5, "embed_backend": "auto"},
   "hud":     {"port": 0, "open_browser": true, "persist_seconds": 20},
   "transcript": {"writeback_dir": "~/Obsidian/LiveTranscripts"},
-  "diarization": {"enabled": false, "backend": "auto", "timeout_seconds": 300,
+  "diarization": {"enabled": true, "backend": "auto", "timeout_seconds": 300,
                    "voice_profiles": {"enabled": true, "threshold": 0.78}},
   "speakers": {"enabled": true, "self_name": "You", "remote_name": "Others"},
   "api_keys": {"openrouter": "sk-or-..."}
@@ -614,7 +614,7 @@ to the **next** recording, since the HUD reads config at session start.
 | `--self-name NAME` | You | Label your microphone audio with this name in the transcript |
 | `--remote-name NAME` | Others | Label the system/loopback audio with this name |
 | `--no-speaker-labels` | off | Mix mic+system into one unlabelled stream |
-| `--diarize` | off | Run optional post-call WhisperX attribution after a live session |
+| `--diarize` | settings | Compatibility override: run post-call WhisperX attribution after a live session |
 | `--diarization-backend X` | config | Post-call attribution: `auto` \| `whisperx` \| `off` |
 | `--live-audio-file PATH` | none | Feed a media file to the HUD instead of a live tap (testing) |
 

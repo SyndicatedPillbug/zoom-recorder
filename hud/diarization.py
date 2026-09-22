@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Optional post-call speaker attribution.
+"""Post-call speaker attribution.
 
 This module is intentionally an adapter, not part of the live path.  When
-WhisperX and its diarization dependencies are installed and explicitly
-enabled, it processes the saved remote track after recording.  If the tool,
-model, token, or runtime is unavailable, the original channel-labelled
-transcript remains the source of truth and the call still completes normally.
+WhisperX and its diarization dependencies are installed, it processes the
+saved remote track after recording. The feature is enabled by default from
+Settings, but remains an optional backend: if the tool, model, token, or
+runtime is unavailable, the original channel-labelled transcript remains the
+source of truth and the call still completes normally.
 """
 
 from __future__ import annotations
@@ -92,6 +93,31 @@ def _whisperx_binary(backend: str) -> Optional[str]:
     if repo_local.is_file():
         return str(repo_local)
     return shutil.which("whisperx")
+
+
+def diarization_readiness() -> Dict[str, Any]:
+    """Return a cheap, secret-free readiness summary for the Control Center."""
+    binary = _whisperx_binary("auto")
+    if not binary:
+        return {
+            "ready": False,
+            "state": "not_installed",
+            "label": "Setup needed",
+            "detail": "Install the optional speaker-identification component from Settings.",
+        }
+    if not _resolve_hf_token():
+        return {
+            "ready": False,
+            "state": "not_authenticated",
+            "label": "Sign in needed",
+            "detail": "A Hugging Face read token is needed for the speaker model.",
+        }
+    return {
+        "ready": True,
+        "state": "ready",
+        "label": "Ready",
+        "detail": "Runs after each recording and never delays the live transcript.",
+    }
 
 
 def _add_optional_embeddings(audio_path: Path, segments: List[Dict[str, Any]],

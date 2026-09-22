@@ -233,9 +233,9 @@ class HudConfig:
     # derived/ output; it mirrors the live transcript while the call runs.
     transcript_writeback_dir: Optional[str] = None
 
-    # Optional post-call attribution. This is deliberately disabled by
-    # default: live capture, STT, and answers never depend on it.
-    diarization_enabled: bool = False
+    # Post-call attribution is enabled by default. It is isolated from live
+    # capture, STT, and answers, so it never adds latency to the meeting.
+    diarization_enabled: bool = True
     diarization_backend: str = "auto"       # auto | whisperx | off
     diarization_timeout_seconds: float = 300.0
     voice_profiles_enabled: bool = True
@@ -368,7 +368,7 @@ def _defaults() -> Dict[str, Any]:
         },
         "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1", "persist_seconds": 20.0},
         "transcript": {"writeback_dir": None},
-        "diarization": {"enabled": False, "backend": "auto",
+        "diarization": {"enabled": True, "backend": "auto",
                          "timeout_seconds": 300.0,
                          "voice_profiles": {"enabled": True, "path": None,
                                             "threshold": 0.78}},
@@ -484,7 +484,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         host=str(hud.get("host") or "127.0.0.1"),
         persist_seconds=_as_float(hud.get("persist_seconds"), 20.0),
         transcript_writeback_dir=transcript.get("writeback_dir") or None,
-        diarization_enabled=bool(diarization.get("enabled", False)),
+        diarization_enabled=bool(diarization.get("enabled", True)),
         diarization_backend=str(diarization.get("backend") or "auto"),
         diarization_timeout_seconds=_as_float(
             diarization.get("timeout_seconds"), 300.0),
