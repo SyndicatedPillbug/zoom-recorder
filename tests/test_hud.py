@@ -142,6 +142,16 @@ class ChunkerTests(unittest.TestCase):
         self.assertTrue(out)
         self.assertLess(len(out[0]), int(10.0 * 16000 * 2))
 
+    def test_adaptive_target_retunes_and_preserves_overlap(self) -> None:
+        c = Chunker(2.0, min_speech_seconds=0.2, min_chunk_seconds=1.0,
+                    max_chunk_seconds=3.0, overlap_seconds=0.5)
+        first = c.feed(tone(2.1, freq=440.0) + tone(2.0, freq=880.0))
+        self.assertGreaterEqual(len(first), 2)
+        overlap_bytes = int(0.5 * 16000 * 2)
+        self.assertEqual(first[0][-overlap_bytes:], first[1][:overlap_bytes])
+        self.assertEqual(c.set_target_seconds(0.2), 1.0)
+        self.assertEqual(c.set_target_seconds(4.0), 3.0)
+
 
 class SttPipelineTests(unittest.TestCase):
     def _transcriber(self, cfg):
@@ -294,6 +304,23 @@ class SttPipelineTests(unittest.TestCase):
         self.assertEqual(tr._effective_chunk_seconds(), 7.0)
         cfg.stt_backend = "local"
         self.assertEqual(tr._effective_chunk_seconds(), 5.0)
+
+    def test_local_adaptive_chunking_moves_with_inference_pressure(self) -> None:
+        cfg = HudConfig(stt_backend="local", stt_chunk_seconds=5.0,
+                        stt_chunk_min_seconds=3.0, stt_chunk_max_seconds=7.0)
+        tr = LiveTranscriber(LiveState(), lambda _m: None, cfg, "Mic", None)
+        src = _Source("You", [])
+        src.queue = queue.Queue()
+        src.chunker = Chunker(5.0, min_chunk_seconds=3.0,
+                              max_chunk_seconds=7.0, overlap_seconds=0.5)
+        tr._retune_chunker(src, inference_seconds=5.0)
+        self.assertEqual(src.chunker.target_seconds, 5.0)
+        tr._retune_chunker(src, inference_seconds=1.0)
+        self.assertEqual(src.chunker.target_seconds, 4.5)
+        src.queue.put((0.0, b"one", 0.0))
+        src.queue.put((0.0, b"two", 0.0))
+        tr._retune_chunker(src, inference_seconds=5.0)
+        self.assertEqual(src.chunker.target_seconds, 5.0)
 
 
 class VADTests(unittest.TestCase):
@@ -932,6 +959,8 @@ class ConfigTests(unittest.TestCase):
             talking_points_grounded=False, talking_points_max=2,
             talking_points_min_new_words=80, talking_points_min_words=30,
             talking_points_quote_overlap=0.6,
+            stt_adaptive_chunking=False, stt_chunk_min_seconds=2.5,
+            stt_chunk_max_seconds=8.0, stt_chunk_overlap_seconds=0.25,
             transcript_writeback_dir="~/Obsidian/LiveTranscripts",
             diarization_enabled=True, diarization_backend="whisperx",
             diarization_timeout_seconds=90.0)
@@ -946,6 +975,8 @@ class ConfigTests(unittest.TestCase):
                      "talking_points_grounded", "talking_points_max",
                      "talking_points_min_new_words", "talking_points_min_words",
                      "talking_points_quote_overlap", "transcript_writeback_dir",
+                     "stt_adaptive_chunking", "stt_chunk_min_seconds",
+                     "stt_chunk_max_seconds", "stt_chunk_overlap_seconds",
                      "diarization_enabled", "diarization_backend",
                      "diarization_timeout_seconds",
                      "stt_partial_enabled", "stt_partial_window_seconds",

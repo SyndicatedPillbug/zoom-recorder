@@ -244,8 +244,22 @@ class Chunker:
     def __init__(self, chunk_seconds: float, min_speech_seconds: float = 0.8,
                  silence_flush_seconds: float = 1.4, silence_db: float = -50.0,
                  frame_ms: int = 100, phrase_silence_seconds: float = 0.6,
-                 phrase_min_speech_seconds: float = 6.0, vad=None) -> None:
-        self.chunk_bytes = int(chunk_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
+                 phrase_min_speech_seconds: float = 6.0, vad=None,
+                 min_chunk_seconds: Optional[float] = None,
+                 max_chunk_seconds: Optional[float] = None,
+                 overlap_seconds: float = 0.0) -> None:
+        self.base_chunk_seconds = max(0.5, float(chunk_seconds))
+        self.min_chunk_seconds = max(
+            0.5, float(min_chunk_seconds if min_chunk_seconds is not None
+                       else self.base_chunk_seconds))
+        self.max_chunk_seconds = max(
+            self.min_chunk_seconds,
+            float(max_chunk_seconds if max_chunk_seconds is not None
+                  else self.base_chunk_seconds))
+        self.overlap_seconds = max(0.0, float(overlap_seconds))
+        self.target_seconds = self._clamp_target(self.base_chunk_seconds)
+        self.chunk_bytes = 0
+        self._set_chunk_bytes()
         self.min_speech_bytes = int(min_speech_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.silence_flush_bytes = int(silence_flush_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
         self.phrase_silence_bytes = int(phrase_silence_seconds * SAMPLE_RATE * SAMPLE_WIDTH)
@@ -257,6 +271,34 @@ class Chunker:
         self._buf = bytearray()
         self._speech_bytes = 0
         self._silence_run = 0
+
+    def _clamp_target(self, seconds: float) -> float:
+        return min(self.max_chunk_seconds,
+                   max(self.min_chunk_seconds, float(seconds)))
+
+    def _set_chunk_bytes(self) -> None:
+        self.chunk_bytes = max(
+            self.frame_bytes if hasattr(self, "frame_bytes") else 1,
+            int(self.target_seconds * SAMPLE_RATE * SAMPLE_WIDTH))
+
+    def set_target_seconds(self, seconds: float) -> float:
+        """Retune the target without changing the buffered audio."""
+        self.target_seconds = self._clamp_target(seconds)
+        self._set_chunk_bytes()
+        return self.target_seconds
+
+    def _emit_target(self, pending: bytearray) -> bytes:
+        """Emit a target-sized window while retaining a small audio overlap."""
+        emit_bytes = min(len(pending), self.chunk_bytes)
+        overlap_bytes = min(
+            int(self.overlap_seconds * SAMPLE_RATE * SAMPLE_WIDTH),
+            max(0, emit_bytes - self.frame_bytes))
+        consumed = emit_bytes - overlap_bytes
+        data = bytes(pending[:emit_bytes])
+        del pending[:consumed]
+        self._speech_bytes = max(0, self._speech_bytes - consumed)
+        self._silence_run = 0
+        return data
 
     def _is_speech(self, frame: bytes) -> bool:
         if self.vad is not None:
@@ -290,10 +332,7 @@ class Chunker:
             pending = self._pending
             if self._speech_bytes >= self.min_speech_bytes:
                 if len(pending) >= self.chunk_bytes:
-                    out.append(bytes(pending[: self.chunk_bytes]))
-                    del pending[: self.chunk_bytes]
-                    self._speech_bytes = max(0, self._speech_bytes - self.chunk_bytes)
-                    self._silence_run = 0
+                    out.append(self._emit_target(pending))
                 elif self._silence_run >= self.silence_flush_bytes:
                     out.append(bytes(pending))
                     pending.clear()
@@ -561,6 +600,7 @@ class _Source:
         self.partial_decoder = StablePartialDecoder()
         self.partial_revision = 0
         self.vad = None
+        self.chunker: Optional[Chunker] = None
         self.tail: List[str] = []
         self.context_tail = ""
         self.dropped = 0
@@ -632,8 +672,10 @@ class LiveTranscriber:
     def _start_sources(self) -> None:
         label = " + ".join(s.speaker or "mixed" for s in self._sources)
         self._active_chunk_seconds = self._effective_chunk_seconds()
-        self.log("live STT running ({} backend, {:.0f}s chunks, {} queue, sources: {})".format(
+        adaptive = self._adaptive_chunking_enabled()
+        self.log("live STT running ({} backend, {:.1f}s chunks{}, {} queue, sources: {})".format(
             self.cfg.stt_backend, self._active_chunk_seconds,
+            ", adaptive" if adaptive else "",
             getattr(self.cfg, "stt_queue_chunks", 4), label))
         if self._glossary:
             self.log("live STT glossary: {}".format(", ".join(self._glossary)))
@@ -663,6 +705,15 @@ class LiveTranscriber:
                      "the provider request limit (configured {:.1f}s)".format(configured))
             return 7.0
         return configured
+
+    def _adaptive_chunking_enabled(self) -> bool:
+        return (bool(getattr(self.cfg, "stt_adaptive_chunking", True))
+                and (self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS)
+
+    def _chunk_bounds(self) -> tuple[float, float]:
+        minimum = max(1.0, float(getattr(self.cfg, "stt_chunk_min_seconds", 3.0)))
+        maximum = max(minimum, float(getattr(self.cfg, "stt_chunk_max_seconds", 7.0)))
+        return minimum, maximum
 
     def _partial_enabled(self) -> bool:
         return ((self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS
@@ -797,8 +848,17 @@ class LiveTranscriber:
             self.state.set_status("recording", tap_error=str(exc))
             return
         source.vad = build_vad(self.cfg, self.log)
-        chunker = Chunker(self._active_chunk_seconds, self.cfg.stt_min_speech_seconds,
-                          vad=source.vad)
+        minimum, maximum = self._chunk_bounds()
+        adaptive = self._adaptive_chunking_enabled()
+        chunker = Chunker(
+            self._active_chunk_seconds, self.cfg.stt_min_speech_seconds,
+            phrase_min_speech_seconds=(minimum if adaptive else 6.0),
+            vad=source.vad,
+            min_chunk_seconds=(minimum if adaptive else None),
+            max_chunk_seconds=(maximum if adaptive else None),
+            overlap_seconds=(float(getattr(self.cfg, "stt_chunk_overlap_seconds", 0.5))
+                             if adaptive else 0.0))
+        source.chunker = chunker
         assert source.proc.stdout is not None
         last_publish = 0.0
         try:
@@ -849,8 +909,12 @@ class LiveTranscriber:
     def _publish_lag(self) -> None:
         queued = sum(s.queue.qsize() for s in self._sources)
         dropped = sum(s.dropped for s in self._sources)
-        lag = round(queued * self._active_chunk_seconds, 1)
-        meta = {"stt_lag_seconds": lag, "stt_queued": queued, "stt_dropped": dropped}
+        targets = [getattr(getattr(s, "chunker", None), "target_seconds",
+                           self._active_chunk_seconds) for s in self._sources]
+        lag = round(sum(s.queue.qsize() * target
+                        for s, target in zip(self._sources, targets)), 1)
+        meta = {"stt_lag_seconds": lag, "stt_queued": queued, "stt_dropped": dropped,
+                "stt_chunk_seconds": round(max(targets or [self._active_chunk_seconds]), 2)}
         thresholds = [t for t in (
             getattr(s.vad, "threshold_db", lambda: None)()
             for s in self._sources if s.vad is not None) if t is not None]
@@ -1044,6 +1108,7 @@ class LiveTranscriber:
                 self._provider_backoff_until = 0.0
                 self._provider_backoff_seconds = 4.0
         result = out if isinstance(out, STTResult) else STTResult(text=str(out or ""))
+        self._retune_chunker(source, time.time() - started)
         text = result.text.strip()
         if not text:
             return
@@ -1080,6 +1145,30 @@ class LiveTranscriber:
                 stt_lag_seconds=round(max(0.0, time.time() - captured_at), 1),
                 stt_final_inferences=self._final_inference_count,
                 stt_partial_dropped=self._partial_dropped)
+
+    def _retune_chunker(self, source: "_Source", inference_seconds: float) -> None:
+        """Adapt local windows while protecting the live queue from backlog."""
+        if not self._adaptive_chunking_enabled():
+            return
+        chunker = getattr(source, "chunker", None)
+        if chunker is None:
+            return
+        current = float(chunker.target_seconds)
+        minimum, maximum = self._chunk_bounds()
+        queued = source.queue.qsize()
+        # A growing queue means the next request should be larger. Inference
+        # time alone is not enough: increasing the audio window merely hides
+        # slow decoding by adding more capture-to-text latency. When the
+        # worker is comfortably ahead, shrink toward the low-latency target.
+        if queued >= 2:
+            target = min(maximum, current + 0.5)
+        elif queued == 0 and inference_seconds <= current * 0.6:
+            target = max(minimum, current - 0.5)
+        else:
+            target = current
+        if target != current:
+            chunker.set_target_seconds(target)
+            self.state.set_meta(stt_chunk_seconds=round(target, 2))
 
     def _delta_text(self, source: "_Source", text: str) -> str:
         words = split_words(text)

@@ -32,8 +32,23 @@ summary generation and final persistence.
 
 Transcript events now carry source segment IDs, revisions and finality; a shared
 inference gate prioritizes final chunks and drops stale interim work. The
-remaining enhancement is percentile aggregation in diagnostics; the current
-HUD exposes live lag and drop counters.
+ diagnostics now expose percentile latency, live lag, queue depth, and drop
+ counters.
+
+### Phase B.1 — adaptive local windows (in progress)
+
+The local Turbo path now starts at the configured chunk target, retunes between
+configurable minimum and maximum bounds, and retains a small overlap between
+target-sized windows. Actual queue pressure is required before a window grows;
+inference time by itself never adds capture-to-text latency. Phrase pauses may
+still flush a shorter window, and final work remains ahead of provisional work.
+
+The first real-time AMI replay after this change produced zero final queue
+drops, nine final inferences, and a final shutdown lag of about 2.1 seconds.
+Its measured p50/p95 final latency was about 2.9/5.0 seconds, so the replay
+demonstrates the path but does not yet satisfy the final latency gate. The next
+pass should compare several speech densities and tune overlap, phrase flush,
+and partial-worker admission before changing the answer scheduler.
 
 ### Phase C — question finalization and answer evidence (implemented baseline)
 

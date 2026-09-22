@@ -157,7 +157,11 @@ class HudConfig:
     # Speech-to-text
     stt_backend: str = "groq"          # groq | openai | local
     stt_model: Optional[str] = None    # None => provider default
-    stt_chunk_seconds: float = 5.0     # lower latency; Groq bills 10s min anyway
+    stt_chunk_seconds: float = 5.0     # initial live chunk target
+    stt_adaptive_chunking: bool = True # local STT retunes around speech/queue pressure
+    stt_chunk_min_seconds: float = 3.0
+    stt_chunk_max_seconds: float = 7.0
+    stt_chunk_overlap_seconds: float = 0.5
     stt_min_speech_seconds: float = 0.8
     stt_whisper_bin: str = "whisper-server"
     stt_glossary: List[str] = field(default_factory=list)
@@ -311,6 +315,10 @@ def _defaults() -> Dict[str, Any]:
             "backend": "groq",
             "model": None,
             "chunk_seconds": 5.0,
+            "adaptive_chunking": True,
+            "chunk_min_seconds": 3.0,
+            "chunk_max_seconds": 7.0,
+            "chunk_overlap_seconds": 0.5,
             "min_speech_seconds": 0.8,
             "whisper_bin": "whisper-server",
             "glossary": [],
@@ -426,6 +434,11 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_backend=str(stt.get("backend") or "groq"),
         stt_model=stt.get("model") or None,
         stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 5.0),
+        stt_adaptive_chunking=bool(stt.get("adaptive_chunking", True)),
+        stt_chunk_min_seconds=_as_float(stt.get("chunk_min_seconds"), 3.0),
+        stt_chunk_max_seconds=_as_float(stt.get("chunk_max_seconds"), 7.0),
+        stt_chunk_overlap_seconds=_as_float(
+            stt.get("chunk_overlap_seconds"), 0.5),
         stt_min_speech_seconds=_as_float(stt.get("min_speech_seconds"), 0.8),
         stt_whisper_bin=str(stt.get("whisper_bin") or "whisper-server"),
         stt_glossary=_as_str_list(stt.get("glossary")),
@@ -520,6 +533,10 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "backend": cfg.stt_backend,
         "model": cfg.stt_model,
         "chunk_seconds": cfg.stt_chunk_seconds,
+        "adaptive_chunking": cfg.stt_adaptive_chunking,
+        "chunk_min_seconds": cfg.stt_chunk_min_seconds,
+        "chunk_max_seconds": cfg.stt_chunk_max_seconds,
+        "chunk_overlap_seconds": cfg.stt_chunk_overlap_seconds,
         "min_speech_seconds": cfg.stt_min_speech_seconds,
         "whisper_bin": cfg.stt_whisper_bin,
         "glossary": list(cfg.stt_glossary),
