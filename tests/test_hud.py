@@ -936,11 +936,28 @@ class AnswerEngineTests(unittest.TestCase):
             return LLMResult(text="- first point\n- second point", model=model,
                              usage={"total_tokens": 12})
 
+        def chat_stream(self, messages, model, max_tokens=600, temperature=0.2,
+                        response_format=None, timeout=None, on_chunk=None):
+            # Delegate to chat; streaming is tested at the LLMClient level.
+            result = self.chat(messages, model, max_tokens, temperature,
+                              response_format, timeout)
+            if on_chunk and result.text:
+                on_chunk(result.text)
+            return result
+
     class _EchoClient:
         def chat(self, messages, model, max_tokens=600, temperature=0.2,
                  response_format=None, timeout=None):
             return LLMResult(text=json.dumps({"bullets": ["Point one", "Point two"]}),
                              model=model, usage={"total_tokens": 5})
+
+        def chat_stream(self, messages, model, max_tokens=600, temperature=0.2,
+                        response_format=None, timeout=None, on_chunk=None):
+            result = self.chat(messages, model, max_tokens, temperature,
+                              response_format, timeout)
+            if on_chunk and result.text:
+                on_chunk(result.text)
+            return result
 
     class _KeywordEmbedder:
         label = "test:keywords"
@@ -1009,9 +1026,10 @@ class AnswerEngineTests(unittest.TestCase):
             "name": "groq", "client": client,
             "chat_model": "m", "rolling_model": "m", "structured": False,
         }])
+        # Very short ambiguous question with no context triggers the rewrite.
         engine._buffer = [Turn(1, 0.0, "Client", "What about that?")]
-        engine._execute({"kind": "question", "question": "What about that?",
-                         "context": "[00:00:00] Client: We stage it in three rings.",
+        engine._execute({"kind": "question", "question": "What?",
+                         "context": "",
                          "window": engine._context_text()})
         answers = state.snapshot()["answers"]
         self.assertEqual(len(answers), 1)

@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 
@@ -170,6 +170,71 @@ class LLMClient:
                     break
         raise last_exc if last_exc is not None else OSError("request failed")
 
+    def _stream_request(self, path: str, data: bytes, headers: Dict[str, str],
+                        timeout: float,
+                        on_chunk: Optional[Callable[[str], None]]) -> LLMResult:
+        """POST with streaming SSE response, calling on_chunk for each delta."""
+        url = "{}{}".format(self.base_url, path)
+        conn = self._connection()
+        try:
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            conn.request("POST", "{}{}".format(self._prefix, path),
+                         body=data, headers=headers)
+            resp = conn.getresponse()
+            status = resp.status
+            if status >= 400:
+                raw = resp.read()
+                if resp.will_close:
+                    self._drop_connection()
+                body = raw.decode("utf-8", errors="replace")
+                retry_after = None
+                ra = dict(resp.getheaders()).get("Retry-After")
+                if ra:
+                    try:
+                        retry_after = float(ra)
+                    except ValueError:
+                        pass
+                raise LLMError("POST {} -> HTTP {}".format(url, status),
+                               status=status, retry_after=retry_after, body=body)
+
+            full_text = []
+            buf = ""
+            model = ""
+            while True:
+                line = resp.fp.readline()
+                if not line:
+                    break
+                line = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except ValueError:
+                    continue
+                if not model:
+                    model = chunk.get("model", "")
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = (choices[0].get("delta") or {}).get("content") or ""
+                    if delta:
+                        full_text.append(delta)
+                        if on_chunk:
+                            on_chunk(delta)
+            if resp.will_close:
+                self._drop_connection()
+        except (http.client.HTTPException, OSError) as exc:
+            self._drop_connection()
+            raise LLMError("network error for {}: {}".format(url, exc)) from exc
+
+        text = "".join(full_text).strip()
+        return LLMResult(text=text, model=model)
+
     def _decode(self, raw: bytes) -> Any:
         return json.loads(raw.decode("utf-8"))
 
@@ -248,6 +313,44 @@ class LLMClient:
             text = ((choices[0].get("message") or {}).get("content") or "").strip()
         return LLMResult(text=text, model=obj.get("model", model),
                          usage=obj.get("usage") or {}, headers=headers)
+
+    def chat_stream(self, messages: List[Dict[str, str]], model: str,
+                    max_tokens: int = 400, temperature: float = 0.2,
+                    response_format: Optional[Dict[str, Any]] = None,
+                    timeout: Optional[float] = None,
+                    on_chunk: Optional[Callable[[str], None]] = None) -> LLMResult:
+        """Streaming chat: yields content deltas via ``on_chunk`` as they arrive.
+
+        Falls back to non-streaming if the server rejects ``stream: true``.
+        Returns the full assembled text as an LLMResult.
+        """
+        if _OFFLINE and self._host not in _LOCAL_HOSTS:
+            raise LLMError(
+                "offline mode: network access is disabled (blocked {})".format(
+                    self.base_url))
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        data = json.dumps(payload).encode("utf-8")
+        headers = self._headers("application/json")
+        url = "{}{}".format(self.base_url, "/chat/completions")
+
+        try:
+            result = self._stream_request("/chat/completions", data, headers,
+                                          timeout or self.timeout, on_chunk)
+        except LLMError as exc:
+            if exc.status == 400:
+                # Some providers reject stream + json mode; retry non-streaming.
+                return self.chat(messages, model, max_tokens, temperature,
+                                 response_format, timeout)
+            raise
+        return result
 
     # -- embeddings --------------------------------------------------------
     def embed(self, inputs: List[str], model: str,

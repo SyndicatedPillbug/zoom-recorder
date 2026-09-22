@@ -805,6 +805,63 @@ class AnswerEngine:
             return result
         return None
 
+    def _chat_stream(self, kind: str, system: str, prompt: str,
+                    max_tokens: Optional[int] = None, temperature: float = 0.2,
+                    model_override: Optional[str] = None,
+                    on_chunk: Optional[Callable[[str], None]] = None):
+        """Streaming variant of _chat: calls chat_stream with on_chunk."""
+        if self._chain is None or not self._chain.entries:
+            return None
+        max_out = max_tokens or self.cfg.answer_max_tokens
+        est = estimate_tokens(system + prompt, max_out)
+        entries = self._chain.entries
+        for offset in range(len(entries)):
+            entry = entries[(self._chain_index + offset) % len(entries)]
+            model = model_override or (
+                entry["rolling_model"] if kind == "rolling" else entry["chat_model"])
+            if not self.budget.can_afford(est):
+                return None
+            self.budget.reserve(est)
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ]
+            response_format = {"type": "json_object"} if entry.get("structured") else None
+            try:
+                result = entry["client"].chat_stream(
+                    messages, model, max_tokens=max_out,
+                    temperature=temperature, response_format=response_format,
+                    on_chunk=on_chunk)
+            except LLMError as exc:
+                if exc.status == 400 and response_format is not None:
+                    # Retry plain text; the bullet parser handles JSON-in-prose.
+                    self.log("answers: {} stream JSON mode rejected; retrying plain text".format(
+                        entry["name"]))
+                    try:
+                        result = entry["client"].chat_stream(
+                            messages, model, max_tokens=max_out,
+                            temperature=temperature, on_chunk=on_chunk)
+                    except LLMError as exc2:
+                        self.budget.record(None, None)
+                        self.log("answers: {} stream error: {}".format(entry["name"], exc2))
+                        continue
+                else:
+                    self.budget.record(None, None)
+                    if exc.status == 429:
+                        self.budget.pause(exc.retry_after, reason=str(exc))
+                        self.log("answers: rate limited by {}; backing off".format(entry["name"]))
+                        return None
+                    self.log("answers: {} stream error: {}".format(entry["name"], exc))
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                self.log("answers: {} stream unexpected error: {}".format(entry["name"], exc))
+                continue
+            self.budget.record(result.headers, result.usage)
+            self._chain_index = (self._chain_index + offset) % len(entries)
+            self.state.set_budget(self.budget.snapshot())
+            return result
+        return None
+
     def _answer_question(self, job: Dict[str, Any]) -> None:
         question = job.get("question") or ""
         context = job.get("context") or ""
@@ -813,8 +870,14 @@ class AnswerEngine:
             return
 
         rewritten = ""
+        # Skip the rewrite LLM call when we have enough context for the
+        # answer model to resolve references directly — the prompt already
+        # includes preceding turns and instructs reference resolution.
+        # Only rewrite very short, ambiguous questions with no context.
         if (not job.get("manual") and question and self.cfg.question_rewrite
-                and is_ambiguous_question(question)):
+                and is_ambiguous_question(question)
+                and len(question.split()) <= 4
+                and not context.strip()):
             rewritten = self._rewrite_question(question, context)
         effective = rewritten or question
 
@@ -828,28 +891,42 @@ class AnswerEngine:
         system = self._system_prompt("question")
         prompt = self._build_prompt("question", effective, context, window, snippets,
                                     qa=self._qa_recent())
-        result = self._chat("question", system, prompt)
+
+        # Create a placeholder answer event so the UI shows the question is
+        # being answered immediately, then stream the raw text in.
+        placeholder = self.state.add(
+            "answer", kind="question", question=question,
+            rewritten_question=rewritten or None, bullets=[],
+            sources=[s.source for s in snippets], model="", streaming=True)
+        event_id = placeholder["id"]
+        accumulated = []
+
+        def _on_chunk(delta: str) -> None:
+            accumulated.append(delta)
+            self.state.update_answer(event_id, streaming_text="".join(accumulated))
+
+        result = self._chat_stream("question", system, prompt, on_chunk=_on_chunk)
         if result is None:
-            self.state.add("answer", kind="question", question=question, bullets=[],
-                           sources=[], model="", error="all providers failed")
+            self.state.update_answer(event_id, bullets=[], model="",
+                                      streaming=False, error="all providers failed")
             return
+
         bullets = parse_bullets(result.text)
         if not bullets:
-            self.state.add("answer", kind="question", question=question, bullets=[],
-                           sources=[], model=result.model, error="no answer produced")
+            self.state.update_answer(event_id, bullets=[], model=result.model,
+                                      streaming=False, error="no answer produced")
             return
 
         parent_id = None
         if parse_follow_up(result.text):
             with self._lock:
                 parent_id = self._last_answer_id or None
-        event = self.state.add(
-            "answer", kind="question", question=question,
-            rewritten_question=rewritten or None, bullets=bullets,
-            sources=[s.source for s in snippets], model=result.model,
-            usage=result.usage, parent_id=parent_id)
+        self.state.update_answer(
+            event_id, bullets=bullets, model=result.model,
+            usage=result.usage, parent_id=parent_id, streaming=False,
+            streaming_text=None)
         with self._lock:
-            self._last_answer_id = event["id"]
+            self._last_answer_id = event_id
             self._qa_thread.append({"question": question, "bullets": bullets})
             keep = max(1, self.cfg.max_context_qa)
             del self._qa_thread[:-keep]

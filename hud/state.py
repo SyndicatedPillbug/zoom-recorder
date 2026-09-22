@@ -125,6 +125,23 @@ class LiveState:
             self.budget = snapshot
             self._lock.notify_all()
 
+    def update_answer(self, event_id: int, **fields: Any) -> None:
+        """Update an existing answer event in place (for streaming).
+
+        Replaces the named fields on the event and emits an 'answer_update'
+        event so SSE clients can patch the live card without waiting for a
+        full new event.
+        """
+        with self._lock:
+            for e in self._events:
+                if e.get("id") == event_id:
+                    e.update(fields)
+                    break
+            self._append_locked({
+                "type": "answer_update", "ref": event_id,
+                "fields": dict(fields),
+            })
+
     # -- reads -------------------------------------------------------------
     def latest_id(self) -> int:
         with self._lock:

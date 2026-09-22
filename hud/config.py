@@ -154,7 +154,7 @@ class HudConfig:
     # Speech-to-text
     stt_backend: str = "groq"          # groq | openai | local
     stt_model: Optional[str] = None    # None => provider default
-    stt_chunk_seconds: float = 10.0    # Groq bills a 10s minimum per request
+    stt_chunk_seconds: float = 5.0     # lower latency; Groq bills 10s min anyway
     stt_min_speech_seconds: float = 0.8
     stt_whisper_bin: str = "whisper-server"
     stt_glossary: List[str] = field(default_factory=list)
@@ -178,7 +178,7 @@ class HudConfig:
     answers_fallback: List[str] = field(default_factory=list)
     chat_model: Optional[str] = None
     rolling_model: Optional[str] = None
-    answer_interval: float = 35.0
+    answer_interval: float = 20.0
     rolling_enabled: bool = True
     answer_max_tokens: int = 600
     context_minutes: float = 5.0
@@ -195,9 +195,9 @@ class HudConfig:
     # and gated on enough new speech so sparse audio yields nothing.
     talking_points_grounded: bool = True
     talking_points_max: int = 3
-    talking_points_min_new_words: int = 60
+    talking_points_min_new_words: int = 30
     talking_points_min_words: int = 40
-    talking_points_quote_overlap: float = 0.7
+    talking_points_quote_overlap: float = 0.5
 
     # Knowledge base
     kb_enabled: bool = True
@@ -289,7 +289,7 @@ def _defaults() -> Dict[str, Any]:
         "stt": {
             "backend": "groq",
             "model": None,
-            "chunk_seconds": 10.0,
+            "chunk_seconds": 5.0,
             "min_speech_seconds": 0.8,
             "whisper_bin": "whisper-server",
             "glossary": [],
@@ -312,7 +312,7 @@ def _defaults() -> Dict[str, Any]:
             "fallback": [],
             "chat_model": None,
             "rolling_model": None,
-            "interval": 35.0,
+            "interval": 20.0,
             "rolling_enabled": True,
             "max_tokens": 600,
             "context_minutes": 5.0,
@@ -327,9 +327,9 @@ def _defaults() -> Dict[str, Any]:
             "summary_model": None,
             "talking_points_grounded": True,
             "talking_points_max": 3,
-            "talking_points_min_new_words": 60,
+            "talking_points_min_new_words": 30,
             "talking_points_min_words": 40,
-            "talking_points_quote_overlap": 0.7,
+            "talking_points_quote_overlap": 0.5,
         },
         "kb": {
             "enabled": True,
@@ -394,7 +394,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
     return HudConfig(
         stt_backend=str(stt.get("backend") or "groq"),
         stt_model=stt.get("model") or None,
-        stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 10.0),
+        stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 5.0),
         stt_min_speech_seconds=_as_float(stt.get("min_speech_seconds"), 0.8),
         stt_whisper_bin=str(stt.get("whisper_bin") or "whisper-server"),
         stt_glossary=_as_str_list(stt.get("glossary")),
@@ -415,7 +415,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         answers_fallback=_as_str_list(answers.get("fallback")),
         chat_model=answers.get("chat_model") or None,
         rolling_model=answers.get("rolling_model") or None,
-        answer_interval=_as_float(answers.get("interval"), 35.0),
+        answer_interval=_as_float(answers.get("interval"), 20.0),
         rolling_enabled=bool(answers.get("rolling_enabled", True)),
         answer_max_tokens=_as_int(answers.get("max_tokens"), 600),
         context_minutes=_as_float(answers.get("context_minutes"), 5.0),
@@ -430,9 +430,9 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         summary_model=answers.get("summary_model") or None,
         talking_points_grounded=bool(answers.get("talking_points_grounded", True)),
         talking_points_max=_as_int(answers.get("talking_points_max"), 3),
-        talking_points_min_new_words=_as_int(answers.get("talking_points_min_new_words"), 60),
+        talking_points_min_new_words=_as_int(answers.get("talking_points_min_new_words"), 30),
         talking_points_min_words=_as_int(answers.get("talking_points_min_words"), 40),
-        talking_points_quote_overlap=_as_float(answers.get("talking_points_quote_overlap"), 0.7),
+        talking_points_quote_overlap=_as_float(answers.get("talking_points_quote_overlap"), 0.5),
         kb_enabled=bool(kb.get("enabled", True)),
         kb_dirs=_as_str_list(kb.get("dirs")),
         kb_model=str(kb.get("model") or "all-MiniLM-L6-v2"),
