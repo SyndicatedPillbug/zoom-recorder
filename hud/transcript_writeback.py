@@ -56,6 +56,26 @@ class TranscriptWriteback:
         self._thread = None
         self._close()
 
+    def finalize_name(self, slug: str) -> None:
+        """Rename the completed mirror after the session topic is known."""
+        if not slug or self._fh is not None:
+            return
+        target = self.path.with_name("{}-live-transcript.md".format(slug))
+        if target == self.path:
+            return
+        try:
+            suffix = 1
+            candidate = target
+            while candidate.exists():
+                suffix += 1
+                candidate = target.with_name(
+                    "{}-{}{}".format(target.stem, suffix, target.suffix))
+            self.path.rename(candidate)
+            self.path = candidate
+        except OSError as exc:
+            self.log("live transcript writeback kept original name ({}): {}".format(
+                self.path, exc))
+
     def _run(self) -> None:
         if not self._open():
             return

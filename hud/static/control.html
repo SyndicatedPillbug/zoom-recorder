@@ -52,6 +52,8 @@
     background:var(--bg); }
   .card .top { display:flex; align-items:center; gap:10px; }
   .card .when { font-weight:650; }
+  .card .topic { font-weight:650; color:var(--text); }
+  .card .folder { font-size:12px; color:var(--muted); margin-top:3px; word-break:break-all; }
   .badge { font-size:11px; border:1px solid var(--border); border-radius:999px; padding:1px 8px;
     color:var(--muted); }
   .card .actions { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
@@ -639,7 +641,11 @@
       if (it.has_mic) badges.push('microphone');
       if (it.has_system) badges.push('other person');
       if (it.transcript) badges.push('transcript');
-      return '<div class="card"><div class="top"><span class="when">' + esc(it.started) +
+      const topic = it.title || 'Meeting';
+      const people = (it.participants || []).join(', ');
+      return '<div class="card"><div class="topic">' + esc(topic) + '</div>' +
+        '<div class="folder">' + esc(it.name) + (people ? ' · ' + esc(people) : '') +
+        '</div><div class="top"><span class="when">' + esc(it.started) +
         '</span><span class="badge">' + esc(it.duration) + '</span>' +
         badges.map(b => '<span class="badge">' + esc(b) + '</span>').join('') +
         '</div><div class="actions" data-item="' + i + '"></div></div>';

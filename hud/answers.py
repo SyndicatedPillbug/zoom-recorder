@@ -30,6 +30,7 @@ from .budget import BudgetGovernor
 from .config import HudConfig, get_provider
 from .kb import KBIndex
 from .llm import LLMClient, LLMError
+from .memory import extract_memory, format_memory
 from .state import LiveState, is_duplicate_point
 
 QUESTION_WORDS = re.compile(
@@ -233,9 +234,15 @@ def parse_bullets(text: str) -> List[str]:
     if text.startswith("{"):
         try:
             obj = json.loads(text)
-            bullets = obj.get("bullets") or obj.get("points") or []
+            bullets = obj.get("bullets") or obj.get("points") or obj.get("claims") or []
             if isinstance(bullets, list):
-                return [str(b).strip() for b in bullets if str(b).strip()]
+                out = []
+                for bullet in bullets:
+                    value = (bullet.get("text") or bullet.get("claim") or bullet.get("point")
+                             if isinstance(bullet, dict) else bullet)
+                    if str(value).strip():
+                        out.append(str(value).strip())
+                return out
         except ValueError:
             pass
     bullets: List[str] = []
@@ -247,6 +254,69 @@ def parse_bullets(text: str) -> List[str]:
         # Fall back to sentences so we never show an empty card.
         bullets = [s.strip() for s in split_sentences(text) if s.strip()]
     return bullets[:6]
+
+
+def parse_answer_claims(text: str) -> List[Dict[str, str]]:
+    """Parse answer claims with optional exact evidence and source labels."""
+    raw = (text or "").strip()
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+            values = obj.get("claims") or obj.get("bullets") or obj.get("points") or []
+            if isinstance(values, list):
+                out = []
+                for value in values:
+                    if isinstance(value, dict):
+                        claim = str(value.get("text") or value.get("claim") or
+                                    value.get("point") or "").strip()
+                        evidence = str(value.get("evidence") or value.get("quote") or "").strip()
+                        source = str(value.get("source") or "").strip()
+                    else:
+                        claim, evidence, source = str(value).strip(), "", ""
+                    if claim:
+                        out.append({"text": claim, "evidence": evidence, "source": source})
+                return out[:6]
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return [{"text": bullet, "evidence": "", "source": ""}
+            for bullet in parse_bullets(raw)]
+
+
+def verify_answer_claims(claims: List[Dict[str, str]], transcript: str,
+                        snippets: List[Any]) -> Tuple[List[str], List[Dict[str, str]], List[str]]:
+    """Return display text, verified evidence records, and dropped claims.
+
+    Explicit evidence is strict. Legacy/plain-text model output remains
+    displayable for provider compatibility, but gets no ``verified`` record;
+    this makes the UI and saved artifact distinguish audited claims from a
+    provider that ignored the requested schema.
+    """
+    reference = transcript or ""
+    source_names = set()
+    for snippet in snippets:
+        source = str(getattr(snippet, "source", "") or "")
+        if source:
+            source_names.add(source)
+        reference += "\n" + str(getattr(snippet, "text", "") or "")
+    display: List[str] = []
+    evidence: List[Dict[str, str]] = []
+    dropped: List[str] = []
+    for claim in claims:
+        text = str(claim.get("text") or "").strip()
+        quote = str(claim.get("evidence") or "").strip()
+        source = str(claim.get("source") or "").strip()
+        if not text:
+            continue
+        if quote and not grounded_in(text, quote, reference, min_tokens=2, threshold=0.65):
+            dropped.append(text)
+            continue
+        if source and source not in source_names:
+            dropped.append(text)
+            continue
+        display.append(text)
+        if quote:
+            evidence.append({"claim": text, "evidence": quote, "source": source})
+    return display[:6], evidence[:6], dropped[:6]
 
 
 _PUNCT_RE = re.compile(r"[^a-z0-9\s]")
@@ -381,8 +451,11 @@ class AnswerEngine:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._worker: Optional[threading.Thread] = None
+        self._rolling_worker: Optional[threading.Thread] = None
         self._queue: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._rolling_queue: "queue.Queue" = queue.Queue(maxsize=1)
         self._job_seq = itertools.count()
+        self._provider_gate = threading.Lock()
         self._paused = False
 
         self._id_cursor = 0
@@ -403,6 +476,8 @@ class AnswerEngine:
         self._live_kb: Optional[KBIndex] = None
         self._live_q: "queue.Queue" = queue.Queue()
         self._live_kb_thread: Optional[threading.Thread] = None
+        self._memory_q: "queue.Queue" = queue.Queue(maxsize=256)
+        self._memory_thread: Optional[threading.Thread] = None
         self._embedder: Any = None
         self._vec_cache: Dict[str, List[float]] = {}
         self._chain: Optional[_Chain] = None
@@ -416,15 +491,26 @@ class AnswerEngine:
     def stop(self) -> None:
         self._stop.set()
         self._queue.put((0, next(self._job_seq), None))
+        try:
+            self._rolling_queue.put_nowait(None)
+        except queue.Full:
+            pass
         if self._live_kb_thread is not None:
             try:
                 self._live_q.put_nowait(None)
+            except queue.Full:
+                pass
+        if self._memory_thread is not None:
+            try:
+                self._memory_q.put_nowait(None)
             except queue.Full:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=12.0)
         if self._live_kb_thread is not None:
             self._live_kb_thread.join(timeout=5.0)
+        if self._memory_thread is not None:
+            self._memory_thread.join(timeout=3.0)
         if self._chain is not None:
             for entry in self._chain.entries:
                 closer = getattr(entry.get("client"), "close", None)
@@ -566,6 +652,26 @@ class AnswerEngine:
         if batch and self._live_kb is not None:
             self._live_kb.add_chunks(batch)
 
+    def _memory_loop(self) -> None:
+        """Extract deterministic meeting facts off the answer loop."""
+        while not self._stop.is_set():
+            try:
+                event = self._memory_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if event is None:
+                self._memory_q.task_done()
+                break
+            try:
+                for item in extract_memory(
+                        str(event.get("text") or ""),
+                        str(event.get("speaker") or ""),
+                        float(event.get("ts") or time.time()),
+                        int(event.get("id") or 0)):
+                    self.state.add_memory_item(item)
+            finally:
+                self._memory_q.task_done()
+
     def _build_embedder(self):
         """Pick an embedding backend: local model, Ollama, OpenAI, then hashing."""
         from .kb import HashingEmbedder, LocalEmbedder, RemoteEmbedder
@@ -616,9 +722,15 @@ class AnswerEngine:
         self._id_cursor = self.state.latest_id()
         self.state.set_budget(self.budget.snapshot())
         self._start_kb()
+        self._memory_thread = threading.Thread(target=self._memory_loop,
+                                               name="hud-memory", daemon=True)
+        self._memory_thread.start()
         self._worker = threading.Thread(target=self._worker_loop,
                                         name="hud-answers-work", daemon=True)
         self._worker.start()
+        self._rolling_worker = threading.Thread(target=self._rolling_worker_loop,
+                                                name="hud-talking-points", daemon=True)
+        self._rolling_worker.start()
         self.log("answers enabled via {} (chat={}, rolling={}, interval={:.0f}s)".format(
             self.cfg.answers_backend, self._chain.entries[0]["chat_model"],
             self._chain.entries[0]["rolling_model"], self.cfg.answer_interval))
@@ -637,11 +749,27 @@ class AnswerEngine:
 
         if self._worker is not None:
             self._worker.join(timeout=12.0)
+        if self._rolling_worker is not None:
+            self._rolling_worker.join(timeout=3.0)
         self._flush_buffer()
 
     def _put(self, priority: int, job: Dict[str, Any]) -> None:
         job.setdefault("queued_at", time.time())
         self._queue.put((priority, next(self._job_seq), job))
+
+    def _put_rolling(self, job: Dict[str, Any]) -> None:
+        job.setdefault("queued_at", time.time())
+        try:
+            self._rolling_queue.put_nowait(job)
+        except queue.Full:
+            try:
+                self._rolling_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._rolling_queue.put_nowait(job)
+            except queue.Full:
+                pass
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -657,6 +785,21 @@ class AnswerEngine:
                 self._execute(job)
             except Exception as exc:  # noqa: BLE001
                 self.log("answers job error: {}".format(exc))
+
+    def _rolling_worker_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = self._rolling_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            if self.paused:
+                continue
+            try:
+                self._execute(job)
+            except Exception as exc:  # noqa: BLE001
+                self.log("talking-point job error: {}".format(exc))
 
     def _execute(self, job: Dict[str, Any]) -> None:
         if job.get("kind") == "rolling":
@@ -689,11 +832,10 @@ class AnswerEngine:
         lookback = self.cfg.question_lookback_seconds
         for detected in detect_questions_since(self._buffer, self._last_question_seq,
                                                lookback, now):
-            if not detected.get("finalized") and not str(
-                    detected.get("question") or "").rstrip().endswith("?"):
-                # A stable prefix can look like a question before Whisper has
-                # heard its endpoint. Keep reconstructing it until the final
-                # chunk boundary marks the evidence authoritative.
+            if not detected.get("finalized"):
+                # A punctuation mark in an interim Whisper hypothesis is not
+                # an endpoint. Wait for the explicit VAD/STT boundary so the
+                # answer is built from the complete question.
                 continue
             self._last_question_seq = max(self._last_question_seq, detected["seq"])
             if not self._should_answer(detected):
@@ -749,7 +891,7 @@ class AnswerEngine:
             self._rolling_payload = {"window": window, "queued_at": time.time()}
             if not self._rolling_queued:
                 self._rolling_queued = True
-                self._put(1, {"kind": "rolling"})
+                self._put_rolling({"kind": "rolling"})
 
     def _should_answer(self, detected: Dict[str, Any]) -> bool:
         question = detected.get("question", "")
@@ -814,6 +956,10 @@ class AnswerEngine:
                         })
                     except queue.Full:
                         pass
+                try:
+                    self._memory_q.put_nowait(dict(event))
+                except queue.Full:
+                    pass
 
     def _trim_buffer(self) -> None:
         cutoff = time.time() - self.cfg.context_minutes * 60.0
@@ -852,6 +998,21 @@ class AnswerEngine:
             return [dict(qa) for qa in self._qa_thread]
 
     def _chat(self, kind: str, system: str, prompt: str,
+              max_tokens: Optional[int] = None, temperature: float = 0.2,
+              model_override: Optional[str] = None):
+        # Questions get the provider lane; stale talking-point refreshes are
+        # dropped when that lane is occupied instead of delaying an answer.
+        acquired = self._provider_gate.acquire(blocking=(kind != "rolling"))
+        if not acquired:
+            self.state.set_meta(talking_point_dropped_busy=True)
+            return None
+        try:
+            return self._chat_unlocked(kind, system, prompt, max_tokens,
+                                       temperature, model_override)
+        finally:
+            self._provider_gate.release()
+
+    def _chat_unlocked(self, kind: str, system: str, prompt: str,
               max_tokens: Optional[int] = None, temperature: float = 0.2,
               model_override: Optional[str] = None):
         """Run one provider call (with fallback + JSON-mode retry)."""
@@ -914,6 +1075,20 @@ class AnswerEngine:
         return None
 
     def _chat_stream(self, kind: str, system: str, prompt: str,
+                    max_tokens: Optional[int] = None, temperature: float = 0.2,
+                    model_override: Optional[str] = None,
+                    on_chunk: Optional[Callable[[str], None]] = None):
+        acquired = self._provider_gate.acquire(blocking=(kind != "rolling"))
+        if not acquired:
+            self.state.set_meta(talking_point_dropped_busy=True)
+            return None
+        try:
+            return self._chat_stream_unlocked(kind, system, prompt, max_tokens,
+                                              temperature, model_override, on_chunk)
+        finally:
+            self._provider_gate.release()
+
+    def _chat_stream_unlocked(self, kind: str, system: str, prompt: str,
                     max_tokens: Optional[int] = None, temperature: float = 0.2,
                     model_override: Optional[str] = None,
                     on_chunk: Optional[Callable[[str], None]] = None):
@@ -1016,6 +1191,9 @@ class AnswerEngine:
         prompt = self._build_prompt("question", effective, context, window, snippets,
                                     qa=self._qa_recent())
         assembly_seconds = round(time.time() - assembly_started, 3)
+        self.state.observe_metric("answer_queue_wait", max(0.0, started_at - queued_at))
+        self.state.observe_metric("prompt_assembly_seconds", assembly_seconds)
+        self.state.observe_metric("prompt_chars", len(system) + len(prompt))
 
         # Create a placeholder answer event so the UI shows the question is
         # being answered immediately, then stream the raw text in.
@@ -1044,10 +1222,14 @@ class AnswerEngine:
                                       answer_latency=round(time.time() - detected_at, 2))
             return
 
-        bullets = parse_bullets(result.text)
+        claims = parse_answer_claims(result.text)
+        bullets, evidence, dropped_claims = verify_answer_claims(
+            claims, "{}\n{}".format(window, context), snippets)
         if not bullets:
             self.state.update_answer(event_id, bullets=[], model=result.model,
                                       streaming=False, error="no answer produced",
+                                      evidence=evidence, dropped_claims=dropped_claims,
+                                      grounding="unverified" if dropped_claims else "none",
                                       provider_ttft=result.ttft_seconds,
                                       provider_seconds=result.request_seconds,
                                       answer_latency=round(time.time() - detected_at, 2))
@@ -1061,9 +1243,17 @@ class AnswerEngine:
             event_id, bullets=bullets, model=result.model,
             usage=result.usage, parent_id=parent_id, streaming=False,
             streaming_text=None,
+            evidence=evidence,
+            dropped_claims=dropped_claims,
+            grounding="verified" if evidence and not dropped_claims else (
+                "partial" if evidence or dropped_claims else "provider_unverified"),
             provider_ttft=result.ttft_seconds,
             provider_seconds=result.request_seconds,
             answer_latency=round(time.time() - detected_at, 2))
+        if result.ttft_seconds is not None:
+            self.state.observe_metric("provider_ttft_seconds", result.ttft_seconds)
+        if result.request_seconds is not None:
+            self.state.observe_metric("provider_request_seconds", result.request_seconds)
         with self._lock:
             self._last_answer_id = event_id
             self._qa_thread.append({"question": question, "bullets": bullets})
@@ -1087,6 +1277,9 @@ class AnswerEngine:
             talking_point_queue_wait=round(max(0.0, started_at - queued_at), 2),
             talking_point_prompt_chars=len(system) + len(prompt),
             talking_point_provider_seconds=(result.request_seconds if result else None))
+        self.state.observe_metric("talking_point_queue_wait", max(0.0, started_at - queued_at))
+        if result is not None and result.request_seconds is not None:
+            self.state.observe_metric("talking_point_provider_seconds", result.request_seconds)
         if result is None:
             self.log("answers: talking-point refresh failed on all providers")
             return
@@ -1190,6 +1383,11 @@ class AnswerEngine:
     def finish(self) -> Optional[Dict[str, Any]]:
         """Generate the summary before shutdown without ever raising."""
         try:
+            # The recorder stops STT first. Drain those final events into the
+            # answer buffer before assembling the summary and identity.
+            self._drain_events()
+            if self._memory_thread is not None:
+                self._memory_q.join()
             return self.summarize()
         except Exception as exc:  # noqa: BLE001
             self.log("summary failed: {}".format(exc))
@@ -1238,8 +1436,10 @@ class AnswerEngine:
                     "reference notes and cite the file; do not invent specific numbers, names, or "
                     "integrations. If something is not covered or you are unsure, say so rather "
                     "than guessing.")
-            schema = '{"bullets": ["..."], "sources": ["file.md"], "follow_up": false}'
-            tail = ("Each bullet must be a single short sentence. Set follow_up true only if this "
+            schema = '{"claims": [{"text": "...", "evidence": "exact words", "source": "file.md"}], "sources": ["file.md"], "follow_up": false}'
+            tail = ("Each claim must be a single short sentence with an exact evidence span from "
+                    "the conversation or reference notes; use an empty source for conversation evidence. "
+                    "Set follow_up true only if this "
                     "question is a direct follow-up to the previous question. ")
         else:
             task = ("You are a passive note-taker. Summarize ONLY what the speakers actually said "
@@ -1270,6 +1470,9 @@ class AnswerEngine:
                 answer = " / ".join(item.get("bullets") or [])
                 lines.append("Q: {}\nA: {}".format(item.get("question", ""), answer))
             parts.append("Earlier questions this call:\n" + "\n\n".join(lines))
+        memory = format_memory(self.state.memory())
+        if memory:
+            parts.append("Structured meeting memory (exact evidence; do not extend it):\n" + memory)
         if question and context:
             parts.append("Turns immediately before the question:\n{}".format(context))
         if snippets:

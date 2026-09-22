@@ -234,6 +234,18 @@ recording stops. These files are written under `derived/` (flushed every
 | `live_answers.md` | Just the AI answers and talking points |
 | `live_summary.md` | End-of-call summary, action items and a follow-up email draft |
 
+The live session also writes `live_events.jsonl` (a provider-free replay
+fixture), `meeting_memory.json` (decisions, commitments and numeric facts with
+evidence), and `live_diagnostics.json` (non-secret STT/answer timing data).
+
+On a clean stop, the numeric session folder is finalized as
+`<HH-MM-SS>_<topic-slug>_<collision-id>`, for example
+`14-32-08_enrollment-planning_a1b2c3d4`. The topic is derived from the first
+substantive transcript line and recorded in `session.json` with its evidence
+hash, timestamps, participants, models and original folder name. If there is
+not enough speech, a timestamp fallback is used. Existing numeric folders
+remain readable.
+
 The window itself is interactive: type a question in the **Ask** box at the
 bottom of the Q&A pane, click a talking point's **pin** to keep it at the top,
 and **copy** on any point or answer. **Pause answers** stops AI generation while
@@ -291,8 +303,10 @@ persistent pane — they never get mixed into the Q&A cards. Talking points are
 strictly **transcript-grounded**: the model must supply a verbatim quote for
 each one, that quote is verified locally, and anything unsupported is dropped.
 A minimum amount of new speech is required before a refresh fires, so sparse or
-noisy audio produces **no** points rather than invented ones. Nothing in the HUD
-can affect the recording — if it fails to start, recording proceeds normally.
+noisy audio produces **no** points rather than invented ones. Question jobs and
+talking-point jobs have separate queues and workers; stale talking-point work
+is dropped when the provider lane is busy. Nothing in the HUD can affect the
+recording — if it fails to start, recording proceeds normally.
 
 For private low-latency transcription, local whisper.cpp is a practical option
 on Apple silicon. The installed runtime uses Metal and BLAS on this Mac. The
@@ -334,6 +348,13 @@ STT lag and interim latency, answer queue wait, prompt assembly time and size,
 provider time-to-first-token, and total provider time. Talking-point refreshes
 are lower priority and are not admitted while a question is queued or already
 being answered; their own queue wait is recorded separately.
+
+Question answers now request claim-level evidence. Claims with an explicit
+quote or note source are checked locally against the conversation and retrieved
+notes before they are shown; dropped claims are recorded on the answer event.
+The app also keeps a small deterministic meeting-memory stream for decisions,
+commitments, and numeric facts. It is updated off the answer loop and each item
+keeps the exact transcript evidence that produced it.
 
 **Voice activity (optional).** Speech is detected with an adaptive noise-floor
 gate by default, which rejects steady hum without any dependency. Installing
@@ -461,6 +482,16 @@ index skips `.obsidian`, `.git`, `.trash`, plugin/build folders, and reports
 when macOS cannot read a protected path. With a remote embedding backend, note
 chunks leave the machine; with a local backend or `sentence-transformers`, they
 never do.
+
+For large Obsidian vaults the cache also maintains a SQLite FTS5 lexical side
+index. Retrieval uses exact-term candidates before semantic scoring, so the
+answer path does not need to scan every chunk for each question. YAML
+frontmatter is retained as chunk metadata, and `derived/live_events.jsonl` can
+be replayed without audio or network access:
+
+```bash
+python3 -m hud.replay ~/ZoomRecordings/2026-09-22/14-32-08_enrollment-planning_a1b2c3d4/derived/live_events.jsonl
+```
 
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your

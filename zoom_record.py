@@ -1495,6 +1495,16 @@ def main(argv: List[str]) -> int:
         record_mic=record_mic,
     )
 
+    # Write a recoverable identity immediately. The final identity is enriched
+    # from the transcript when the session closes, but a crash or force-quit
+    # should still leave a useful timestamped record behind.
+    try:
+        from hud.identity import build_identity, write_identity
+        write_identity(outdir / "session.json",
+                       build_identity(started, None, outdir.name, "", cfg))
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        log.warn("Could not write initial session identity: {}".format(exc))
+
     log.info("zoom-recorder starting. Output: {}".format(outdir))
     log.info("Inputs detected: {}".format(", ".join(d.name for d in inputs) or "(none)"))
     log.info("Outputs detected: {}".format(", ".join(d.name for d in outputs) or "(none)"))
@@ -1600,6 +1610,7 @@ def main(argv: List[str]) -> int:
                 system_name(),
                 cfg.model,
                 on_stop=stop.set,
+                started_at=started,
             )
             live.start()
             rec.on_restart = lambda: live.update_devices(
@@ -1672,6 +1683,11 @@ def main(argv: List[str]) -> int:
                 live.stop()
             except Exception as exc:  # noqa: BLE001
                 log.warn("Live HUD shutdown error: {}".format(exc))
+            finally:
+                # LiveSession may rename the numeric folder after deriving its
+                # topic. All post-recording artifacts must follow that move,
+                # even if a non-critical HUD cleanup step raised.
+                outdir = live.outdir
 
         mic_segments = rec.segments_mic()
         sys_segments = rec.segments_sys()

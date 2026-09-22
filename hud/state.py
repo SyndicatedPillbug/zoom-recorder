@@ -53,11 +53,13 @@ class LiveState:
         self._lock = threading.Condition()
         self._events: List[Dict[str, Any]] = []
         self._talking_points: List[Dict[str, Any]] = []
+        self._memory: List[Dict[str, Any]] = []
         self._partials: Dict[str, Dict[str, Any]] = {}
         self._next_id = 1
         self.status: str = "starting"
         self.budget: Dict[str, Any] = {}
         self.meta: Dict[str, Any] = {}
+        self._metrics: Dict[str, List[float]] = {}
 
     # -- writes ------------------------------------------------------------
     def _append_locked(self, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -126,6 +128,36 @@ class LiveState:
             self.budget = snapshot
             self._lock.notify_all()
 
+    def observe_metric(self, name: str, value: Any) -> None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return
+        if number < 0:
+            return
+        with self._lock:
+            values = self._metrics.setdefault(str(name), [])
+            values.append(number)
+            if len(values) > 200:
+                del values[:-200]
+
+    def metrics(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            snapshot = {name: list(values) for name, values in self._metrics.items()}
+        out: Dict[str, Dict[str, Any]] = {}
+        for name, values in snapshot.items():
+            if not values:
+                continue
+            ordered = sorted(values)
+            out[name] = {
+                "count": len(ordered),
+                "p50": round(ordered[(len(ordered) - 1) // 2], 3),
+                "p95": round(ordered[min(len(ordered) - 1,
+                                          int(len(ordered) * 0.95))], 3),
+                "last": round(values[-1], 3),
+            }
+        return out
+
     def update_answer(self, event_id: int, **fields: Any) -> None:
         """Update an existing answer event in place (for streaming).
 
@@ -142,6 +174,25 @@ class LiveState:
                 "type": "answer_update", "ref": event_id,
                 "fields": dict(fields),
             })
+
+    def add_memory_item(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Keep a compact, deduplicated set of evidence-backed meeting facts."""
+        text = str(item.get("text") or "").strip()
+        if not text:
+            return None
+        norm = re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
+        with self._lock:
+            for existing in self._memory:
+                if re.sub(r"[^a-z0-9\s]", "", str(existing.get("text", "")).lower()).strip() == norm:
+                    return dict(existing)
+            stored = dict(item)
+            stored.setdefault("ts", time.time())
+            stored["type"] = "memory"
+            self._memory.append(stored)
+            if len(self._memory) > 200:
+                del self._memory[:-200]
+            event = self._append_locked(stored)
+            return dict(event)
 
     def set_transcript_partial(self, source_key: str, text: str,
                                speaker: Optional[str] = None,
@@ -181,6 +232,10 @@ class LiveState:
         with self._lock:
             return [dict(p) for p in self._talking_points]
 
+    def memory(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._memory]
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             transcript = [e for e in self._events if e.get("type") == "transcript"]
@@ -194,6 +249,8 @@ class LiveState:
                 "partials": [dict(p) for p in self._partials.values()],
                 "answers": answers,
                 "talking_points": [dict(p) for p in self._talking_points],
+                "memory": [dict(item) for item in self._memory],
+                "metrics": self.metrics(),
             }
 
     def transcript_text(self, since_ts: Optional[float] = None) -> str:
@@ -228,6 +285,10 @@ class LiveState:
             if sources:
                 lines.append("")
                 lines.append("_Sources: {}_".format(", ".join(sources)))
+            if e.get("grounding"):
+                lines.append("_Grounding: {}_".format(e["grounding"]))
+            for item in e.get("evidence") or []:
+                lines.append("> Evidence: {}".format(item.get("evidence", "")))
             lines.append("")
         if points:
             lines.append("## Talking points")
@@ -249,7 +310,7 @@ class LiveState:
         """
         with self._lock:
             events = [e for e in self._events
-                      if e.get("type") in ("transcript", "answer", "talking_point")]
+                      if e.get("type") in ("transcript", "answer", "talking_point", "memory")]
         if not events:
             return ""
         lines: List[str] = []
@@ -270,6 +331,12 @@ class LiveState:
                 if text:
                     lines.append("[{}] + {}".format(stamp, text))
                 continue
+            if e["type"] == "memory":
+                text = str(e.get("text", "")).strip()
+                if text:
+                    lines.append("[{}] ◇ {}: {}".format(
+                        stamp, e.get("kind", "memory"), text))
+                continue
             question = e.get("question")
             kind = e.get("kind", "answer")
             heading = question if question else ("Talking points" if kind == "rolling" else "Answer")
@@ -281,5 +348,7 @@ class LiveState:
             if sources:
                 lines.append("")
                 lines.append("_Sources: {}_".format(", ".join(sources)))
+            if e.get("grounding"):
+                lines.append("_Grounding: {}_".format(e["grounding"]))
             lines.append("")
         return "\n".join(lines).strip() + "\n"

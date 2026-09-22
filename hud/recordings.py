@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Read-only listing of past recordings for the Control Center.
 
-Sessions live under ``<basedir>/<YYYY-MM-DD>/<HH-MM-SS>_<id>/`` (see
-zoom_record.py). This module only inspects them -- it never writes or deletes
-anything.
+Sessions live under ``<basedir>/<YYYY-MM-DD>/<HH-MM-SS>_<topic>_<id>/`` after
+finalization (older ``<HH-MM-SS>_<id>`` folders remain valid). This module only
+inspects them -- it never writes or deletes anything.
 """
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SESSION_RE = re.compile(r"^\d{2}-\d{2}-\d{2}_[0-9a-f]+$")
+SESSION_RE = re.compile(r"^\d{2}-\d{2}-\d{2}_[A-Za-z0-9][A-Za-z0-9._-]*_[0-9a-f]+$")
+LEGACY_SESSION_RE = re.compile(r"^\d{2}-\d{2}-\d{2}_[0-9a-f]+$")
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -30,6 +31,8 @@ class Recording:
     transcript: Optional[str] = None
     summary: Optional[str] = None
     mixed: Optional[str] = None
+    title: Optional[str] = None
+    participants: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -44,6 +47,8 @@ class Recording:
             "transcript": self.transcript,
             "summary": self.summary,
             "mixed": self.mixed,
+            "title": self.title,
+            "participants": list(self.participants),
         }
 
 
@@ -73,6 +78,14 @@ def _session_started(day: str, name: str) -> str:
     # "17-27-11_ab12cd34" -> "YYYY-MM-DD 17:27:11"
     time_part = name.split("_", 1)[0].replace("-", ":")
     return "{} {}".format(day, time_part)
+
+
+def _identity(session: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _load_index(basedir: Path) -> Dict[str, Dict[str, Any]]:
@@ -108,10 +121,19 @@ def list_recordings(basedir: str, limit: int = 200,
         if not day_dir.is_dir() or not DAY_RE.match(day_dir.name):
             continue
         for session in sorted(day_dir.iterdir(), reverse=True):
-            if not session.is_dir() or not SESSION_RE.match(session.name):
+            if not session.is_dir() or not (SESSION_RE.match(session.name)
+                                            or LEGACY_SESSION_RE.match(session.name)):
                 continue
+            identity = _identity(session)
+            raw_participants = identity.get("participants", [])
+            if not isinstance(raw_participants, list):
+                raw_participants = []
             rec = Recording(path=str(session), day=day_dir.name, name=session.name,
-                            started=_session_started(day_dir.name, session.name))
+                            started=str(identity.get("started_at") or
+                                       _session_started(day_dir.name, session.name)),
+                            title=(str(identity.get("title"))
+                                   if identity.get("title") else None),
+                            participants=[str(p) for p in raw_participants])
             mic = session / "recording_mic.wav"
             syswav = session / "recording_sys.wav"
             mixed = session / "derived" / "recording_mixed.wav"
@@ -157,7 +179,7 @@ def move_to_trash(session_path: str, basedir: str) -> Dict[str, Any]:
         target.relative_to(root)
     except ValueError:
         return {"ok": False, "error": "path not allowed"}
-    if not SESSION_RE.match(target.name):
+    if not (SESSION_RE.match(target.name) or LEGACY_SESSION_RE.match(target.name)):
         return {"ok": False, "error": "not a recording folder"}
     trash = Path.home() / ".Trash"
     trash.mkdir(exist_ok=True)

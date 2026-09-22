@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -25,15 +26,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
                          detect_question_turns, detect_questions_since,
-                         estimate_tokens, grounded_in,
-                         is_ambiguous_question, parse_bullets, parse_point_objects)
+                         estimate_tokens, grounded_in, parse_answer_claims,
+                         verify_answer_claims, is_ambiguous_question, parse_bullets,
+                         parse_point_objects)
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
+from hud.identity import (build_identity, derive_title, meaningful_folder_name,
+                          slugify)  # noqa: E402
 from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
 from hud.local_http import host_from_header, url_host  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
+from hud.memory import extract_memory, format_memory  # noqa: E402
 from hud.menu_state import describe  # noqa: E402
+from hud.replay import benchmark, replay  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
 from hud.stt import (Chunker, LiveTranscriber, _Source, frame_rms_dbfs,  # noqa: E402
@@ -233,6 +239,16 @@ class SttPipelineTests(unittest.TestCase):
         self.assertEqual([e["text"] for e in transcript], ["what is the"])
         self.assertTrue(any(e["type"] == "transcript_boundary"
                             for e in tr.state.since(0)))
+
+    def test_transcript_events_carry_revision_identity(self) -> None:
+        tr = self._transcriber(HudConfig(stt_backend="local",
+                                         stt_hallucination_filter=False))
+        src = _Source("Client", [])
+        tr._publish_committed(src, "the rollout plan", finalized=False)
+        event = tr.state.snapshot()["transcript"][0]
+        self.assertEqual(event["segment_id"], "Client:1")
+        self.assertEqual(event["revision"], 0)
+        self.assertFalse(event["finalized"])
 
     def test_groq_two_source_chunk_floor_protects_request_rate(self) -> None:
         cfg = HudConfig(stt_backend="groq", stt_chunk_seconds=5.0)
@@ -558,6 +574,96 @@ class LocalHttpTests(unittest.TestCase):
         self.assertEqual(url_host("::1"), "[::1]")
 
 
+class IdentityTests(unittest.TestCase):
+    def test_title_uses_first_substantive_transcript_line(self) -> None:
+        title, evidence = derive_title(
+            "[10:00:00] **You:** Hi everyone\n"
+            "[10:00:03] **Client:** We need to finalize the enrollment timeline for fall.")
+        self.assertEqual(title, "We need to finalize the enrollment timeline for fall")
+        self.assertIn("enrollment timeline", evidence)
+
+    def test_identity_keeps_evidence_and_participants(self) -> None:
+        cfg = mock.Mock(record_mic=True, stt_backend="local",
+                        stt_model="turbo", answers_backend="groq",
+                        chat_model="model")
+        identity = build_identity(
+            datetime(2026, 9, 22, 10, 11, 12), None, "10-11-12_ab12cd34",
+            "Dana: We agreed to launch the new onboarding flow next week.", cfg)
+        self.assertEqual(identity["title_source"], "first_substantive_transcript_line")
+        self.assertEqual(identity["participants"], ["Dana"])
+        self.assertEqual(identity["original_folder"], "10-11-12_ab12cd34")
+        self.assertEqual(meaningful_folder_name("10-11-12_ab12cd34", identity),
+                         "10-11-12_we-agreed-to-launch-the-new-onboarding-flow-next-week_ab12cd34")
+
+    def test_slugify_is_safe_and_bounded(self) -> None:
+        self.assertEqual(slugify("Résumé: Q3 / enrollment?"), "resume-q3-enrollment")
+        self.assertLessEqual(len(slugify("word " * 100)), 64)
+
+    def test_session_stop_finalizes_folder_and_metadata(self) -> None:
+        from hud.session import LiveSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "10-11-12_ab12cd34"
+            original.mkdir()
+            order = []
+            session = LiveSession(HudConfig(), original, lambda _m: None, "Mic",
+                                  started_at=datetime(2026, 9, 22, 10, 11, 12))
+            session._started = True
+            session.state.add("transcript", source="live", speaker="Client",
+                              text="We agreed to finalize enrollment planning next week.")
+            session.stt = mock.Mock()
+            session.stt.stop.side_effect = lambda: order.append("stt")
+            session.answers = mock.Mock()
+            session.answers.finish.side_effect = lambda: order.append("finish") or None
+            session.answers.stop.side_effect = lambda: order.append("answers")
+            session._writeback = mock.Mock()
+            session._writeback.stop.side_effect = lambda: order.append("writeback")
+            session._persist = lambda summary=None: order.append("persist")
+            session.stop()
+            self.assertNotEqual(session.outdir, original)
+            self.assertIn("enrollment", session.outdir.name)
+            self.assertTrue((session.outdir / "session.json").is_file())
+            self.assertEqual(order, ["stt", "finish", "answers", "writeback", "persist"])
+
+
+class MemoryAndReplayTests(unittest.TestCase):
+    def test_memory_extracts_exact_decision_and_number_evidence(self) -> None:
+        items = extract_memory("We agreed to launch in Q3 with a $50,000 budget.",
+                               "Client", 123.0, 7)
+        self.assertEqual({item["kind"] for item in items},
+                         {"decision", "fact_with_number"})
+        self.assertTrue(all(item["evidence"].startswith("We agreed") for item in items))
+
+    def test_replay_and_benchmark_are_provider_free(self) -> None:
+        events = [
+            {"type": "transcript", "source": "live", "speaker": "Client",
+             "text": "We agreed to ship next week."},
+            {"type": "transcript", "source": "live", "speaker": "Client",
+             "text": "What is the rollout plan?"},
+        ]
+        state = replay(events)
+        self.assertEqual(len(state.snapshot()["transcript"]), 2)
+        self.assertGreaterEqual(len(state.memory()), 1)
+        stats = benchmark(events)
+        self.assertEqual(stats["events"], 2)
+        self.assertGreater(stats["memory_items"], 0)
+
+    def test_memory_prompt_format_preserves_evidence(self) -> None:
+        text = format_memory([{"kind": "decision", "text": "ship it",
+                               "evidence": "We agreed to ship it", "ts": 1.0}])
+        self.assertIn("We agreed to ship it", text)
+
+    def test_state_metrics_expose_percentiles_without_event_noise(self) -> None:
+        state = LiveState()
+        for value in (1, 2, 3, 4, 5):
+            state.observe_metric("latency", value)
+        metrics = state.metrics()["latency"]
+        self.assertEqual(metrics["count"], 5)
+        self.assertEqual(metrics["p50"], 3.0)
+        self.assertEqual(metrics["p95"], 5.0)
+        self.assertEqual(state.latest_id(), 0)
+
+
 class TranscriptWritebackTests(unittest.TestCase):
     def test_mirrors_transcript_events_and_drains_on_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -594,6 +700,14 @@ class TranscriptWritebackTests(unittest.TestCase):
             self.assertTrue(sink.start())
             sink.stop()
             self.assertTrue(any("writeback disabled" in line for line in logs))
+
+    def test_completed_file_can_be_renamed_after_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = TranscriptWriteback(LiveState(), tmp, "10-00-00_ab12cd34", lambda _m: None)
+            sink.start()
+            sink.stop()
+            sink.finalize_name("enrollment-planning")
+            self.assertTrue((Path(tmp) / "enrollment-planning-live-transcript.md").is_file())
 
 
 class BudgetTests(unittest.TestCase):
@@ -1180,6 +1294,17 @@ class AnswerEngineTests(unittest.TestCase):
         def __init__(self, entries):
             self.entries = entries
 
+    def test_answer_claims_require_explicit_evidence_when_provided(self) -> None:
+        claims = parse_answer_claims(json.dumps({"claims": [
+            {"text": "The launch is Friday", "evidence": "launch is Friday"},
+            {"text": "The budget is $5M", "evidence": "budget is $5M"},
+        ]}))
+        bullets, evidence, dropped = verify_answer_claims(
+            claims, "[10:00] Client: The launch is Friday.", [])
+        self.assertEqual(bullets, ["The launch is Friday"])
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(dropped, ["The budget is $5M"])
+
     def _engine(self, state, cfg):
         engine = AnswerEngine(state, lambda _m: None, cfg)
         engine._chain = self._Chain([{
@@ -1266,6 +1391,17 @@ class AnswerEngineTests(unittest.TestCase):
         engine._tick()
         _priority, _seq, job = engine._queue.get_nowait()
         self.assertEqual(job["question"], "what is the")
+
+    def test_interim_question_mark_still_waits_for_boundary(self) -> None:
+        cfg = HudConfig(answers_backend="groq", kb_enabled=False,
+                        rolling_enabled=False)
+        state = LiveState()
+        engine = AnswerEngine(state, lambda _m: None, cfg)
+        state.add("transcript", source="live", speaker="Client",
+                  text="what is the plan?", finalized=False)
+        engine._tick()
+        with self.assertRaises(queue.Empty):
+            engine._queue.get_nowait()
 
     def test_rolling_emits_talking_points_not_answers(self) -> None:
         cfg = HudConfig(answers_backend="groq", kb_enabled=False,
@@ -2311,21 +2447,32 @@ class RecordingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             day = Path(tmp) / "2026-09-18"
             session = day / "17-27-11_ab12cd34"
+            named = day / "16-20-10_enrollment-planning_cd34ef56"
             (session / "derived").mkdir(parents=True)
+            (named / "derived").mkdir(parents=True)
             (session / "recording_mic.wav").write_bytes(b"RIFF")
             (session / "recording_sys.wav").write_bytes(b"RIFF")
             (session / "transcript.txt").write_text("hello", encoding="utf-8")
             (session / "derived" / "live_summary.md").write_text("# s", encoding="utf-8")
+            (named / "session.json").write_text(json.dumps({
+                "started_at": "2026-09-18T16:20:10",
+                "title": "Enrollment planning",
+                "participants": ["Dana", "Client"],
+            }), encoding="utf-8")
             (day / "not-a-session").mkdir()
             items = list_recordings(tmp, probe=False)
-            self.assertEqual(len(items), 1)
-            rec = items[0]
+            self.assertEqual(len(items), 2)
+            rec = next(item for item in items if item.name == session.name)
             self.assertEqual(rec.started, "2026-09-18 17:27:11")
             self.assertTrue(rec.has_mic)
             self.assertTrue(rec.has_system)
             self.assertTrue(rec.transcript)
             self.assertTrue(rec.summary)
             self.assertEqual(rec.as_dict()["duration"], "--:--")  # no probe
+            named_rec = next(item for item in items if item.name == named.name)
+            self.assertEqual(named_rec.title, "Enrollment planning")
+            self.assertEqual(named_rec.participants, ["Dana", "Client"])
+            self.assertEqual(named_rec.started, "2026-09-18T16:20:10")
 
 
 class ControlCenterTests(unittest.TestCase):

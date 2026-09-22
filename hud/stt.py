@@ -542,6 +542,8 @@ class _Source:
         self.context_tail = ""
         self.dropped = 0
         self.transcribed = 0
+        self.segment_seq = 0
+        self.last_segment_id = ""
 
 
 class LiveTranscriber:
@@ -561,6 +563,12 @@ class LiveTranscriber:
         self._provider_backoff_until = 0.0
         self._provider_backoff_seconds = 4.0
         self._provider_backoff_lock = threading.Lock()
+        # whisper-server is effectively a single local inference lane. Final
+        # chunks wait for it; stale interim frames skip it and are replaced by
+        # the next rolling window.
+        self._inference_lock = threading.Lock()
+        self._partial_dropped = 0
+        self._final_inference_count = 0
         self._active_chunk_seconds = float(cfg.stt_chunk_seconds)
 
     # -- lifecycle ---------------------------------------------------------
@@ -877,7 +885,15 @@ class LiveTranscriber:
             captured_at, audio = item
             started = time.time()
             try:
-                out = self._stt.transcribe(audio, prompt=self._prompt_for(source))  # type: ignore[attr-defined]
+                if not self._inference_lock.acquire(blocking=False):
+                    self._partial_dropped += 1
+                    self.state.set_meta(stt_partial_dropped=self._partial_dropped)
+                    continue
+                try:
+                    out = self._stt.transcribe(  # type: ignore[attr-defined]
+                        audio, prompt=self._prompt_for(source))
+                finally:
+                    self._inference_lock.release()
                 result = out if isinstance(out, STTResult) else STTResult(text=str(out or ""))
                 text = result.text.strip()
                 if (text and (not self.cfg.stt_hallucination_filter
@@ -894,6 +910,8 @@ class LiveTranscriber:
                         captured_at=captured_at)
                     self.state.set_meta(
                         stt_partial_latency=round(max(0.0, time.time() - captured_at), 2))
+                    self.state.observe_metric("stt_partial_latency_seconds",
+                                              max(0.0, time.time() - captured_at))
             except Exception as exc:  # noqa: BLE001
                 # Partial recognition is an enhancement. A failed interim
                 # request must never disable final transcription.
@@ -907,10 +925,20 @@ class LiveTranscriber:
             return
         source.context_tail = (source.context_tail + " " + delta).strip()[-200:]
         source.transcribed += 1
+        source.segment_seq += 1
+        source.last_segment_id = "{}:{}".format(
+            source.speaker or "mixed", source.segment_seq)
         self.state.add("transcript", text=delta, source="live",
                        speaker=source.speaker,
                        latency=round(time.time() - started, 2) if started else None,
-                       stable_partial=not finalized, finalized=finalized)
+                       stable_partial=not finalized, finalized=finalized,
+                       segment_id=source.last_segment_id,
+                       revision=source.partial_revision,
+                       captured_at=started)
+        if not finalized:
+            self.state.add("transcript_revision", text=delta, source="live",
+                           speaker=source.speaker, segment_id=source.last_segment_id,
+                           revision=source.partial_revision, finalized=False)
 
     def _prompt_for(self, source: _Source) -> Optional[str]:
         if not self.cfg.stt_context_prompt:
@@ -949,10 +977,15 @@ class LiveTranscriber:
         started = time.time()
         prompt = self._prompt_for(source)
         try:
-            try:
-                out = self._stt.transcribe(chunk, prompt=prompt)  # type: ignore[attr-defined]
-            except TypeError:
-                out = self._stt.transcribe(chunk)  # type: ignore[attr-defined]
+            # Final recognition has priority over interim recognition, and the
+            # lock keeps two independent sources from contending in the same
+            # whisper-server process.
+            with self._inference_lock:
+                try:
+                    out = self._stt.transcribe(chunk, prompt=prompt)  # type: ignore[attr-defined]
+                except TypeError:
+                    out = self._stt.transcribe(chunk)  # type: ignore[attr-defined]
+                self._final_inference_count += 1
         except LLMError as exc:
             self.log("STT error: {}".format(exc))
             self.state.add("status", status="recording", stt_error=str(exc))
@@ -988,14 +1021,20 @@ class LiveTranscriber:
         self._publish_committed(source, text, started, finalized=True)
         if self._partial_enabled():
             self.state.add("transcript_boundary", source_key=source.speaker or "mixed",
-                           speaker=source.speaker, finalized=True)
+                           speaker=source.speaker, finalized=True,
+                           segment_id=source.last_segment_id,
+                           revision=source.partial_revision + 1)
             source.partial_revision += 1
             self.state.set_transcript_partial(
                 source.speaker or "mixed", "", source.speaker,
                 source.partial_revision, finalized=True)
         if captured_at is not None:
+            self.state.observe_metric("stt_final_latency_seconds",
+                                      max(0.0, time.time() - captured_at))
             self.state.set_meta(
-                stt_lag_seconds=round(max(0.0, time.time() - captured_at), 1))
+                stt_lag_seconds=round(max(0.0, time.time() - captured_at), 1),
+                stt_final_inferences=self._final_inference_count,
+                stt_partial_dropped=self._partial_dropped)
 
     def _delta_text(self, source: "_Source", text: str) -> str:
         words = split_words(text)

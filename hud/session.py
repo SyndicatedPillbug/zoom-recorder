@@ -10,16 +10,19 @@ start leaves the recording completely unaffected.
 from __future__ import annotations
 
 import os
+import json
 import secrets
 import threading
 import time
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .answers import AnswerEngine
 from .budget import BudgetGovernor
 from .config import HudConfig
+from .identity import build_identity, meaningful_folder_name, write_identity
 from .local_http import url_host
 from .server import HudServer
 from .state import LiveState
@@ -33,7 +36,8 @@ class LiveSession:
     def __init__(self, cfg: HudConfig, outdir: Path, log: Callable[[str], None],
                  mic_name: Optional[str], system_name: Optional[str] = None,
                  model_path: Optional[Path] = None,
-                 on_stop: Optional[Callable[[], None]] = None) -> None:
+                 on_stop: Optional[Callable[[], None]] = None,
+                 started_at: Optional[datetime] = None) -> None:
         self.cfg = cfg
         self.outdir = Path(outdir)
         self.log = log
@@ -41,6 +45,7 @@ class LiveSession:
         self.system_name = system_name
         self.model_path = model_path
         self.on_stop = on_stop
+        self.started_at = started_at or datetime.now()
 
         self.state = LiveState()
         self.budget = BudgetGovernor(cfg.budget_tpm, cfg.budget_tpd)
@@ -133,25 +138,35 @@ class LiveSession:
         self._stop.set()
         if self._flush_thread is not None:
             self._flush_thread.join(timeout=2.5)
+
+        # Stop capture/STT before generating a summary so the final recognized
+        # words are present in both the summary and the identity record.
+        if self.stt is not None:
+            try:
+                self.stt.stop()
+            except Exception:  # noqa: BLE001
+                pass
         summary = None
         if self.answers is not None:
             try:
                 summary = self.answers.finish()
             except Exception as exc:  # noqa: BLE001
                 self.log("live HUD: summary failed ({})".format(exc))
-        self._persist(summary=summary)
-        for component in (self.answers, self.stt):
-            if component is not None:
-                try:
-                    component.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+        if self.answers is not None:
+            try:
+                self.answers.stop()
+            except Exception:  # noqa: BLE001
+                pass
         if self._writeback is not None:
             try:
                 self._writeback.stop()
             except Exception as exc:  # noqa: BLE001
                 self.log("live transcript writeback shutdown failed ({})".format(exc))
+        identity = self._finalize_identity()
+        if self._writeback is not None:
+            self._writeback.finalize_name(str(identity.get("slug") or ""))
             self._writeback = None
+        self._persist(summary=summary)
         self.state.set_status("stopped")
         try:
             HUD_URLFILE.unlink(missing_ok=True)
@@ -162,6 +177,38 @@ class LiveSession:
                 self.server.stop()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _finalize_identity(self) -> Dict[str, Any]:
+        """Write evidence-backed metadata and add a readable folder slug."""
+        from datetime import datetime as _datetime
+
+        identity = build_identity(
+            self.started_at, _datetime.now(), self.outdir.name,
+            self.state.transcript_text(), self.cfg)
+        original = self.outdir
+        target_name = meaningful_folder_name(original.name, identity)
+        target = original.parent / target_name
+        if target != original:
+            suffix = 1
+            candidate = target
+            while candidate.exists():
+                suffix += 1
+                candidate = target.with_name("{}-{}".format(target.name, suffix))
+            try:
+                original.rename(candidate)
+                self.outdir = candidate
+                identity["folder"] = candidate.name
+                identity["path"] = str(candidate)
+            except OSError as exc:
+                self.log("session folder kept numeric name ({}): {}".format(
+                    original, exc))
+        try:
+            write_identity(self.outdir / "session.json", identity)
+        except OSError as exc:
+            self.log("session identity could not be written ({}): {}".format(
+                self.outdir, exc))
+        self.log("session identity: {}".format(identity.get("title") or "Meeting"))
+        return identity
 
     # -- helpers -----------------------------------------------------------
     @property
@@ -242,6 +289,22 @@ class LiveSession:
         derived = self.outdir / "derived"
         derived.mkdir(parents=True, exist_ok=True)
         written = []
+        try:
+            from .replay import write_jsonl
+            write_jsonl(derived / "live_events.jsonl", self.state.since(0))
+            written.append("live_events.jsonl")
+            self._atomic_write(
+                derived / "meeting_memory.json",
+                json.dumps(self.state.memory(), indent=2, ensure_ascii=False) + "\n")
+            written.append("meeting_memory.json")
+            self._atomic_write(
+                derived / "live_diagnostics.json",
+                json.dumps({"meta": self.state.snapshot().get("meta", {}),
+                            "metrics": self.state.metrics()}, indent=2,
+                           ensure_ascii=False, sort_keys=True) + "\n")
+            written.append("live_diagnostics.json")
+        except (OSError, TypeError, ValueError) as exc:
+            self.log("Live HUD: could not persist event/memory log ({})".format(exc))
         transcript = self.state.transcript_text()
         if transcript:
             self._atomic_write(derived / "live_transcript.txt", transcript + "\n")

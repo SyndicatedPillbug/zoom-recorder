@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -94,11 +95,83 @@ def chunk_markdown(text: str, source: str, target_chars: int = 2400,
         buf_heading = heading
     if buf:
         chunks.append(_make_chunk(buf_heading, buf, source))
+    metadata = _frontmatter(text)
+    if metadata:
+        for chunk in chunks:
+            chunk["metadata"] = dict(metadata)
     return chunks
 
 
 def _make_chunk(heading: str, body: str, source: str) -> Dict[str, str]:
     return {"source": source, "heading": heading or source, "text": body.strip()}
+
+
+def _frontmatter(text: str) -> Dict[str, str]:
+    """Read lightweight Obsidian YAML metadata without requiring PyYAML."""
+    lines = (text or "").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out: Dict[str, str] = {}
+    for line in lines[1:80]:
+        if line.strip() == "---":
+            break
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip().strip("[]")
+        if key and value:
+            out[key] = value
+    return out
+
+
+class SQLiteLexicalIndex:
+    """Persistent FTS5 side index for very large Markdown vaults."""
+
+    def __init__(self, path: Path, log: Callable[[str], None]) -> None:
+        self.path = path
+        self.log = log
+        self.enabled = False
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(str(self.path)) as db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY, source TEXT, heading TEXT, text TEXT)")
+                db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(source, heading, text, content='chunks', content_rowid='id')")
+                db.execute("CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN INSERT INTO chunks_fts(rowid, source, heading, text) VALUES (new.id, new.source, new.heading, new.text); END")
+                db.execute("CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts, rowid, source, heading, text) VALUES ('delete', old.id, old.source, old.heading, old.text); END")
+                db.execute("CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts, rowid, source, heading, text) VALUES ('delete', old.id, old.source, old.heading, old.text); INSERT INTO chunks_fts(rowid, source, heading, text) VALUES (new.id, new.source, new.heading, new.text); END")
+            self.enabled = True
+        except (OSError, sqlite3.Error) as exc:
+            self.log("KB: SQLite FTS unavailable; using in-memory lexical index ({})".format(exc))
+
+    def replace(self, chunks: List[Dict[str, str]]) -> None:
+        if not self.enabled:
+            return
+        try:
+            with sqlite3.connect(str(self.path)) as db:
+                db.execute("DELETE FROM chunks")
+                db.executemany("INSERT INTO chunks(source, heading, text) VALUES (?, ?, ?)",
+                                [(str(c.get("source", "")), str(c.get("heading", "")),
+                                  str(c.get("text", ""))) for c in chunks])
+        except sqlite3.Error as exc:
+            self.log("KB: SQLite lexical update failed ({})".format(exc))
+
+    def query(self, text: str, limit: int = 1000) -> List[Tuple[str, str, str]]:
+        if not self.enabled:
+            return []
+        terms = [t for t in _tokens(text) if len(t) > 1]
+        if not terms:
+            return []
+        match = " OR ".join('"{}"'.format(t.replace('"', '')) for t in terms[:24])
+        try:
+            with sqlite3.connect(str(self.path)) as db:
+                rows = db.execute(
+                    "SELECT source, heading, text FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?",
+                    (match, int(limit))).fetchall()
+            return [(str(a), str(b), str(c)) for a, b, c in rows]
+        except sqlite3.Error:
+            return []
 
 
 def _iter_markdown_files(dirs: List[str], onerror: Optional[Callable[[str], None]] = None):
@@ -261,6 +334,7 @@ class KBIndex:
         self._token_index: Dict[str, List[int]] = {}
         self._ready = False
         self._lock = threading.Lock()
+        self._sqlite = SQLiteLexicalIndex(self.cache_dir / "lexical.sqlite3", self.log)
 
     def _rebuild_token_index(self) -> None:
         index: Dict[str, List[int]] = {}
@@ -424,6 +498,7 @@ class KBIndex:
         self._chunks = chunks
         self._vectors = vectors
         self._rebuild_token_index()
+        self._sqlite.replace(chunks)
         self._ready = True
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -461,6 +536,7 @@ class KBIndex:
             if len(self._vectors) != len(self._chunks):
                 return False
             self._rebuild_token_index()
+            self._sqlite.replace(self._chunks)
             self.log("KB: loaded cached index ({} chunks, {})".format(
                 len(self._chunks), getattr(self.embedder, "label", "?")))
             return True
@@ -500,6 +576,8 @@ class KBIndex:
                 del self._chunks[:excess]
                 del self._vectors[:excess]
                 self._rebuild_token_index()
+            snapshot = list(self._chunks)
+        self._sqlite.replace(snapshot)
         return len(chunks)
 
     # -- query -------------------------------------------------------------
@@ -530,9 +608,18 @@ class KBIndex:
         # conceptual/synonym matches are never discarded.
         candidate_indices = range(len(vectors))
         if len(vectors) > 5000:
-            query_tokens = set(_tokens(text))
-            candidates = {idx for token in query_tokens
-                          for idx in token_index.get(token, [])}
+            lexical_rows = self._sqlite.query(text, limit=2000)
+            if lexical_rows:
+                wanted = {(source, heading, body)
+                          for source, heading, body in lexical_rows}
+                candidates = {idx for idx, chunk in enumerate(chunks)
+                              if (str(chunk.get("source", "")),
+                                  str(chunk.get("heading", "")),
+                                  str(chunk.get("text", ""))) in wanted}
+            else:
+                query_tokens = set(_tokens(text))
+                candidates = {idx for token in query_tokens
+                              for idx in token_index.get(token, [])}
             if candidates and len(candidates) < len(vectors) * 0.75:
                 candidate_indices = candidates
 

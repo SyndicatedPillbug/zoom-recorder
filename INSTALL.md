@@ -81,6 +81,21 @@ Open **Setup** (menu: *Check my audio setup…*) and choose step 4:
 To keep everything on the machine, use **Settings → Offline mode** (blocks
 all internet access). See `SECURITY.md` for exactly what is sent where.
 
+### Obsidian context and session identity
+
+In Advanced settings, add the folders that contain your Obsidian Markdown
+notes and past transcripts to the knowledge-base directories. The app builds a
+local incremental embedding cache plus a SQLite lexical index, skips Obsidian
+metadata/plugin folders, and continues with lexical retrieval if macOS denies
+the embedding cache directory. For a protected vault, grant the menu-bar
+launcher Files & Folders access in **System Settings → Privacy & Security**.
+
+Each finalized recording has a `session.json` sidecar and a readable topic
+folder name derived from the first substantive transcript line. This is
+additional metadata; the original recording and `derived/` outputs remain in
+the same session folder. `live_events.jsonl` can be replayed with
+`python3 -m hud.replay PATH` for offline troubleshooting.
+
 ## 5. Optional: hardware volume keys in loopback mode
 
 macOS volume keys do nothing while a Multi-Output Device is the default
