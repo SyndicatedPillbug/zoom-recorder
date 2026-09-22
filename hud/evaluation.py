@@ -34,8 +34,12 @@ class WordErrorStats:
         return self.substitutions + self.deletions + self.insertions
 
     @property
-    def wer(self) -> float:
-        return self.errors / self.reference_words if self.reference_words else 0.0
+    def wer(self) -> Optional[float]:
+        if self.reference_words:
+            return self.errors / self.reference_words
+        # WER is undefined for a silence-only reference when the hypothesis
+        # contains words; insertion counts remain the meaningful signal.
+        return 0.0 if not self.hypothesis_words else None
 
     def as_dict(self) -> dict:
         return {
@@ -45,7 +49,7 @@ class WordErrorStats:
             "deletions": self.deletions,
             "insertions": self.insertions,
             "errors": self.errors,
-            "wer": round(self.wer, 6),
+            "wer": round(self.wer, 6) if self.wer is not None else None,
         }
 
 

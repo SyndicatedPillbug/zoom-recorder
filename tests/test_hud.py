@@ -873,6 +873,9 @@ class MemoryAndReplayTests(unittest.TestCase):
         self.assertEqual(stats.errors, 2)
         self.assertEqual(stats.reference_words, 4)
         self.assertEqual(stats.wer, 0.5)
+        silence = word_error_stats("", "hello there")
+        self.assertIsNone(silence.wer)
+        self.assertEqual(silence.insertions, 2)
 
     def test_memory_extracts_exact_decision_and_number_evidence(self) -> None:
         items = extract_memory("We agreed to launch in Q3 with a $50,000 budget.",
