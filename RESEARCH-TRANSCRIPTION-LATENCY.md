@@ -87,12 +87,14 @@ support frequent rolling windows even while Turbo handles final recognition.
 
 The outputs also confirm the intended division of labor: Turbo produced the
 cleaner wording, while base.en produced a few extra and incorrect phrases in
-the same audio. These are throughput measurements, not WER measurements; the
-fixture does not yet have a checked, time-aligned reference transcript. The
-next evaluation must compare both models against a reference before changing
-the interim window or local-agreement threshold. A CPU-only Turbo run took
-about 54 seconds for the same 45-second file, confirming that Metal access is
-an operational prerequisite for the expected local baseline.
+the same audio. The first 45 seconds are silence-only according to the
+official word timings, so that slice is useful for insertion/hallucination
+checks but not ordinary WER. On the aligned 50–80 second speech window, Turbo
+scored 20.0% WER and base.en scored 21.3% WER. That is close enough for base.en
+to serve as a provisional lane, but not a reason to replace Turbo as the
+authoritative final model. A CPU-only Turbo run took about 54 seconds for the
+same 45-second file, confirming that Metal access is an operational
+prerequisite for the expected local baseline.
 
 ## Recommended next experiments
 
@@ -110,8 +112,8 @@ an operational prerequisite for the expected local baseline.
    but they do not guarantee an equivalent end-to-end latency improvement.
 5. Use the new small, dependency-free reference-aligned evaluator for word
    error rate, substitutions, deletions, and insertions. Extend the fixture
-   manifest with first-stable-word and final capture-to-text latency once
-   checked time-aligned references are available.
+   manifest with first-stable-word and final capture-to-text latency; the
+   aligned AMI speech slice is now available for that streaming measurement.
 
 ## Explicit non-recommendations
 

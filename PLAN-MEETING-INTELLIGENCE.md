@@ -123,9 +123,10 @@ final model or a shorter interim window.
 The dependency-free word-level evaluator is now implemented in
 `hud/evaluation.py` and covered by the full regression suite. It reports WER
 plus substitutions, deletions, and insertions from any checked reference and
-hypothesis text. Adding aligned fixture references, first-stable-word latency,
-and final capture-to-text latency is the remaining work; interim window and
-local-agreement changes remain gated on that evidence.
+hypothesis text. The aligned AMI 50–80 second speech slice scored 20.0% WER
+with Turbo and 21.3% with base.en. Measuring first-stable-word latency and
+final capture-to-text latency remains; interim window and local-agreement
+changes remain gated on that evidence.
 
 ### Phase C — question finalization and answer evidence (implemented baseline)
 
