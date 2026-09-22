@@ -14,6 +14,10 @@ cd ~/zoom-recorder
 
 # ...or install what is missing (Homebrew ffmpeg + BlackHole, pip rumps):
 ./install.sh --install-deps
+
+# Optional post-call speaker diarization and reusable voice matching:
+./install.sh --install-diarization
+./.venv-diarization/bin/hf auth login
 ```
 
 `./install.sh --dry-run` prints everything it would do without changing
@@ -79,9 +83,11 @@ Open **Setup** (menu: *Check my audio setup…*) and choose step 4:
   accuracy and for Suggestions/answers.
 
 Optional multi-speaker attribution is a separate, post-call feature. It is
-disabled by default so it cannot affect live capture or answer latency. After
-installing WhisperX and its diarization dependencies, provide the model's
-Hugging Face credential as `HF_TOKEN` and start a live session with
+disabled by default so it cannot affect live capture or answer latency. The
+supported setup creates a repo-local `.venv-diarization` environment with
+WhisperX and `pyannote.audio`; the recorder discovers its `whisperx` command
+automatically. Authenticate that environment with `hf auth login` or provide
+the model credential through `HF_TOKEN`, then start a live session with
 `./zoom_record.py --live --diarize`. The result is written under `derived/`;
 missing dependencies or a failed pass leave the ordinary transcript intact.
 
@@ -94,9 +100,9 @@ manual labels can also build a local reusable voice profile. Those profiles are
 stored owner-only under the app configuration directory, contain no audio, and
 can be disabled or deleted from Settings.
 
-For local embedding enrichment, install `pyannote.audio` in the same optional
-environment as WhisperX and keep `HF_TOKEN` available. The app still works
-without it; it simply keeps generic diarization labels.
+For reusable voice matching, keep voice profiles enabled so WhisperX emits its
+speaker embeddings during the same post-call pass. The app still works without
+that optional output; it simply keeps generic diarization labels.
 
 To keep everything on the machine, use **Settings → Offline mode** (blocks
 all internet access). See `SECURITY.md` for exactly what is sent where.

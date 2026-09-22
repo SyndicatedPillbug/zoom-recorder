@@ -7,6 +7,7 @@
 # Usage:
 #   ./install.sh                  # check deps, report, run doctor
 #   ./install.sh --install-deps   # also brew/pip install what is missing
+#   ./install.sh --install-diarization # install isolated WhisperX + pyannote
 #   ./install.sh --autostart      # also enable login autostart (opt-in)
 #   ./install.sh --dry-run        # print what would happen, change nothing
 set -uo pipefail
@@ -14,12 +15,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON3="$(command -v python3 || true)"
 INSTALL_DEPS=0
+INSTALL_DIARIZATION=0
 AUTOSTART=0
 DRY_RUN=0
 
 for arg in "$@"; do
   case "$arg" in
     --install-deps) INSTALL_DEPS=1 ;;
+    --install-diarization) INSTALL_DIARIZATION=1 ;;
     --autostart) AUTOSTART=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help)
@@ -53,6 +56,32 @@ if [[ -z "$PYTHON3" ]]; then
   exit 1
 fi
 say "python3: $PYTHON3 ($("$PYTHON3" -c 'import sys; print(sys.version.split()[0])'))"
+
+# --- optional WhisperX + pyannote environment -----------------------------
+if [[ "$INSTALL_DIARIZATION" == "1" ]]; then
+  DIAR_PYTHON="$(command -v python3.12 || true)"
+  if [[ -z "$DIAR_PYTHON" ]]; then
+    say "Python 3.12: MISSING (needed for the isolated diarization environment)"
+    run brew install python@3.12
+    DIAR_PYTHON="$(command -v python3.12 || true)"
+    if [[ -z "$DIAR_PYTHON" && -x "/opt/homebrew/bin/python3.12" ]]; then
+      DIAR_PYTHON="/opt/homebrew/bin/python3.12"
+    fi
+    if [[ -z "$DIAR_PYTHON" && -x "/usr/local/bin/python3.12" ]]; then
+      DIAR_PYTHON="/usr/local/bin/python3.12"
+    fi
+  fi
+  DIAR_VENV="$SCRIPT_DIR/.venv-diarization"
+  if [[ -n "$DIAR_PYTHON" ]]; then
+    say "Diarization environment: $DIAR_VENV"
+    run "$DIAR_PYTHON" -m venv "$DIAR_VENV"
+    run "$DIAR_VENV/bin/python" -m pip install --upgrade pip setuptools wheel
+    run "$DIAR_VENV/bin/python" -m pip install whisperx pyannote.audio
+    say "Authenticate it before using --diarize: $DIAR_VENV/bin/hf auth login"
+  else
+    say "ERROR: Python 3.12 could not be located after installation" >&2
+  fi
+fi
 
 missing=0
 

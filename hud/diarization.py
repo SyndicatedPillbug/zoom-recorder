@@ -31,6 +31,9 @@ def _speaker_id(raw: str, ids: Dict[str, str]) -> str:
 def _load_segments(path: Path) -> List[Dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     raw = data.get("segments", []) if isinstance(data, dict) else []
+    speaker_embeddings = data.get("speaker_embeddings", {}) if isinstance(data, dict) else {}
+    if not isinstance(speaker_embeddings, dict):
+        speaker_embeddings = {}
     out: List[Dict[str, Any]] = []
     ids: Dict[str, str] = {}
     for item in raw if isinstance(raw, list) else []:
@@ -45,6 +48,8 @@ def _load_segments(path: Path) -> List[Dict[str, Any]]:
             continue
         raw_speaker = str(item.get("speaker") or "UNKNOWN")
         embedding = _vector(item.get("embedding"))
+        if embedding is None:
+            embedding = _vector(speaker_embeddings.get(raw_speaker))
         out.append({
             "start": start,
             "end": end,
@@ -56,6 +61,37 @@ def _load_segments(path: Path) -> List[Dict[str, Any]]:
             "_embedding": embedding,
         })
     return out
+
+
+def _resolve_hf_token() -> Optional[str]:
+    """Resolve a local Hugging Face token without ever logging or exposing it."""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if token:
+        return token.strip() or None
+    for candidate in (
+        Path.home() / ".cache" / "huggingface" / "token",
+        Path.home() / ".huggingface" / "token",
+    ):
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        if value:
+            return value
+    return None
+
+
+def _whisperx_binary(backend: str) -> Optional[str]:
+    """Find WhisperX, preferring the repo-local optional environment."""
+    if backend not in ("auto", "whisperx"):
+        return None
+    configured = os.environ.get("WHISPERX_BIN")
+    if configured and Path(configured).is_file():
+        return configured
+    repo_local = Path(__file__).resolve().parent.parent / ".venv-diarization" / "bin" / "whisperx"
+    if repo_local.is_file():
+        return str(repo_local)
+    return shutil.which("whisperx")
 
 
 def _add_optional_embeddings(audio_path: Path, segments: List[Dict[str, Any]],
@@ -158,11 +194,11 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
     if not audio_path.is_file():
         log("diarization skipped: remote audio track is unavailable")
         return None
-    binary = shutil.which("whisperx") if backend in ("auto", "whisperx") else None
+    binary = _whisperx_binary(backend)
     if not binary:
         log("diarization skipped: install WhisperX to enable the optional post-call pass")
         return None
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    token = _resolve_hf_token()
     if not token:
         log("diarization skipped: HF_TOKEN is not set for the diarization model")
         return None
@@ -171,10 +207,18 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
     with tempfile.TemporaryDirectory(prefix="diarization-", dir=str(output_dir)) as tmp:
         command = [binary, str(audio_path), "--model", "large-v3-turbo",
                    "--output_dir", tmp, "--output_format", "json", "--diarize",
-                   "--device", "cpu", "--compute_type", "int8", "--hf_token", token]
+                   "--device", "cpu", "--compute_type", "int8"]
+        if getattr(cfg, "voice_profiles_enabled", True):
+            command.append("--speaker_embeddings")
+        # Keep the credential out of the process argument list.  Hugging Face
+        # libraries and WhisperX both honor HF_TOKEN in the child environment.
+        child_env = os.environ.copy()
+        child_env["HF_TOKEN"] = token
         try:
             proc = subprocess.run(
                 command, capture_output=True, text=True,
+                cwd=str(Path(__file__).resolve().parent.parent),
+                env=child_env,
                 timeout=max(30.0, float(getattr(cfg, "diarization_timeout_seconds", 300.0))))
         except (OSError, subprocess.SubprocessError) as exc:
             log("diarization skipped after launch failure: {}".format(exc))

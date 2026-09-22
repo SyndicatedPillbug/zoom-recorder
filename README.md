@@ -22,6 +22,9 @@ selection, continuous capture verification, dynamic failover, and transcription.
 git clone <this repo> ~/zoom-recorder
 cd ~/zoom-recorder
 ./install.sh --install-deps   # checks/installs ffmpeg, BlackHole, rumps
+# Optional post-call speaker attribution and reusable voice profiles:
+./install.sh --install-diarization
+./.venv-diarization/bin/hf auth login
 ./run-menubar.command         # start the menu bar
 ```
 
@@ -290,20 +293,22 @@ views without rewriting raw audio or transcript events. The mapping is saved in
 
 **Optional post-call diarization.** For calls with several people sharing one
 remote/system channel, the safe first step is an opt-in background pass after
-capture. It never delays live STT, question detection, or answer TTFT. Install
-WhisperX and its diarization dependencies separately, set `HF_TOKEN` for the
-pyannote model, then run:
+capture. It never delays live STT, question detection, or answer TTFT. The
+supported setup installs WhisperX and its diarization dependencies in the
+repo-local `.venv-diarization` environment; the app finds that environment
+automatically. Authenticate with `hf auth login` or set `HF_TOKEN`, then run:
 
 ```bash
 ./zoom_record.py --live --diarize --self-name "Dana"
 ```
 
 The pass processes only the saved remote track when one exists, uses fixed
-non-shell arguments, has a timeout, and writes only derived files. If WhisperX,
-the model, or the token is missing, the call completes with the normal
-channel-labelled transcript. Speaker IDs remain generic (`Remote 1`, `Remote
-2`) until the user renames them; acoustic attribution never silently claims a
-real person's identity.
+non-shell arguments, keeps the credential out of the child process arguments,
+has a timeout, and writes only derived files. If WhisperX, the model, or the
+token is missing, the call completes with the normal channel-labelled
+transcript. Speaker IDs remain generic (`Remote 1`, `Remote 2`) until the user
+renames them; acoustic attribution never silently claims a real person's
+identity.
 
 **Reusable voice matches.** When a diarization backend supplies acoustic
 embeddings, an explicit manual name can enroll one representative sample into
@@ -313,10 +318,9 @@ match is still marked `voice_profile` and remains generic below the configured
 threshold. The store contains aggregate embeddings and metadata, not audio;
 it is created with owner-only permissions. Disable **Reuse confirmed voices**
 in Settings to stop matching, and delete the profile file to erase stored
-matches. The post-call worker will use the optional `pyannote/embedding` model
-when `pyannote.audio` is installed alongside WhisperX; otherwise it safely
-falls back because WhisperX's session-local speaker IDs are not reusable
-identities by themselves.
+matches. When enabled, WhisperX emits the speaker embeddings during the same
+post-call pass; otherwise it safely falls back because WhisperX's session-local
+speaker IDs are not reusable identities by themselves.
 
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is

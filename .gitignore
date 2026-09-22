@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.venv-diarization/
 
 # Local secrets / provider config
 config.local.json
@@ -10,4 +11,3 @@ config.local.json
 
 # HUD caches
 .hud_index/
-

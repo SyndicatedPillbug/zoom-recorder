@@ -639,8 +639,10 @@ class IdentityTests(unittest.TestCase):
             audio = root / "remote.wav"
             audio.write_bytes(b"audio")
             cfg = HudConfig(diarization_enabled=True, diarization_backend="whisperx")
+            launched = {}
 
             def fake_run(command, **_kwargs):
+                launched["command"] = command
                 outdir = Path(command[command.index("--output_dir") + 1])
                 (outdir / "remote.json").write_text(json.dumps({
                     "segments": [{"start": 0.0, "end": 2.0,
@@ -657,6 +659,8 @@ class IdentityTests(unittest.TestCase):
                       "speaker_id": "remote", "captured_at": 101.0, "ts": 101.0}],
                     root / "derived", cfg, lambda _m: None, started_epoch=100.0)
             self.assertIsNotNone(result)
+            self.assertIn("--speaker_embeddings", launched["command"])
+            self.assertNotIn("--hf_token", launched["command"])
             self.assertTrue((root / "derived" / "diarization.json").is_file())
             rendered = (root / "derived" / "diarized_transcript.md").read_text()
             self.assertIn("Remote 1", rendered)
