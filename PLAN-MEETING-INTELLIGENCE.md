@@ -42,13 +42,23 @@ configurable minimum and maximum bounds, and retains a small overlap between
 target-sized windows. Actual queue pressure is required before a window grows;
 inference time by itself never adds capture-to-text latency. Phrase pauses may
 still flush a shorter window, and final work remains ahead of provisional work.
+Provisional admission now yields whenever final audio is queued or being
+decoded; when the provisional queue is full, the newest draft replaces the
+stale queued draft instead of being dropped. This keeps the authoritative lane
+responsive while preserving the most current local draft for the HUD.
 
-The first real-time AMI replay after this change produced zero final queue
-drops, nine final inferences, and a final shutdown lag of about 2.1 seconds.
-Its measured p50/p95 final latency was about 2.9/5.0 seconds, so the replay
-demonstrates the path but does not yet satisfy the final latency gate. The next
-pass should compare several speech densities and tune overlap, phrase flush,
-and partial-worker admission before changing the answer scheduler.
+Real-time AMI replays now produce zero final queue drops and zero provisional
+queue drops. On a dense 15-second speech sample, the original three-second
+floor measured about 3.8 seconds p50 final latency; lowering the floor to 2.5
+seconds measured about 2.4 seconds p50 and 2.5 seconds p95, with three final
+inferences and no provisional drops. A speech-plus-pause sample measured about
+2.2 seconds p50/p95 and flushed cleanly. The longer 45-second replay using the
+new default produced zero final drops, zero provisional drops, nine final
+inferences, and a 3.5-second settled target; final latency was 3.94 seconds
+p50 and 4.79 seconds p95. This is bounded and materially better than an
+unbounded backlog, but the p95 tail remains above the aspirational gate, so
+this phase stays in progress. Overlap and phrase-flush tuning remain the next
+likely levers before changing the answer scheduler.
 
 ### Phase C — question finalization and answer evidence (implemented baseline)
 

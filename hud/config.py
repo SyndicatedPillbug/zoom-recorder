@@ -159,7 +159,7 @@ class HudConfig:
     stt_model: Optional[str] = None    # None => provider default
     stt_chunk_seconds: float = 5.0     # initial live chunk target
     stt_adaptive_chunking: bool = True # local STT retunes around speech/queue pressure
-    stt_chunk_min_seconds: float = 3.0
+    stt_chunk_min_seconds: float = 2.5
     stt_chunk_max_seconds: float = 7.0
     stt_chunk_overlap_seconds: float = 0.5
     stt_min_speech_seconds: float = 0.8
@@ -316,7 +316,7 @@ def _defaults() -> Dict[str, Any]:
             "model": None,
             "chunk_seconds": 5.0,
             "adaptive_chunking": True,
-            "chunk_min_seconds": 3.0,
+            "chunk_min_seconds": 2.5,
             "chunk_max_seconds": 7.0,
             "chunk_overlap_seconds": 0.5,
             "min_speech_seconds": 0.8,
@@ -435,7 +435,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_model=stt.get("model") or None,
         stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 5.0),
         stt_adaptive_chunking=bool(stt.get("adaptive_chunking", True)),
-        stt_chunk_min_seconds=_as_float(stt.get("chunk_min_seconds"), 3.0),
+        stt_chunk_min_seconds=_as_float(stt.get("chunk_min_seconds"), 2.5),
         stt_chunk_max_seconds=_as_float(stt.get("chunk_max_seconds"), 7.0),
         stt_chunk_overlap_seconds=_as_float(
             stt.get("chunk_overlap_seconds"), 0.5),

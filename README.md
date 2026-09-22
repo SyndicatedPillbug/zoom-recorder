@@ -367,8 +367,8 @@ The quantized model is about 547 MiB on disk. Use it explicitly with:
 
 With two remote Groq streams, the recorder raises sub-7-second chunks to 7
 seconds to stay under the provider's current STT request rate. Local Turbo
-starts at the configured chunk size, then adapts between the configured 3–7
-second bounds based on inference time and queue pressure, retaining a small
+starts at the configured chunk size, then adapts between the configured 2.5–7
+second bounds based on queue pressure, retaining a small
 overlap to protect word boundaries. The answer loop wakes on new transcript
 events instead of waiting for a fixed polling tick, so question detection
 starts immediately after recognition. Local mode also removes STT network
@@ -493,7 +493,7 @@ to drift minutes behind the call.
 ```json
 {
   "stt":     {"backend": "groq", "chunk_seconds": 5, "adaptive_chunking": true,
-               "chunk_min_seconds": 3, "chunk_max_seconds": 7,
+               "chunk_min_seconds": 2.5, "chunk_max_seconds": 7,
                "chunk_overlap_seconds": 0.5, "partial_enabled": true,
                "partial_window_seconds": 2, "partial_interval_seconds": 0.8,
                "glossary": ["Acme", "Q3"],

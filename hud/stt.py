@@ -631,6 +631,8 @@ class LiveTranscriber:
         # the next rolling window.
         self._inference_lock = threading.Lock()
         self._partial_dropped = 0
+        self._partial_suppressed = 0
+        self._partial_coalesced = 0
         self._final_inference_count = 0
         self._active_chunk_seconds = float(cfg.stt_chunk_seconds)
 
@@ -711,7 +713,7 @@ class LiveTranscriber:
                 and (self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS)
 
     def _chunk_bounds(self) -> tuple[float, float]:
-        minimum = max(1.0, float(getattr(self.cfg, "stt_chunk_min_seconds", 3.0)))
+        minimum = max(1.0, float(getattr(self.cfg, "stt_chunk_min_seconds", 2.5)))
         maximum = max(minimum, float(getattr(self.cfg, "stt_chunk_max_seconds", 7.0)))
         return minimum, maximum
 
@@ -957,12 +959,29 @@ class LiveTranscriber:
                 return
             source.partial_last_submit = now
             audio = bytes(source.partial_buffer[-window_bytes:])
+        # Final recognition owns the inference lane. Do not admit an interim
+        # request while final audio is queued or another inference is active;
+        # a draft produced in that interval is stale by the time it renders.
+        if source.queue.qsize() > 0 or self._inference_lock.locked():
+            self._partial_suppressed += 1
+            self.state.set_meta(stt_partial_suppressed=self._partial_suppressed)
+            return
         try:
             source.partial_queue.put_nowait((now, audio))
         except queue.Full:
-            # A slow inference is allowed to skip an interim frame; the next
-            # frame always contains newer audio and keeps the UI current.
-            pass
+            # Keep the newest window rather than allowing a stale draft to
+            # occupy the single interim slot while Whisper is busy.
+            try:
+                source.partial_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                source.partial_queue.put_nowait((now, audio))
+                self._partial_coalesced += 1
+                self.state.set_meta(stt_partial_coalesced=self._partial_coalesced)
+            except queue.Full:
+                self._partial_dropped += 1
+                self.state.set_meta(stt_partial_dropped=self._partial_dropped)
 
     def _partial_worker(self, source: "_Source") -> None:
         while not self._stop.is_set():
@@ -1144,7 +1163,9 @@ class LiveTranscriber:
             self.state.set_meta(
                 stt_lag_seconds=round(max(0.0, time.time() - captured_at), 1),
                 stt_final_inferences=self._final_inference_count,
-                stt_partial_dropped=self._partial_dropped)
+                stt_partial_dropped=self._partial_dropped,
+                stt_partial_suppressed=self._partial_suppressed,
+                stt_partial_coalesced=self._partial_coalesced)
 
     def _retune_chunker(self, source: "_Source", inference_seconds: float) -> None:
         """Adapt local windows while protecting the live queue from backlog."""

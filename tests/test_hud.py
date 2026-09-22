@@ -253,9 +253,26 @@ class SttPipelineTests(unittest.TestCase):
         self.assertEqual(snap["partials"][0]["text"], "plan")
         self.assertNotIn("plan", tr.state.transcript_text())
 
+    def test_partial_admission_yields_to_queued_final_audio(self) -> None:
+        cfg = HudConfig(stt_backend="local", stt_partial_window_seconds=0.2,
+                        stt_partial_interval_seconds=0.0)
+        tr = self._transcriber(cfg)
+        src = _Source("You", [])
+        src.queue.put((0.0, b"final", 0.0))
+        tr._sources = [src]
+        tr._feed_partial(src, b"\x00\x00" * 3200)
+        self.assertTrue(tr._partial_suppressed)
+        self.assertTrue(src.partial_queue.empty())
+
     def test_partial_recognition_is_local_only(self) -> None:
         self.assertFalse(self._transcriber(HudConfig(stt_backend="groq"))._partial_enabled())
         self.assertTrue(self._transcriber(HudConfig(stt_backend="local"))._partial_enabled())
+
+    def test_adaptive_local_minimum_defaults_to_two_point_five_seconds(self) -> None:
+        cfg = HudConfig(stt_backend="local")
+        tr = self._transcriber(cfg)
+        self.assertEqual(cfg.stt_chunk_min_seconds, 2.5)
+        self.assertEqual(tr._chunk_bounds(), (2.5, 7.0))
 
     def test_final_chunk_deduplicates_stable_partial_words(self) -> None:
         cfg = HudConfig(stt_backend="local", stt_hallucination_filter=False)
