@@ -111,6 +111,20 @@ deterministic memory extraction until a final Turbo event closes the boundary.
 This prevents a fast interim model's temporary wording from becoming meeting
 evidence.
 
+### Phase B.5 — reference-aligned accuracy evaluation (in progress)
+
+The first same-fixture throughput baseline is recorded in
+`RESEARCH-TRANSCRIPTION-LATENCY.md`: Turbo is the authoritative quality lane
+at roughly 8.8x real time on this M4 Air, while base.en is roughly 98x real
+time and suitable for frequent provisional windows. The smaller model still
+produces visibly weaker wording, so throughput alone cannot justify a smaller
+final model or a shorter interim window.
+
+The next deliverable is a dependency-free fixture evaluator with checked
+reference text. It will report WER plus substitutions, deletions, insertions,
+first-stable-word latency, and final capture-to-text latency. Interim window
+and local-agreement changes remain gated on that evidence.
+
 ### Phase C — question finalization and answer evidence (implemented baseline)
 
 Interim question marks now wait for an explicit transcript boundary before an

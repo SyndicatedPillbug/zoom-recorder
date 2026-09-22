@@ -76,6 +76,24 @@ Sources:
 - https://console.groq.com/docs/speech-to-text
 - https://console.groq.com/docs/rate-limits
 
+### 6. First same-fixture local model baseline
+
+On 2026-09-22, the 45-second AMI-derived fixture was sent through persistent
+Metal-backed whisper.cpp servers on the M4 Air. The authoritative
+`large-v3-turbo-q5_0` model completed the full-file request in about 5.1
+seconds, or 8.8x real time. The `base.en` interim model completed it in about
+0.46 seconds, or 98x real time. The smaller model is therefore fast enough to
+support frequent rolling windows even while Turbo handles final recognition.
+
+The outputs also confirm the intended division of labor: Turbo produced the
+cleaner wording, while base.en produced a few extra and incorrect phrases in
+the same audio. These are throughput measurements, not WER measurements; the
+fixture does not yet have a checked, time-aligned reference transcript. The
+next evaluation must compare both models against a reference before changing
+the interim window or local-agreement threshold. A CPU-only Turbo run took
+about 54 seconds for the same 45-second file, confirming that Metal access is
+an operational prerequisite for the expected local baseline.
+
 ## Recommended next experiments
 
 1. Measure the new warmup on the same 15-second and 45-second fixtures,
@@ -90,6 +108,9 @@ Sources:
 4. Only after those measurements, investigate Core ML or ANEForge encoder
    acceleration. Those paths accelerate the encoder only; they are promising,
    but they do not guarantee an equivalent end-to-end latency improvement.
+5. Add a small, dependency-free reference-aligned evaluator that reports word
+   error rate, substitutions, deletions, insertions, first stable word latency,
+   and final capture-to-text latency for each fixture/model/window policy.
 
 ## Explicit non-recommendations
 
