@@ -750,7 +750,7 @@ class LiveTranscriber:
     def _partial_enabled(self) -> bool:
         return ((self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS
                 and bool(getattr(self.cfg, "stt_partial_enabled", True))
-                and float(getattr(self.cfg, "stt_partial_window_seconds", 2.0)) > 0)
+                and float(getattr(self.cfg, "stt_partial_window_seconds", 4.0)) > 0)
 
     def _stop_sources(self, sources: List["_Source"]) -> None:
         for source in sources:
@@ -998,7 +998,7 @@ class LiveTranscriber:
         """Queue the newest short rolling window without blocking capture."""
         if not self._partial_enabled():
             return
-        window_bytes = int(float(getattr(self.cfg, "stt_partial_window_seconds", 2.0))
+        window_bytes = int(float(getattr(self.cfg, "stt_partial_window_seconds", 4.0))
                           * SAMPLE_RATE * SAMPLE_WIDTH)
         if window_bytes <= 0:
             return

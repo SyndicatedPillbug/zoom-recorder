@@ -29,6 +29,7 @@ from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
                          estimate_tokens, grounded_in, parse_answer_claims,
                          verify_answer_claims, is_ambiguous_question, parse_bullets,
                          parse_point_objects)
+from hud.audio_benchmark import _load_reference, _percentile, _window_reference  # noqa: E402
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
@@ -864,6 +865,15 @@ class IdentityTests(unittest.TestCase):
 
 
 class MemoryAndReplayTests(unittest.TestCase):
+    def test_audio_benchmark_percentile_is_deterministic(self) -> None:
+        self.assertEqual(_percentile([0.2, 0.1, 0.4, 0.3], 50), 0.2)
+        self.assertIsNone(_percentile([], 95))
+        text, timed = _load_reference(Path(__file__).resolve().parent.parent /
+                                      "fixtures/ami-es2002a-50-80.reference.json")
+        self.assertIn("kick-off", text)
+        assert timed is not None
+        self.assertEqual(_window_reference(timed, 0.0, 2.0), "Okay")
+
     def test_word_error_stats_normalizes_and_counts_edits(self) -> None:
         self.assertEqual(normalize_words("Hello, WORLD! It's fine."),
                          ["hello", "world", "it's", "fine"])

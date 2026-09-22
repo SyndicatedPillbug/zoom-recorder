@@ -128,8 +128,19 @@ with Turbo and 21.3% with base.en. Measuring first-stable-word latency and
 final capture-to-text latency remains. The evaluator now handles both rolling
 hypotheses and persisted stable interim events; the existing replay's first
 stable publication measured 1.32 seconds, but true speech-start-to-word timing
-still needs an audio-aligned replay. Interim window and local-agreement changes
-remain gated on that evidence.
+now has an audio-aligned rolling harness. The first stable commit is measured
+relative to its completed window; mapping it to the first matching reference
+word remains a follow-up. Interim window and local-agreement changes remain
+gated on broader fixture evidence.
+
+The first paced AMI rolling benchmark rejected the two-second base.en window:
+its first stable word was wrong (`Nice` instead of `Okay`) and its stable-only
+output retained only 10 words. A four-second window produced the correct first
+stable word, retained 44 words, and still published the first stable commit
+about 0.13 seconds after its window completed. The default interim window is
+therefore now four seconds; explicit saved settings are preserved. Per-window
+WER remains a diagnostic because overlapping hypotheses and speech boundaries
+still need a broader fixture set.
 
 ### Phase C — question finalization and answer evidence (implemented baseline)
 

@@ -123,6 +123,21 @@ current event's `captured_at` marks rolling-window submission, so a future
 word-aligned replay must add the acoustic start time before that stronger claim
 is used for tuning.
 
+### 7. Paced interim-window decision
+
+The new audio benchmark was run against the aligned 50–80 second AMI speech
+slice using a base.en server and 0.8-second updates. A two-second window had a
+0.13-second inference p50 but committed only 10 words and produced the wrong
+first stable word (`Nice`). A four-second window had a 0.16-second inference
+p50, produced the correct first stable word (`Okay`), committed 44 words, and
+published that first stable commit about 0.13 seconds after the window ended.
+
+The default interim window is therefore four seconds. This changes only the
+default; an explicitly saved `partial_window_seconds` value remains respected.
+The final Turbo lane is unchanged and remains the authoritative transcript.
+Per-window WER is retained as a diagnostic, but a broader set of timestamped
+fixtures is still required before reducing the window again.
+
 ## Explicit non-recommendations
 
 - Do not lower the final Turbo floor below 2.5 seconds without an accuracy

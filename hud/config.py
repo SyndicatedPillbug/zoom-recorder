@@ -183,7 +183,7 @@ class HudConfig:
     # survives the stability gate and becomes an authoritative transcript event.
     stt_partial_enabled: bool = True
     stt_partial_model: Optional[str] = DEFAULT_PARTIAL_TRANSCRIPTION_MODEL
-    stt_partial_window_seconds: float = 2.0
+    stt_partial_window_seconds: float = 4.0
     stt_partial_interval_seconds: float = 0.8
 
     # Answers
@@ -338,7 +338,7 @@ def _defaults() -> Dict[str, Any]:
             "context_prompt": True,
             "partial_enabled": True,
             "partial_model": DEFAULT_PARTIAL_TRANSCRIPTION_MODEL,
-            "partial_window_seconds": 2.0,
+            "partial_window_seconds": 4.0,
             "partial_interval_seconds": 0.8,
         },
         "answers": {
@@ -460,7 +460,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_partial_enabled=bool(stt.get("partial_enabled", True)),
         stt_partial_model=(str(stt.get("partial_model") or
                                DEFAULT_PARTIAL_TRANSCRIPTION_MODEL)),
-        stt_partial_window_seconds=_as_float(stt.get("partial_window_seconds"), 2.0),
+        stt_partial_window_seconds=_as_float(stt.get("partial_window_seconds"), 4.0),
         stt_partial_interval_seconds=_as_float(stt.get("partial_interval_seconds"), 0.8),
         answers_enabled=bool(answers.get("enabled", True)),
         answers_backend=str(answers.get("backend") or "groq"),

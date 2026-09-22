@@ -378,7 +378,7 @@ The local server is warmed with a short silence request before capture, so
 one-time model/runtime initialization does not land on the first speech window.
 
 Local mode also enables near-real-time interim words by default. It re-decodes
-an overlapping two-second window about every 0.8 seconds. The HUD shows the
+an overlapping four-second window about every 0.8 seconds. The HUD shows the
 newest unstable words as a muted live draft; words are promoted to the normal
 transcript only after they remain stable across windows. Draft words are never
 written to the optional transcript mirror, indexed in the live KB, or used as
@@ -502,7 +502,7 @@ to drift minutes behind the call.
                "chunk_min_seconds": 2.5, "chunk_max_seconds": 7,
                "chunk_overlap_seconds": 0.5, "partial_enabled": true,
                "partial_model": "~/.cache/whisper-cpp/ggml-base.en.bin",
-               "partial_window_seconds": 2, "partial_interval_seconds": 0.8,
+               "partial_window_seconds": 4, "partial_interval_seconds": 0.8,
                "glossary": ["Acme", "Q3"],
                "vad_backend": "auto", "vad_margin_db": 6, "hallucination_filter": true},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
@@ -548,6 +548,25 @@ be replayed without audio or network access:
 ```bash
 python3 -m hud.replay ~/ZoomRecordings/2026-09-22/14-32-08_enrollment-planning_a1b2c3d4/derived/live_events.jsonl
 ```
+
+For a paced local rolling-window benchmark, use the offline audio harness. It
+uses the same local Whisper backend and stable-prefix decoder as live mode, but
+does not touch capture, providers, or meeting state:
+
+```bash
+python3 -m hud.audio_benchmark /path/to/fixture.wav \
+  --model ~/.cache/whisper-cpp/ggml-base.en.bin \
+  --reference fixtures/ami-es2002a-50-80.reference.json
+```
+
+The checked AMI reference slice is derived from the corpus's CC BY 4.0 manual
+word annotations; it is a benchmark aid, not a runtime dependency. The output
+reports stable-only WER, the latest rolling hypothesis text, inference
+percentiles, per-window WER when timestamped references are supplied, and the
+first stable word's window-to-publication timing.
+Stable-only WER is expected to include deletions while the rolling window is
+still withholding its newest unstable suffix; true per-window WER requires a
+timestamped reference manifest.
 
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your
