@@ -174,6 +174,16 @@ class SttPipelineTests(unittest.TestCase):
         self.assertEqual(result.text, "recovered text")
         self.assertTrue(any("GPU failed" in item for item in logs))
 
+    def test_local_server_warmup_is_best_effort(self) -> None:
+        logs = []
+        stt = LocalWhisperSTT.__new__(LocalWhisperSTT)
+        stt.log = logs.append
+        stt._server_transcribe = mock.Mock(
+            side_effect=RuntimeError("test warmup failure"))
+        stt._warm_server()
+        stt._server_transcribe.assert_called_once()
+        self.assertTrue(any("warmup skipped" in item for item in logs))
+
     def test_enqueue_drops_oldest_when_full(self) -> None:
         tr = self._transcriber(HudConfig(stt_queue_chunks=1))
         src = _Source("You", [])

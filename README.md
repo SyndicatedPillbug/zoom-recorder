@@ -374,6 +374,8 @@ events instead of waiting for a fixed polling tick, so question detection
 starts immediately after recognition. Local mode also removes STT network
 latency, audio egress, and Groq audio-second usage, although it does not make
 the Whisper computation itself faster than Groq's hosted hardware.
+The local server is warmed with a short silence request before capture, so
+one-time model/runtime initialization does not land on the first speech window.
 
 Local mode also enables near-real-time interim words by default. It re-decodes
 an overlapping two-second window about every 0.8 seconds. The HUD shows the

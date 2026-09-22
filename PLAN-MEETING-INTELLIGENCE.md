@@ -60,6 +60,30 @@ unbounded backlog, but the p95 tail remains above the aspirational gate, so
 this phase stays in progress. Overlap and phrase-flush tuning remain the next
 likely levers before changing the answer scheduler.
 
+Two follow-up experiments were rejected: a 2.0-second floor lost the opening
+word on the dense sample, and allowing shrinkage with one queued chunk raised
+the same sample's p95 latency to about 4.85 seconds. The current 2.5-second
+floor, 0.5-second overlap, and queue-empty shrink rule remain the best measured
+accuracy/latency balance.
+
+### Phase B.2 — runtime and streaming research (in progress)
+
+The local server now receives a best-effort short silence request before live
+capture, moving one-time model/runtime initialization out of the first speech
+window. External research confirms that the current whisper.cpp Metal path and
+Flash Attention are already appropriate for Apple Silicon; the next meaningful
+local improvement is a separate faster interim model or a true local-agreement
+streaming lane, not another chunk-size tweak. See
+`RESEARCH-TRANSCRIPTION-LATENCY.md` for sources, rejected options, and the
+measurement plan.
+
+The warmup reduced dense-fixture final latency to about 3.11 seconds p50 and
+3.70 seconds p95 without changing the recognized words. On the longer replay,
+the first window improved from roughly 4.3 seconds to 3.7 seconds, while the
+steady-state p95 remained variable at about 5.25 seconds. Warmup is therefore
+accepted as a startup improvement, not as the solution to the steady-state
+tail.
+
 ### Phase C — question finalization and answer evidence (implemented baseline)
 
 Interim question marks now wait for an explicit transcript boundary before an

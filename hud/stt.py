@@ -37,6 +37,7 @@ from .vad import build_vad
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2  # int16
 CHANNELS = 1
+LOCAL_SERVER_WARMUP_SECONDS = 0.25
 
 # Whisper is known to emit these on silence/noise. Bare interjections are only
 # treated as hallucination when the chunk was marginal (see looks_hallucinated).
@@ -477,6 +478,7 @@ class LocalWhisperSTT:
             self._server = None
             return
         self._port = port
+        ready = False
         for _ in range(40):
             if self._server.poll() is not None:
                 self.log("local STT: whisper-server exited early; falling back to whisper-cli")
@@ -487,10 +489,24 @@ class LocalWhisperSTT:
                 import urllib.request
                 urllib.request.urlopen(
                     "http://127.0.0.1:{}/".format(port), timeout=0.4)
+                ready = True
                 break
             except Exception:  # noqa: BLE001
                 time.sleep(0.15)
+        if ready:
+            self._warm_server()
         self.log("local STT: whisper-server on port {}".format(port))
+
+    def _warm_server(self) -> None:
+        """Pay model/runtime startup cost before the first live speech window."""
+        silence = b"\x00\x00" * int(
+            LOCAL_SERVER_WARMUP_SECONDS * SAMPLE_RATE)
+        try:
+            self._server_transcribe(pcm_to_wav(silence))
+            self.log("local STT: whisper-server warmed before live audio")
+        except Exception as exc:  # noqa: BLE001
+            # Warmup is an optimization, never a reason to disable local STT.
+            self.log("local STT: whisper-server warmup skipped ({})".format(exc))
 
     def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> STTResult:
         wav = pcm_to_wav(pcm)
