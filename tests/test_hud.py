@@ -360,6 +360,46 @@ class KBTests(unittest.TestCase):
         self.assertTrue(is_duplicate_point("price is 10 per seat", existing))
         self.assertFalse(is_duplicate_point("Latency budget is 200ms", existing))
 
+    def test_hashing_embedder_similarity(self) -> None:
+        from hud.kb import HashingEmbedder
+        emb = HashingEmbedder(dim=128)
+        vecs = emb.encode(["budget meeting quarterly", "budget meeting review",
+                          "weather forecast rain"])
+        from hud.kb import _dot, _norm
+
+        def cos(a, b):
+            na, nb = _norm(a), _norm(b)
+            return _dot(a, b) / (na * nb) if na and nb else 0.0
+
+        self.assertGreater(cos(vecs[0], vecs[1]), cos(vecs[0], vecs[2]))
+
+    def test_add_chunks_and_query(self) -> None:
+        index = KBIndex([], self.KeywordEmbedder(),
+                        log=lambda _m: None, min_score=0.0)
+        index.init_empty()
+        self.assertEqual(index.query("anything", top_k=5), [])
+        added = index.add_chunks([
+            {"source": "live_transcript", "heading": "You",
+             "text": "alpha alpha alpha rollout discussion"},
+            {"source": "live_transcript", "heading": "Others",
+             "text": "beta beta beta pricing model"},
+        ])
+        self.assertEqual(added, 2)
+        hits = index.query("alpha", top_k=1)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].heading, "You")
+        self.assertIn("alpha", hits[0].text.lower())
+
+    def test_add_chunks_max_eviction(self) -> None:
+        index = KBIndex([], self.KeywordEmbedder(),
+                        log=lambda _m: None, min_score=0.0, max_chunks=2)
+        index.init_empty()
+        for i in range(5):
+            index.add_chunks([{"source": "s", "heading": "h",
+                               "text": "alpha " * (i + 1)}])
+        self.assertEqual(len(index._chunks), 2)
+        self.assertEqual(len(index._vectors), 2)
+
 
 class BudgetTests(unittest.TestCase):
     def test_afford_and_pause(self) -> None:

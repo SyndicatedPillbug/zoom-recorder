@@ -23,6 +23,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .budget import BudgetGovernor
@@ -327,11 +328,13 @@ class _Chain:
 
 class AnswerEngine:
     def __init__(self, state: LiveState, log: Callable[[str], None],
-                 cfg: HudConfig, budget: Optional[BudgetGovernor] = None) -> None:
+                 cfg: HudConfig, budget: Optional[BudgetGovernor] = None,
+                 outdir: Optional[Any] = None) -> None:
         self.state = state
         self.log = log
         self.cfg = cfg
         self.budget = budget or BudgetGovernor()
+        self.outdir = Path(outdir) if outdir else None
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -353,6 +356,9 @@ class AnswerEngine:
         self._words_since_rolling = 0
 
         self._kb: Optional[KBIndex] = None
+        self._live_kb: Optional[KBIndex] = None
+        self._live_q: "queue.Queue" = queue.Queue()
+        self._live_kb_thread: Optional[threading.Thread] = None
         self._embedder: Any = None
         self._vec_cache: Dict[str, List[float]] = {}
         self._chain: Optional[_Chain] = None
@@ -366,8 +372,15 @@ class AnswerEngine:
     def stop(self) -> None:
         self._stop.set()
         self._queue.put((0, next(self._job_seq), None))
+        if self._live_kb_thread is not None:
+            try:
+                self._live_q.put_nowait(None)
+            except queue.Full:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=12.0)
+        if self._live_kb_thread is not None:
+            self._live_kb_thread.join(timeout=5.0)
         if self._chain is not None:
             for entry in self._chain.entries:
                 closer = getattr(entry.get("client"), "close", None)
@@ -428,13 +441,18 @@ class AnswerEngine:
     def _start_kb(self) -> None:
         """Build the embedder/KB on a side thread so answers aren't blocked.
 
-        The embedder is also used for semantic talking-point dedupe, so it is
-        built even when the KB itself is disabled.
+        The embedder is also used for semantic talking-point dedupe and the
+        live transcript index, so it is built even when the static KB is
+        disabled. The live transcript index (self._live_kb) grows as turns
+        arrive and makes earlier conversation retrievable beyond the 5-minute
+        context window.
         """
         want_kb = self.cfg.kb_enabled and bool(self.cfg.kb_dirs)
         want_dedupe = self.cfg.point_dedupe_score > 0
+        # Always build the embedder so the live transcript index works even
+        # when no static KB dirs are configured.
         if not (want_kb or want_dedupe):
-            return
+            want_dedupe = True
 
         def _work() -> None:
             try:
@@ -444,22 +462,69 @@ class AnswerEngine:
                         self.log("KB: no embedding backend available; continuing without KB")
                     return
                 self._embedder = embedder
+
+                # Live transcript index: starts empty, grows with the call.
+                # A lower min_score so marginally relevant older turns are
+                # still retrievable. Capped to bound memory on long calls.
+                self._live_kb = KBIndex([], embedder, log=self.log, min_score=0.05,
+                                        max_chunks=2000)
+                self._live_kb.init_empty()
+                self._live_kb_thread = threading.Thread(
+                    target=self._live_kb_loop, name="hud-live-kb", daemon=True)
+                self._live_kb_thread.start()
+                self.log("live transcript index ready ({})".format(
+                    getattr(embedder, "label", "?")))
+
                 if want_kb:
-                    kb = KBIndex(self.cfg.kb_dirs, embedder,
+                    # Auto-include the recordings base directory so past call
+                    # transcripts and summaries become searchable reference
+                    # material alongside any user-configured dirs.
+                    dirs = list(self.cfg.kb_dirs)
+                    if self.outdir is not None and self.outdir.parent:
+                        parent = self.outdir.parent
+                        if parent.is_dir() and str(parent) not in dirs:
+                            dirs.append(str(parent))
+                            self.log("KB: auto-included recordings dir {}".format(parent))
+                    kb = KBIndex(dirs, embedder,
                                  cache_dir=self.cfg.kb_cache_dir, log=self.log,
                                  min_score=self.cfg.kb_min_score)
                     if kb.build(force=self.cfg.kb_reindex):
                         self._kb = kb
                     else:
-                        self.log("KB: disabled (build failed)")
+                        self.log("KB: disabled (build failed or no files)")
             except Exception as exc:  # noqa: BLE001
                 self.log("KB setup failed: {}".format(exc))
 
         threading.Thread(target=_work, name="hud-kb", daemon=True).start()
 
+    def _live_kb_loop(self) -> None:
+        """Background thread: batch-embed transcript turns into the live KB.
+
+        Keeping this off the main answer loop means a slow remote embedder
+        never blocks question detection or the 1 s tick.
+        """
+        batch: List[Dict[str, str]] = []
+        while not self._stop.is_set():
+            try:
+                item = self._live_q.get(timeout=1.0)
+            except queue.Empty:
+                if batch and self._live_kb is not None:
+                    self._live_kb.add_chunks(batch)
+                    batch = []
+                continue
+            if item is None:
+                break
+            batch.append(item)
+            if len(batch) >= 8:
+                if self._live_kb is not None:
+                    self._live_kb.add_chunks(batch)
+                batch = []
+        if batch and self._live_kb is not None:
+            self._live_kb.add_chunks(batch)
+
     def _build_embedder(self):
-        """Pick an embedding backend: local model, then Ollama, then OpenAI."""
-        from .kb import LocalEmbedder, RemoteEmbedder
+        """Pick an embedding backend: local model, Ollama, OpenAI, then hashing."""
+        from .kb import HashingEmbedder, LocalEmbedder, RemoteEmbedder
 
         backend = (self.cfg.kb_embed_backend or "auto").lower()
         model = self.cfg.kb_embed_model
@@ -485,6 +550,11 @@ class AnswerEngine:
                 return RemoteEmbedder(
                     LLMClient(provider.base_url, api_key),
                     model or "text-embedding-3-small", name="openai")
+        # Final fallback: zero-dependency hashing embedder. Always works,
+        # so the live transcript index and semantic dedup never go dark.
+        if backend in ("auto", "hashing"):
+            self.log("KB: using hashing embedder (no neural backend available)")
+            return HashingEmbedder()
         return None
 
     # -- main loop ---------------------------------------------------------
@@ -625,10 +695,23 @@ class AnswerEngine:
                 if not text:
                     continue
                 self._seq += 1
+                speaker = event.get("speaker") or ""
                 self._buffer.append(Turn(
                     seq=self._seq, ts=float(event.get("ts", time.time())),
-                    speaker=event.get("speaker") or "", text=text))
+                    speaker=speaker, text=text))
                 self._words_since_rolling += len(text.split())
+                # Feed each turn into the live transcript index so older
+                # conversation is retrievable by meaning, not just the
+                # rolling 5-minute window.
+                if self._live_kb is not None:
+                    try:
+                        self._live_q.put_nowait({
+                            "source": "live_transcript",
+                            "heading": speaker or "speaker",
+                            "text": text,
+                        })
+                    except queue.Full:
+                        pass
 
     def _trim_buffer(self) -> None:
         cutoff = time.time() - self.cfg.context_minutes * 60.0
@@ -643,6 +726,23 @@ class AnswerEngine:
 
     def _flush_buffer(self) -> None:
         self._buffer = []
+
+    def _query_all(self, query_text: str, top_k: int) -> List:
+        """Query the static KB and the live transcript index, merge by score.
+
+        Both indexes share the same embedder, so cosine scores are directly
+        comparable. The live index lets answers reference conversation from
+        beyond the 5-minute context window; the static KB contributes
+        user-provided reference docs and past recording transcripts.
+        """
+        from .kb import KBSnippet
+        results: List[KBSnippet] = []
+        if self._kb is not None:
+            results.extend(self._kb.query(query_text, top_k))
+        if self._live_kb is not None:
+            results.extend(self._live_kb.query(query_text, top_k))
+        results.sort(key=lambda s: s.score, reverse=True)
+        return results[:top_k]
 
     # -- generation --------------------------------------------------------
     def _qa_recent(self) -> List[Dict[str, Any]]:
@@ -719,12 +819,11 @@ class AnswerEngine:
         effective = rewritten or question
 
         snippets = []
-        if self._kb is not None:
-            if effective:
-                query_text = "{} {}".format(effective, context or window[-1200:]).strip()
-            else:
-                query_text = window[-1500:]
-            snippets = self._kb.query(query_text, self.cfg.kb_top_k)
+        if effective:
+            query_text = "{} {}".format(effective, context or window[-1200:]).strip()
+        else:
+            query_text = window[-1500:]
+        snippets = self._query_all(query_text, self.cfg.kb_top_k)
 
         system = self._system_prompt("question")
         prompt = self._build_prompt("question", effective, context, window, snippets,
@@ -760,8 +859,8 @@ class AnswerEngine:
         if not window:
             return
         snippets = []
-        if self._kb is not None:
-            snippets = self._kb.query(window[-1500:], self.cfg.kb_top_k)
+        if self._live_kb is not None or self._kb is not None:
+            snippets = self._query_all(window[-1500:], self.cfg.kb_top_k)
         existing = [p["text"] for p in self.state.talking_points()]
         system = self._system_prompt("rolling")
         prompt = self._build_prompt("rolling", None, "", window, snippets, existing=existing)

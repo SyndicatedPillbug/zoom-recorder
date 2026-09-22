@@ -88,7 +88,8 @@ class LiveSession:
             self.state.set_status("recording", stt_error=str(exc))
 
         try:
-            self.answers = AnswerEngine(self.state, self.log, self.cfg, self.budget)
+            self.answers = AnswerEngine(self.state, self.log, self.cfg, self.budget,
+                                        outdir=self.outdir)
             self.answers.start()
         except Exception as exc:  # noqa: BLE001
             self.log("live HUD: answer engine failed to start ({})".format(exc))
