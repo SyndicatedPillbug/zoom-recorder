@@ -55,6 +55,9 @@ class LiveState:
         self._talking_points: List[Dict[str, Any]] = []
         self._memory: List[Dict[str, Any]] = []
         self._partials: Dict[str, Dict[str, Any]] = {}
+        # Stable IDs keep the capture/STT path independent from the mutable
+        # display names that a user may assign in the HUD.
+        self._speaker_mappings: Dict[str, Dict[str, Any]] = {}
         self._next_id = 1
         self.status: str = "starting"
         self.budget: Dict[str, Any] = {}
@@ -91,6 +94,45 @@ class LiveState:
         with self._lock:
             self.meta.update(fields)
             self._append_locked({"type": "meta", "meta": dict(fields)})
+
+    def set_speaker_label(self, speaker_id: str, label: str,
+                          source: str = "user") -> bool:
+        """Set or clear a local display label without touching raw events.
+
+        The mapping is deliberately tiny and local: it is presentation state,
+        not a claim that the audio was diarized. Clearing the label removes the
+        override and makes existing events fall back to their captured label.
+        """
+        key = str(speaker_id or "").strip()
+        value = " ".join(str(label or "").split())[:80]
+        if not key or len(key) > 80:
+            return False
+        with self._lock:
+            previous = self._speaker_mappings.get(key, {})
+            revision = int(previous.get("revision", 0)) + 1
+            if value:
+                self._speaker_mappings[key] = {
+                    "speaker_id": key, "label": value, "source": source,
+                    "revision": revision,
+                }
+            else:
+                self._speaker_mappings.pop(key, None)
+            self._append_locked({
+                "type": "speaker_mapping", "speaker_id": key,
+                "label": value, "source": source, "revision": revision,
+            })
+            return True
+
+    def speaker_label(self, speaker_id: Optional[str],
+                      fallback: Optional[str] = None) -> Optional[str]:
+        key = str(speaker_id or "").strip()
+        with self._lock:
+            mapping = self._speaker_mappings.get(key)
+            return (mapping.get("label") if mapping else None) or fallback
+
+    def speaker_mappings(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {key: dict(value) for key, value in self._speaker_mappings.items()}
 
     def add_talking_points(self, points: Sequence[str], sources: Optional[Sequence[str]] = None,
                            model: str = "") -> List[Dict[str, Any]]:
@@ -196,7 +238,9 @@ class LiveState:
 
     def set_transcript_partial(self, source_key: str, text: str,
                                speaker: Optional[str] = None,
-                               revision: int = 0, **fields: Any) -> Dict[str, Any]:
+                               revision: int = 0,
+                               speaker_id: Optional[str] = None,
+                               **fields: Any) -> Dict[str, Any]:
         """Publish a replaceable, provisional transcript draft.
 
         Partial speech is intentionally kept out of the authoritative
@@ -207,6 +251,7 @@ class LiveState:
         with self._lock:
             event = {"type": "transcript_partial", "source_key": key,
                      "text": str(text or ""), "speaker": speaker,
+                     "speaker_id": speaker_id,
                      "revision": int(revision), "provisional": True}
             event.update(fields)
             self._partials[key] = dict(event)
@@ -247,6 +292,9 @@ class LiveState:
                 "latest_id": self._next_id - 1,
                 "transcript": transcript,
                 "partials": [dict(p) for p in self._partials.values()],
+                "speaker_mappings": {
+                    key: dict(value) for key, value in self._speaker_mappings.items()
+                },
                 "answers": answers,
                 "talking_points": [dict(p) for p in self._talking_points],
                 "memory": [dict(item) for item in self._memory],
@@ -256,6 +304,7 @@ class LiveState:
     def transcript_text(self, since_ts: Optional[float] = None) -> str:
         with self._lock:
             events = [e for e in self._events if e.get("type") == "transcript"]
+            mappings = {key: dict(value) for key, value in self._speaker_mappings.items()}
         if since_ts is not None:
             events = [e for e in events if e.get("ts", 0) >= since_ts]
         lines: List[str] = []
@@ -264,7 +313,8 @@ class LiveState:
             if not text:
                 continue
             stamp = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
-            speaker = e.get("speaker")
+            speaker_id = str(e.get("speaker_id") or "")
+            speaker = (mappings.get(speaker_id, {}).get("label") or e.get("speaker"))
             prefix = "{}: ".format(speaker) if speaker else ""
             lines.append("[{}] {}{}".format(stamp, prefix, text))
         return "\n".join(lines)
@@ -311,6 +361,7 @@ class LiveState:
         with self._lock:
             events = [e for e in self._events
                       if e.get("type") in ("transcript", "answer", "talking_point", "memory")]
+            mappings = {key: dict(value) for key, value in self._speaker_mappings.items()}
         if not events:
             return ""
         lines: List[str] = []
@@ -322,7 +373,8 @@ class LiveState:
             if e["type"] == "transcript":
                 text = str(e.get("text", "")).strip()
                 if text:
-                    speaker = e.get("speaker")
+                    speaker_id = str(e.get("speaker_id") or "")
+                    speaker = (mappings.get(speaker_id, {}).get("label") or e.get("speaker"))
                     prefix = "{}: ".format(speaker) if speaker else ""
                     lines.append("[{}] {}{}".format(stamp, prefix, text))
                 continue

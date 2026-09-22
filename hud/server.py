@@ -34,6 +34,7 @@ class _Handler(BaseHTTPRequestHandler):
     token: str = ""
     on_ask: Optional[Callable[[str, bool], bool]] = None
     on_pause: Optional[Callable[[bool], None]] = None
+    on_speaker_label: Optional[Callable[[str, str], bool]] = None
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         if self.logger:
@@ -145,6 +146,14 @@ class _Handler(BaseHTTPRequestHandler):
             if self.on_pause:
                 self.on_pause(paused)
             self._send_json({"ok": True, "paused": paused})
+        elif parsed.path == "/speaker-label":
+            speaker_id = str(body.get("speaker_id") or "").strip()
+            label = str(body.get("label") or "")
+            if not speaker_id or len(speaker_id) > 80 or len(label) > 200:
+                self._send_json({"ok": False, "error": "invalid speaker label"}, status=400)
+                return
+            ok = bool(self.on_speaker_label and self.on_speaker_label(speaker_id, label))
+            self._send_json({"ok": ok, "label": " ".join(label.split())[:80]})
         elif parsed.path == "/stop":
             if self.on_stop:
                 self.on_stop()
@@ -206,6 +215,7 @@ class HudServer:
                  log: Optional[Callable[[str], None]] = None, token: str = "",
                  on_ask: Optional[Callable[[str, bool], bool]] = None,
                  on_pause: Optional[Callable[[bool], None]] = None,
+                 on_speaker_label: Optional[Callable[[str, str], bool]] = None,
                  on_stop: Optional[Callable[[], None]] = None) -> None:
         self.state = state
         self.host = host
@@ -214,6 +224,7 @@ class HudServer:
         self.token = token
         self.on_ask = on_ask
         self.on_pause = on_pause
+        self.on_speaker_label = on_speaker_label
         self.on_stop = on_stop
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -227,6 +238,8 @@ class HudServer:
             "token": self.token,
             "on_ask": staticmethod(self.on_ask) if self.on_ask else None,
             "on_pause": staticmethod(self.on_pause) if self.on_pause else None,
+            "on_speaker_label": (staticmethod(self.on_speaker_label)
+                                  if self.on_speaker_label else None),
             "on_stop": staticmethod(self.on_stop) if self.on_stop else None,
         })
         self._httpd, self.host = bind_local_server(handler, self.host, self.port)

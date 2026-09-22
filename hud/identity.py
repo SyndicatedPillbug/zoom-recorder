@@ -90,7 +90,8 @@ def _participants(transcript: str) -> List[str]:
 
 
 def build_identity(started_at: datetime, ended_at: Optional[datetime],
-                   original_folder: str, transcript: str, cfg: Any) -> Dict[str, Any]:
+                   original_folder: str, transcript: str, cfg: Any,
+                   speaker_mappings: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     fallback = "Meeting {}".format(started_at.strftime("%Y-%m-%d %H:%M"))
     title, evidence = derive_title(transcript, fallback=fallback)
     return {
@@ -105,6 +106,9 @@ def build_identity(started_at: datetime, ended_at: Optional[datetime],
         "title_evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest()
         if evidence else None,
         "participants": _participants(transcript),
+        "speaker_mappings": {
+            str(key): dict(value) for key, value in (speaker_mappings or {}).items()
+        },
         "transcript_words": len(_words(transcript)),
         "recording_mode": (
             "microphone + other party" if getattr(cfg, "record_mic", True)

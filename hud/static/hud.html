@@ -79,6 +79,9 @@
   .line.partial { color: var(--muted); font-style: italic; border-left: 2px solid var(--accent); padding-left: 8px; }
   .line .t { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; font-size: 12px; }
   .line .spk { color: var(--accent); font-weight: 600; margin-right: 6px; }
+  .line .spk.editable-speaker { cursor: text; border-radius: 4px; padding: 1px 3px; margin-left: -3px; }
+  .line .spk.editable-speaker:hover { background: var(--panel-2); outline: 1px solid var(--border); }
+  .speaker-edit { width: 120px; background: var(--panel-2); color: var(--text); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 4px; font: inherit; font-weight: 600; }
   .card {
     background: var(--panel-2);
     border: 1px solid var(--border);
@@ -207,6 +210,7 @@
   const PINS_KEY = 'hud.pins';
   let transcriptCount = 0, answerCount = 0, lastId = 0, paused = false;
   const partialNodes = new Map();
+  const speakerLabels = Object.create(null);
   let pointItems = [];
   let pins = new Set();
   try { pins = new Set(JSON.parse(localStorage.getItem(PINS_KEY) || '[]')); } catch (e) {}
@@ -236,6 +240,19 @@
     });
   }
 
+  function speakerLabel(ev) {
+    const id = String(ev.speaker_id || '');
+    return (id && speakerLabels[id]) || ev.speaker || '';
+  }
+
+  function speakerMarkup(ev) {
+    const label = speakerLabel(ev);
+    if (!label) return '';
+    const id = String(ev.speaker_id || '');
+    const attr = id ? ' class="spk editable-speaker" data-speaker-id="' + esc(id) + '" data-speaker-default="' + esc(ev.speaker || '') + '" title="Click to rename"' : ' class="spk"';
+    return '<span' + attr + '>' + esc(label) + '</span>';
+  }
+
   function addTranscript(ev) {
     const drafts = [...partialNodes.values()].map(node => node._partialEvent).filter(Boolean);
     if (transcriptCount === 0) { transcriptEl.innerHTML = ''; partialNodes.clear(); }
@@ -243,7 +260,7 @@
     const stick = atBottom(transcriptEl);
     const p = document.createElement('p');
     p.className = 'line';
-    const speaker = ev.speaker ? '<span class="spk">' + esc(ev.speaker) + '</span>' : '';
+    const speaker = speakerMarkup(ev);
     p.innerHTML = '<span class="t">' + esc(clock(ev.ts)) + '</span>' + speaker + esc(ev.text || '');
     transcriptEl.appendChild(p);
     transcriptCount++;
@@ -252,7 +269,7 @@
   }
 
   function addPartial(ev) {
-    const key = String(ev.source_key || ev.speaker || 'mixed');
+    const key = String(ev.source_key || ev.speaker_id || ev.speaker || 'mixed');
     const text = String(ev.text || '').trim();
     let p = partialNodes.get(key);
     if (!text) {
@@ -266,7 +283,7 @@
       transcriptEl.appendChild(p);
     }
     p._partialEvent = ev;
-    const speaker = ev.speaker ? '<span class="spk">' + esc(ev.speaker) + '</span>' : '';
+    const speaker = speakerMarkup(ev);
     p.innerHTML = '<span class="t">live</span>' + speaker + esc(text);
     if (atBottom(transcriptEl)) transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
@@ -347,6 +364,56 @@
     pauseBtn.textContent = paused ? 'Resume answers' : 'Pause answers';
   }
 
+  function applySpeakerMapping(ev) {
+    const id = String(ev.speaker_id || '');
+    if (!id) return;
+    const label = String(ev.label || '').trim();
+    if (label) speakerLabels[id] = label;
+    else delete speakerLabels[id];
+    transcriptEl.querySelectorAll('.editable-speaker[data-speaker-id="' + CSS.escape(id) + '"]').forEach(node => {
+      node.textContent = label || node.getAttribute('data-speaker-default') || '';
+    });
+    // Re-render only the provisional lines, which are few and never touch the
+    // authoritative transcript scroll history.
+    partialNodes.forEach(node => {
+      if (node && node._partialEvent && String(node._partialEvent.speaker_id || '') === id) {
+        addPartial(node._partialEvent);
+      }
+    });
+  }
+
+  async function editSpeaker(node) {
+    const id = node.getAttribute('data-speaker-id');
+    if (!id || node.querySelector('input')) return;
+    const old = node.textContent || '';
+    const input = document.createElement('input');
+    input.className = 'speaker-edit';
+    input.maxLength = 80;
+    input.value = old;
+    let committed = false;
+    const finish = async (save) => {
+      if (committed) return;
+      committed = true;
+      if (!save) { node.textContent = old; return; }
+      const label = input.value.trim();
+      const result = await api('/speaker-label', 'POST', { speaker_id: id, label: label });
+      if (!result || !result.ok) node.textContent = old;
+    };
+    node.textContent = '';
+    node.appendChild(input);
+    input.focus(); input.select();
+    input.onkeydown = e => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    };
+    input.onblur = () => finish(true);
+  }
+
+  transcriptEl.addEventListener('click', e => {
+    const node = e.target.closest && e.target.closest('.editable-speaker');
+    if (node) editSpeaker(node);
+  });
+
   function applyStatus(ev) {
     const meta = ev.meta || {};
     const explicit = ev.status || meta.status;
@@ -401,7 +468,8 @@
       if (ev.id <= lastId) return;
       lastId = ev.id;
     }
-    if (ev.type === 'transcript') addTranscript(ev);
+    if (ev.type === 'speaker_mapping') applySpeakerMapping(ev);
+    else if (ev.type === 'transcript') addTranscript(ev);
     else if (ev.type === 'transcript_partial') addPartial(ev);
     else if (ev.type === 'talking_point') addPoint(ev);
     else if (ev.type === 'answer') addAnswer(ev);
@@ -419,6 +487,10 @@
 
   // Rebuild both answer panes from the server snapshot (e.g. after a reload).
   function hydrate(snap) {
+    Object.keys(snap.speaker_mappings || {}).forEach(id => {
+      const mapping = snap.speaker_mappings[id] || {};
+      if (mapping.label) speakerLabels[id] = mapping.label;
+    });
     (snap.transcript || []).forEach(addTranscript);
     (snap.partials || []).forEach(addPartial);
     (snap.answers || []).forEach(addAnswer);

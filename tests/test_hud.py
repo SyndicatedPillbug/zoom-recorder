@@ -32,6 +32,7 @@ from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
 from hud.budget import BudgetGovernor  # noqa: E402
 from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E402
                         load_config, save_config)
+from hud.diarization import run_post_call_diarization  # noqa: E402
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
 from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
@@ -249,6 +250,22 @@ class SttPipelineTests(unittest.TestCase):
         self.assertEqual(event["segment_id"], "Client:1")
         self.assertEqual(event["revision"], 0)
         self.assertFalse(event["finalized"])
+
+    def test_transcript_events_explain_channel_attribution(self) -> None:
+        tr = self._transcriber(HudConfig(stt_backend="local",
+                                         stt_hallucination_filter=False))
+        src = _Source("Client", [], "remote")
+        tr._publish_committed(src, "the rollout plan")
+        event = tr.state.snapshot()["transcript"][0]
+        self.assertEqual(event["speaker_id"], "remote")
+        self.assertEqual(event["speaker_source"], "channel")
+        self.assertEqual(event["speaker_confidence"], 1.0)
+
+    def test_runtime_sources_use_stable_channel_ids(self) -> None:
+        cfg = HudConfig(speakers_enabled=True, self_name="Dana", remote_name="Client")
+        sources = LiveTranscriber(LiveState(), lambda _m: None,
+                                  cfg, "Mic", "System")._build_sources()
+        self.assertEqual([s.speaker_id for s in sources], ["local", "remote"])
 
     def test_groq_two_source_chunk_floor_protects_request_rate(self) -> None:
         cfg = HudConfig(stt_backend="groq", stt_chunk_seconds=5.0)
@@ -595,9 +612,53 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(meaningful_folder_name("10-11-12_ab12cd34", identity),
                          "10-11-12_we-agreed-to-launch-the-new-onboarding-flow-next-week_ab12cd34")
 
+    def test_identity_persists_user_speaker_mappings(self) -> None:
+        cfg = mock.Mock(record_mic=True, stt_backend="local", stt_model="turbo",
+                        answers_backend="groq", chat_model="model")
+        identity = build_identity(
+            datetime(2026, 9, 22, 10, 11, 12), None, "10-11-12_ab12cd34",
+            "Client: We agreed to launch the new onboarding flow next week.", cfg,
+            speaker_mappings={"remote": {"speaker_id": "remote", "label": "Dana"}})
+        self.assertEqual(identity["speaker_mappings"]["remote"]["label"], "Dana")
+
     def test_slugify_is_safe_and_bounded(self) -> None:
         self.assertEqual(slugify("Résumé: Q3 / enrollment?"), "resume-q3-enrollment")
         self.assertLessEqual(len(slugify("word " * 100)), 64)
+
+    def test_post_call_diarization_is_disabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = HudConfig()
+            self.assertIsNone(run_post_call_diarization(
+                Path(tmp) / "remote.wav", [], Path(tmp) / "derived", cfg,
+                lambda _m: None))
+
+    def test_post_call_diarization_writes_derived_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "remote.wav"
+            audio.write_bytes(b"audio")
+            cfg = HudConfig(diarization_enabled=True, diarization_backend="whisperx")
+
+            def fake_run(command, **_kwargs):
+                outdir = Path(command[command.index("--output_dir") + 1])
+                (outdir / "remote.json").write_text(json.dumps({
+                    "segments": [{"start": 0.0, "end": 2.0,
+                                  "speaker": "SPEAKER_00", "text": "hello"}]
+                }), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.dict(os.environ, {"HF_TOKEN": "test-token"}), \
+                    mock.patch("hud.diarization.shutil.which", return_value="whisperx"), \
+                    mock.patch("hud.diarization.subprocess.run", side_effect=fake_run):
+                result = run_post_call_diarization(
+                    audio,
+                    [{"type": "transcript", "text": "hello there", "speaker": "Others",
+                      "speaker_id": "remote", "captured_at": 101.0, "ts": 101.0}],
+                    root / "derived", cfg, lambda _m: None, started_epoch=100.0)
+            self.assertIsNotNone(result)
+            self.assertTrue((root / "derived" / "diarization.json").is_file())
+            rendered = (root / "derived" / "diarized_transcript.md").read_text()
+            self.assertIn("Remote 1", rendered)
 
     def test_session_stop_finalizes_folder_and_metadata(self) -> None:
         from hud.session import LiveSession
@@ -794,7 +855,9 @@ class ConfigTests(unittest.TestCase):
             talking_points_grounded=False, talking_points_max=2,
             talking_points_min_new_words=80, talking_points_min_words=30,
             talking_points_quote_overlap=0.6,
-            transcript_writeback_dir="~/Obsidian/LiveTranscripts")
+            transcript_writeback_dir="~/Obsidian/LiveTranscripts",
+            diarization_enabled=True, diarization_backend="whisperx",
+            diarization_timeout_seconds=90.0)
         again = config_from_dict(config_to_dict(cfg))
         for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
                      "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
@@ -806,6 +869,8 @@ class ConfigTests(unittest.TestCase):
                      "talking_points_grounded", "talking_points_max",
                      "talking_points_min_new_words", "talking_points_min_words",
                      "talking_points_quote_overlap", "transcript_writeback_dir",
+                     "diarization_enabled", "diarization_backend",
+                     "diarization_timeout_seconds",
                      "stt_partial_enabled", "stt_partial_window_seconds",
                      "stt_partial_interval_seconds"):
             self.assertEqual(getattr(cfg, attr), getattr(again, attr), attr)
@@ -921,6 +986,23 @@ class StateTests(unittest.TestCase):
         self.assertIn("Client: glad to meet you", text)
         timeline = state.timeline_markdown()
         self.assertIn("Dana: hello there", timeline)
+
+    def test_speaker_override_updates_historical_outputs_and_emits_event(self) -> None:
+        state = LiveState()
+        state.add("transcript", text="hello there", speaker="Others", speaker_id="remote")
+        self.assertTrue(state.set_speaker_label("remote", "Dana"))
+        self.assertIn("Dana: hello there", state.transcript_text())
+        self.assertNotIn("Others: hello there", state.timeline_markdown())
+        mapping = [e for e in state.since(0) if e["type"] == "speaker_mapping"][-1]
+        self.assertEqual(mapping["speaker_id"], "remote")
+        self.assertEqual(state.snapshot()["speaker_mappings"]["remote"]["label"], "Dana")
+
+    def test_clearing_speaker_override_restores_captured_label(self) -> None:
+        state = LiveState()
+        state.add("transcript", text="hello there", speaker="Others", speaker_id="remote")
+        state.set_speaker_label("remote", "Dana")
+        state.set_speaker_label("remote", "")
+        self.assertIn("Others: hello there", state.transcript_text())
 
 
 class SourceTests(unittest.TestCase):
@@ -1057,6 +1139,24 @@ class ServerTests(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self.assertTrue(json.loads(resp.read())["ok"])
             self.assertEqual(called["n"], 1)
+        finally:
+            server.stop()
+
+    def test_speaker_label_endpoint(self) -> None:
+        import urllib.request
+
+        state = LiveState()
+        server = HudServer(state, port=0,
+                           on_speaker_label=state.set_speaker_label)
+        port = server.start()
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:{}/speaker-label".format(port), method="POST",
+                data=json.dumps({"speaker_id": "remote", "label": "Dana"}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertTrue(json.loads(resp.read())["ok"])
+            self.assertEqual(state.speaker_mappings()["remote"]["label"], "Dana")
         finally:
             server.stop()
 

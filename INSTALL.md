@@ -78,6 +78,17 @@ Open **Setup** (menu: *Check my audio setup…*) and choose step 4:
 - **Online** — Groq / OpenAI / OpenRouter with an API key for the best
   accuracy and for Suggestions/answers.
 
+Optional multi-speaker attribution is a separate, post-call feature. It is
+disabled by default so it cannot affect live capture or answer latency. After
+installing WhisperX and its diarization dependencies, provide the model's
+Hugging Face credential as `HF_TOKEN` and start a live session with
+`./zoom_record.py --live --diarize`. The result is written under `derived/`;
+missing dependencies or a failed pass leave the ordinary transcript intact.
+
+During any live session, click a speaker label in the transcript to enter a
+participant name. Names are saved as local session metadata and do not require
+network access.
+
 To keep everything on the machine, use **Settings → Offline mode** (blocks
 all internet access). See `SECURITY.md` for exactly what is sent where.
 

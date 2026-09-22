@@ -523,8 +523,13 @@ class _Source:
     the two-party case.
     """
 
-    def __init__(self, speaker: Optional[str], cmd: List[str]) -> None:
+    def __init__(self, speaker: Optional[str], cmd: List[str],
+                 speaker_id: Optional[str] = None) -> None:
         self.speaker = speaker
+        # Tests and offline callers may construct a source with only its old
+        # display label; preserve that identity. Runtime sources pass explicit
+        # stable IDs from _build_sources().
+        self.speaker_id = speaker_id or str(speaker or "unknown").strip()
         self.cmd = cmd
         self.proc: Optional[subprocess.Popen] = None
         self.thread: Optional[threading.Thread] = None
@@ -744,7 +749,7 @@ class LiveTranscriber:
 
     def _build_sources(self) -> List[_Source]:
         if self.cfg.audio_file:
-            return [_Source(None, self._file_cmd(self.cfg.audio_file))]
+            return [_Source(None, self._file_cmd(self.cfg.audio_file), "unknown")]
         if not self.mic_name:
             raise RuntimeError("no microphone device selected for the live tap")
         labelled = self.cfg.speakers_enabled
@@ -752,13 +757,13 @@ class LiveTranscriber:
             # Two independent channels -> accurate two-party attribution with
             # no diarization model: mic is you, loopback is everyone else.
             return [
-                _Source(self.cfg.self_name, self._device_cmd(self.mic_name)),
-                _Source(self.cfg.remote_name, self._device_cmd(self.system_name)),
+                _Source(self.cfg.self_name, self._device_cmd(self.mic_name), "local"),
+                _Source(self.cfg.remote_name, self._device_cmd(self.system_name), "remote"),
             ]
         if self.system_name:
-            return [_Source(None, self._mixed_cmd(self.mic_name, self.system_name))]
+            return [_Source(None, self._mixed_cmd(self.mic_name, self.system_name), "unknown")]
         return [_Source(self.cfg.self_name if labelled else None,
-                        self._device_cmd(self.mic_name))]
+                        self._device_cmd(self.mic_name), "local" if labelled else "unknown")]
 
     # -- per-source loop ---------------------------------------------------
     def _run_source(self, source: _Source) -> None:
@@ -904,8 +909,12 @@ class LiveTranscriber:
                     if committed:
                         self._publish_committed(source, committed, started, finalized=False)
                     self.state.set_transcript_partial(
-                        source.speaker or "mixed", provisional, source.speaker,
-                        source.partial_revision,
+                        source.speaker_id, provisional,
+                        self.state.speaker_label(source.speaker_id, source.speaker),
+                        source.partial_revision, speaker_id=source.speaker_id,
+                        speaker_source=("channel" if source.speaker_id != "unknown" else "unknown"),
+                        speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
+                        speaker_revision=0,
                         latency=round(time.time() - started, 2),
                         captured_at=captured_at)
                     self.state.set_meta(
@@ -927,9 +936,13 @@ class LiveTranscriber:
         source.transcribed += 1
         source.segment_seq += 1
         source.last_segment_id = "{}:{}".format(
-            source.speaker or "mixed", source.segment_seq)
+            source.speaker_id, source.segment_seq)
+        speaker = self.state.speaker_label(source.speaker_id, source.speaker)
         self.state.add("transcript", text=delta, source="live",
-                       speaker=source.speaker,
+                       speaker=speaker, speaker_id=source.speaker_id,
+                       speaker_source=("channel" if source.speaker_id != "unknown" else "unknown"),
+                       speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
+                       speaker_revision=0,
                        latency=round(time.time() - started, 2) if started else None,
                        stable_partial=not finalized, finalized=finalized,
                        segment_id=source.last_segment_id,
@@ -937,7 +950,11 @@ class LiveTranscriber:
                        captured_at=started)
         if not finalized:
             self.state.add("transcript_revision", text=delta, source="live",
-                           speaker=source.speaker, segment_id=source.last_segment_id,
+                           speaker=speaker, speaker_id=source.speaker_id,
+                           speaker_source=("channel" if source.speaker_id != "unknown" else "unknown"),
+                           speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
+                           speaker_revision=0,
+                           segment_id=source.last_segment_id,
                            revision=source.partial_revision, finalized=False)
 
     def _prompt_for(self, source: _Source) -> Optional[str]:
@@ -1020,14 +1037,21 @@ class LiveTranscriber:
             return
         self._publish_committed(source, text, started, finalized=True)
         if self._partial_enabled():
-            self.state.add("transcript_boundary", source_key=source.speaker or "mixed",
-                           speaker=source.speaker, finalized=True,
+            speaker = self.state.speaker_label(source.speaker_id, source.speaker)
+            self.state.add("transcript_boundary", source_key=source.speaker_id,
+                           speaker=speaker, speaker_id=source.speaker_id, finalized=True,
+                           speaker_source=("channel" if source.speaker_id != "unknown" else "unknown"),
+                           speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
+                           speaker_revision=0,
                            segment_id=source.last_segment_id,
                            revision=source.partial_revision + 1)
             source.partial_revision += 1
             self.state.set_transcript_partial(
-                source.speaker or "mixed", "", source.speaker,
-                source.partial_revision, finalized=True)
+                source.speaker_id, "", speaker, source.partial_revision,
+                speaker_id=source.speaker_id,
+                speaker_source=("channel" if source.speaker_id != "unknown" else "unknown"),
+                speaker_confidence=(1.0 if source.speaker_id != "unknown" else 0.0),
+                speaker_revision=0, finalized=True)
         if captured_at is not None:
             self.state.observe_metric("stt_final_latency_seconds",
                                       max(0.0, time.time() - captured_at))

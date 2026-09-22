@@ -233,6 +233,8 @@ recording stops. These files are written under `derived/` (flushed every
 | `live_conversation.md` | Transcript **and** answers interleaved in order, so each answer sits next to the speech that prompted it |
 | `live_answers.md` | Just the AI answers and talking points |
 | `live_summary.md` | End-of-call summary, action items and a follow-up email draft |
+| `diarization.json` | Optional post-call speaker turns and confidence metadata |
+| `diarized_transcript.md` | Optional derived transcript with generic remote speaker IDs |
 
 The live session also writes `live_events.jsonl` (a provider-free replay
 fixture), `meeting_memory.json` (decisions, commitments and numeric facts with
@@ -278,6 +280,30 @@ parties; multiple *remote* speakers all fall under the single loopback label
 (that case is what full diarization would be needed for). Multiple speakers
 means two STT streams, so audio usage roughly doubles. `--no-speaker-labels`
 mixes mic + system into one unlabelled stream as before.
+
+**Renaming participants.** Click any speaker label in the live transcript, type
+the participant's name, and press Enter. Escape cancels; clearing the field
+restores the captured generic label. This is a local metadata override: it is
+instant, does not call an AI provider, and changes historical display/writeback
+views without rewriting raw audio or transcript events. The mapping is saved in
+`session.json`.
+
+**Optional post-call diarization.** For calls with several people sharing one
+remote/system channel, the safe first step is an opt-in background pass after
+capture. It never delays live STT, question detection, or answer TTFT. Install
+WhisperX and its diarization dependencies separately, set `HF_TOKEN` for the
+pyannote model, then run:
+
+```bash
+./zoom_record.py --live --diarize --self-name "Dana"
+```
+
+The pass processes only the saved remote track when one exists, uses fixed
+non-shell arguments, has a timeout, and writes only derived files. If WhisperX,
+the model, or the token is missing, the call completes with the normal
+channel-labelled transcript. Speaker IDs remain generic (`Remote 1`, `Remote
+2`) until the user renames them; acoustic attribution never silently claims a
+real person's identity.
 
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
@@ -460,6 +486,7 @@ to drift minutes behind the call.
   "kb":      {"dirs": ["~/notes"], "top_k": 5, "embed_backend": "auto"},
   "hud":     {"port": 0, "open_browser": true, "persist_seconds": 20},
   "transcript": {"writeback_dir": "~/Obsidian/LiveTranscripts"},
+  "diarization": {"enabled": false, "backend": "auto", "timeout_seconds": 300},
   "speakers": {"enabled": true, "self_name": "You", "remote_name": "Others"},
   "api_keys": {"openrouter": "sk-or-..."}
 }
@@ -569,6 +596,8 @@ to the **next** recording, since the HUD reads config at session start.
 | `--self-name NAME` | You | Label your microphone audio with this name in the transcript |
 | `--remote-name NAME` | Others | Label the system/loopback audio with this name |
 | `--no-speaker-labels` | off | Mix mic+system into one unlabelled stream |
+| `--diarize` | off | Run optional post-call WhisperX attribution after a live session |
+| `--diarization-backend X` | config | Post-call attribution: `auto` \| `whisperx` \| `off` |
 | `--live-audio-file PATH` | none | Feed a media file to the HUD instead of a live tap (testing) |
 
 ## How It Works

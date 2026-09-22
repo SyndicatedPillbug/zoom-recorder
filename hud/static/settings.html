@@ -173,6 +173,13 @@
     <div class="row"><label>Others (loopback)</label><div class="ctl">
       <input type="text" id="speakers.remote_name" /></div></div>
     <div class="hint">Mic and loopback are captured separately, so each is labelled. Multiple remote speakers share the loopback label.</div>
+    <div class="row"><label>Post-call diarization</label><div class="ctl">
+      <input type="checkbox" id="diarization.enabled" /></div></div>
+    <div class="row"><label>Diarization backend</label><div class="ctl">
+      <select id="diarization.backend"><option value="auto">auto</option><option value="whisperx">WhisperX</option><option value="off">off</option></select></div></div>
+    <div class="row"><label>Diarization timeout</label><div class="ctl">
+      <input type="number" step="30" min="30" id="diarization.timeout_seconds" /><span class="hint">seconds</span></div></div>
+    <div class="hint">Optional and never part of the live path. Requires WhisperX plus a Hugging Face token; it writes only derived/ files after recording.</div>
   </section>
 
   <section>
@@ -301,6 +308,9 @@
     kbDirs = (c.kb.dirs || []).slice(); renderDirs();
     setVal('speakers.enabled', c.speakers.enabled); setVal('speakers.self_name', c.speakers.self_name);
     setVal('speakers.remote_name', c.speakers.remote_name);
+    setVal('diarization.enabled', c.diarization && c.diarization.enabled);
+    setVal('diarization.backend', (c.diarization && c.diarization.backend) || 'auto');
+    setVal('diarization.timeout_seconds', (c.diarization && c.diarization.timeout_seconds) || 300);
     setVal('hud.port', c.hud.port); setVal('hud.open_browser', c.hud.open_browser);
     setVal('hud.persist_seconds', c.hud.persist_seconds);
     setVal('transcript.writeback_dir', c.transcript.writeback_dir);
@@ -341,6 +351,9 @@
       speakers: { enabled: $('speakers.enabled').checked,
                   self_name: $('speakers.self_name').value,
                   remote_name: $('speakers.remote_name').value },
+      diarization: { enabled: $('diarization.enabled').checked,
+                     backend: $('diarization.backend').value,
+                     timeout_seconds: num('diarization.timeout_seconds') },
       hud: { port: num('hud.port'), open_browser: $('hud.open_browser').checked,
              persist_seconds: num('hud.persist_seconds') },
       transcript: { writeback_dir: $('transcript.writeback_dir').value.trim() || null },

@@ -1134,6 +1134,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="name to label the system/loopback audio with (default 'Others')")
     parser.add_argument("--no-speaker-labels", action="store_true",
                         help="mix mic+system into one unlabelled stream")
+    parser.add_argument("--diarize", action="store_true",
+                        help="after the call, optionally split remote speakers with WhisperX")
+    parser.add_argument("--diarization-backend", default=None,
+                        help="post-call attribution backend: auto | whisperx | off")
     return parser.parse_args(argv)
 
 
@@ -1189,6 +1193,10 @@ def build_hud_config(args: argparse.Namespace):
         cfg.remote_name = args.remote_name
     if args.no_speaker_labels:
         cfg.speakers_enabled = False
+    if args.diarize:
+        cfg.diarization_enabled = True
+    if args.diarization_backend:
+        cfg.diarization_backend = args.diarization_backend
     if getattr(args, "offline", False):
         # Offline is a hard privacy switch: no answers, no KB embeddings, and
         # STT only through a local backend (remote providers would be blocked
@@ -1599,11 +1607,13 @@ def main(argv: List[str]) -> int:
     # Start the HUD first so the browser URL is ready in ~2s; the transcript
     # begins flowing as soon as the capture produces segments.
     live = None
+    live_cfg = None
     if args.live:
         try:
             from hud.session import LiveSession
 
             hud_cfg = build_hud_config(args)
+            live_cfg = hud_cfg
             live = LiveSession(
                 hud_cfg, outdir, log.info,
                 mic.device.name if mic is not None else None,
@@ -1764,6 +1774,35 @@ def main(argv: List[str]) -> int:
                                  outdir / "derived" / "recording_mixed.wav", log)
         if mixed is not None:
             transcribe(cfg, mixed, log)
+
+        # Optional post-call attribution is deliberately after capture, live
+        # STT, answers, and the ordinary transcription path. It can never add
+        # latency to the question loop or risk the original audio files.
+        if live is not None and live_cfg is not None and live_cfg.diarization_enabled:
+            try:
+                from hud.diarization import run_post_call_diarization
+                diar_audio = merged_sys or mixed
+                if diar_audio is not None:
+                    diar_result = run_post_call_diarization(
+                        diar_audio, live.state.since(0), outdir / "derived", live_cfg,
+                        log.info, started_epoch=started.timestamp(),
+                        mappings=live.state.speaker_mappings())
+                    if diar_result:
+                        identity_path = outdir / "session.json"
+                        try:
+                            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                            identity["diarization"] = {
+                                "backend": diar_result.get("backend"),
+                                "speaker_count": diar_result.get("speaker_count"),
+                                "segments_file": "derived/diarization.json",
+                            }
+                            identity_path.write_text(
+                                json.dumps(identity, indent=2, ensure_ascii=False) + "\n",
+                                encoding="utf-8")
+                        except (OSError, ValueError) as exc:
+                            log.warn("Diarization completed but session metadata was not updated: {}".format(exc))
+            except Exception as exc:  # noqa: BLE001
+                log.warn("Optional diarization failed; original transcript kept: {}".format(exc))
 
         log.info("Done. Originals are read-only under {}/. Derived copies (safe to overwrite) "
                  "belong in {}/derived/.".format(outdir, outdir))

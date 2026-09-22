@@ -74,6 +74,7 @@ class LiveSession:
             self.server = HudServer(self.state, self.cfg.host, self.cfg.port, self.log,
                                     token=self.token, on_ask=self._on_ask,
                                     on_pause=self._on_pause,
+                                    on_speaker_label=self._on_speaker_label,
                                     on_stop=self.on_stop)
             self._port = self.server.start()
         except Exception as exc:  # noqa: BLE001
@@ -184,7 +185,8 @@ class LiveSession:
 
         identity = build_identity(
             self.started_at, _datetime.now(), self.outdir.name,
-            self.state.transcript_text(), self.cfg)
+            self.state.transcript_text(), self.cfg,
+            speaker_mappings=self.state.speaker_mappings())
         original = self.outdir
         target_name = meaningful_folder_name(original.name, identity)
         target = original.parent / target_name
@@ -230,6 +232,10 @@ class LiveSession:
         if self.answers is not None:
             self.answers.pause(paused)
         self.state.set_meta(answers_paused=paused)
+
+    def _on_speaker_label(self, speaker_id: str, label: str) -> bool:
+        """Apply a presentation-only name override from the HUD."""
+        return self.state.set_speaker_label(speaker_id, label, source="user")
 
     def update_devices(self, mic_name: Optional[str], system_name: Optional[str]) -> None:
         """Follow a recorder device switch (headphones, failover, route change)."""

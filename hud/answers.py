@@ -88,6 +88,7 @@ class Turn:
     speaker: str
     text: str
     finalized: bool = True
+    speaker_id: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -189,6 +190,7 @@ def detect_questions_since(turns: List[Turn], after_seq: int,
         out.append({
             "question": question,
             "speaker": turn.speaker or "",
+            "speaker_id": turn.speaker_id or "",
             "seq": turn.seq,
             "context": context,
             "finalized": bool(turn.finalized),
@@ -896,10 +898,11 @@ class AnswerEngine:
     def _should_answer(self, detected: Dict[str, Any]) -> bool:
         question = detected.get("question", "")
         speaker = detected.get("speaker") or ""
+        speaker_id = detected.get("speaker_id") or ""
         if is_rhetorical_question(question):
             return False
-        if (not self.cfg.answer_self_questions and speaker
-                and speaker == self.cfg.self_name):
+        if (not self.cfg.answer_self_questions and
+                (speaker_id == "local" or (speaker and speaker == self.cfg.self_name))):
             return False
         return True
 
@@ -914,10 +917,12 @@ class AnswerEngine:
                 # an answer prompt until stable words arrive as transcript events.
                 draft = str(event.get("text") or "").strip()
                 speaker = event.get("speaker") or ""
+                speaker_id = event.get("speaker_id") or ""
                 if draft:
                     prior = ""
                     for turn in reversed(self._buffer):
-                        if turn.speaker == speaker:
+                        if ((speaker_id and turn.speaker_id == speaker_id) or
+                                (not speaker_id and turn.speaker == speaker)):
                             prior = turn.text
                             break
                     candidate = (prior + " " + draft).strip()
@@ -928,8 +933,10 @@ class AnswerEngine:
                 continue
             if event.get("type") == "transcript_boundary":
                 speaker = event.get("speaker") or ""
+                speaker_id = event.get("speaker_id") or ""
                 for turn in reversed(self._buffer):
-                    if turn.speaker == speaker:
+                    if ((speaker_id and turn.speaker_id == speaker_id) or
+                            (not speaker_id and turn.speaker == speaker)):
                         turn.finalized = True
                         break
                 continue
@@ -939,10 +946,12 @@ class AnswerEngine:
                     continue
                 self._seq += 1
                 speaker = event.get("speaker") or ""
+                speaker_id = event.get("speaker_id") or ""
                 self._buffer.append(Turn(
                     seq=self._seq, ts=float(event.get("ts", time.time())),
                     speaker=speaker, text=text,
-                    finalized=bool(event.get("finalized", True))))
+                    finalized=bool(event.get("finalized", True)),
+                    speaker_id=speaker_id))
                 self._words_since_rolling += len(text.split())
                 # Feed each turn into the live transcript index so older
                 # conversation is retrievable by meaning, not just the

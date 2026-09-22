@@ -233,6 +233,12 @@ class HudConfig:
     # derived/ output; it mirrors the live transcript while the call runs.
     transcript_writeback_dir: Optional[str] = None
 
+    # Optional post-call attribution. This is deliberately disabled by
+    # default: live capture, STT, and answers never depend on it.
+    diarization_enabled: bool = False
+    diarization_backend: str = "auto"       # auto | whisperx | off
+    diarization_timeout_seconds: float = 300.0
+
     # Budget caps (0 == trust the provider's rate-limit headers)
     budget_tpm: int = 0
     budget_tpd: int = 0
@@ -359,6 +365,8 @@ def _defaults() -> Dict[str, Any]:
         },
         "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1", "persist_seconds": 20.0},
         "transcript": {"writeback_dir": None},
+        "diarization": {"enabled": False, "backend": "auto",
+                         "timeout_seconds": 300.0},
         "speakers": {"enabled": True, "self_name": "You", "remote_name": "Others"},
         "budget": {"tpm": 0, "tpd": 0},
         "privacy": {"offline": False, "notifications": True},
@@ -407,6 +415,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
     budget = data.get("budget") or {}
     privacy = data.get("privacy") or {}
     transcript = data.get("transcript") or {}
+    diarization = data.get("diarization") or {}
 
     return HudConfig(
         stt_backend=str(stt.get("backend") or "groq"),
@@ -470,6 +479,10 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         host=str(hud.get("host") or "127.0.0.1"),
         persist_seconds=_as_float(hud.get("persist_seconds"), 20.0),
         transcript_writeback_dir=transcript.get("writeback_dir") or None,
+        diarization_enabled=bool(diarization.get("enabled", False)),
+        diarization_backend=str(diarization.get("backend") or "auto"),
+        diarization_timeout_seconds=_as_float(
+            diarization.get("timeout_seconds"), 300.0),
         budget_tpm=_as_int(budget.get("tpm"), 0),
         budget_tpd=_as_int(budget.get("tpd"), 0),
         offline=bool(privacy.get("offline", False)),
@@ -483,6 +496,11 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
 def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
     """Inverse of :func:`config_from_dict`; used by the settings GUI."""
     out = _defaults()
+    out["diarization"].update({
+        "enabled": cfg.diarization_enabled,
+        "backend": cfg.diarization_backend,
+        "timeout_seconds": cfg.diarization_timeout_seconds,
+    })
     out["stt"].update({
         "backend": cfg.stt_backend,
         "model": cfg.stt_model,
