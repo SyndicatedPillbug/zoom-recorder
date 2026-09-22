@@ -762,7 +762,10 @@ class LiveTranscriber:
                 "-map", "[a]", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
 
     def _file_cmd(self, path: str) -> List[str]:
-        return ["ffmpeg", "-hide_banner", "-nostdin", "-i", path,
+        # Test fixtures must arrive at wall-clock speed. Without ``-re``
+        # ffmpeg decodes the whole file immediately, overfills the bounded
+        # live queue, and makes a healthy live pipeline look lossy.
+        return ["ffmpeg", "-hide_banner", "-nostdin", "-re", "-i", path,
                 "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
 
     def _build_sources(self) -> List[_Source]:

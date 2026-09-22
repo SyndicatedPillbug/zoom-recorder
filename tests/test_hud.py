@@ -1107,6 +1107,12 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0].speaker, "Dana")
 
+    def test_file_fixture_is_paced_like_live_audio(self) -> None:
+        cfg = HudConfig(audio_file="/tmp/dialogue.wav")
+        source = self._transcriber(cfg, None, None)._build_sources()[0]
+        self.assertIn("-re", source.cmd)
+        self.assertEqual(source.speaker_id, "unknown")
+
 
 class SettingsServerTests(unittest.TestCase):
     def setUp(self) -> None:
