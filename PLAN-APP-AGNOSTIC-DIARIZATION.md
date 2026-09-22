@@ -13,6 +13,11 @@ fast, reliable live baseline.
 - Phase 2 has a safe opt-in adapter: `--diarize` invokes WhisperX only after
   capture and live processing finish, writes derived attribution artifacts,
   and falls back cleanly when WhisperX or its model credentials are absent.
+- The reusable voice-profile store is now implemented. It enrolls only from
+  explicit user labels, stores aggregate embeddings with owner-only permissions,
+  and reports thresholded matches as hints. The current WhisperX JSON adapter
+  does not emit embeddings; the worker now optionally enriches it with the
+  local `pyannote/embedding` model when that dependency is installed.
 - Phases 3 and 4 remain intentionally opt-in design work; no live diarization
   model is allowed onto the capture or answer critical path yet.
 
@@ -40,6 +45,8 @@ fast, reliable live baseline.
    output or later revision records rather than rewriting an already-written
    line in place.
 6. No call-platform roster or authentication is required.
+7. Cross-session voice matching is opt-in local biometric metadata; it is
+   never inferred from a name alone and can be disabled or deleted.
 
 ## Proposed data model
 
@@ -145,6 +152,17 @@ it can use longer context and does not affect live performance.
 - Optionally support a short “who is speaking?” confirmation prompt.
 - Consider voice enrollment only as an explicit opt-in; never infer a real
   person’s name silently.
+
+### Reusable voice-profile contract
+
+- A profile is created or updated only when a user-labeled diarization speaker
+  supplies an acoustic embedding.
+- A future match must clear both the similarity threshold and a separation
+  margin from the next-best profile; otherwise the generic speaker label wins.
+- The profile store keeps normalized aggregate vectors, sample counts, session
+  references, and timestamps. It never stores raw audio or transcript text.
+- Profile matches are marked `speaker_source: "voice_profile"`; manual labels
+  remain `speaker_source: "user"` and always take precedence.
 
 ## Performance and safety gates
 

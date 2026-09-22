@@ -89,6 +89,15 @@ During any live session, click a speaker label in the transcript to enter a
 participant name. Names are saved as local session metadata and do not require
 network access.
 
+If the optional diarization backend provides acoustic embeddings, explicit
+manual labels can also build a local reusable voice profile. Those profiles are
+stored owner-only under the app configuration directory, contain no audio, and
+can be disabled or deleted from Settings.
+
+For local embedding enrichment, install `pyannote.audio` in the same optional
+environment as WhisperX and keep `HF_TOKEN` available. The app still works
+without it; it simply keeps generic diarization labels.
+
 To keep everything on the machine, use **Settings → Offline mode** (blocks
 all internet access). See `SECURITY.md` for exactly what is sent where.
 

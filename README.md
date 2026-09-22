@@ -305,6 +305,19 @@ channel-labelled transcript. Speaker IDs remain generic (`Remote 1`, `Remote
 2`) until the user renames them; acoustic attribution never silently claims a
 real person's identity.
 
+**Reusable voice matches.** When a diarization backend supplies acoustic
+embeddings, an explicit manual name can enroll one representative sample into
+the local voice-profile store at `~/.config/zoom-recorder/voice_profiles.json`.
+Later calls can use those profiles to raise or lower confidence, but a close
+match is still marked `voice_profile` and remains generic below the configured
+threshold. The store contains aggregate embeddings and metadata, not audio;
+it is created with owner-only permissions. Disable **Reuse confirmed voices**
+in Settings to stop matching, and delete the profile file to erase stored
+matches. The post-call worker will use the optional `pyannote/embedding` model
+when `pyannote.audio` is installed alongside WhisperX; otherwise it safely
+falls back because WhisperX's session-local speaker IDs are not reusable
+identities by themselves.
+
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
 detected by a **voice-activity gate** — an adaptive noise floor per source, or
@@ -486,7 +499,8 @@ to drift minutes behind the call.
   "kb":      {"dirs": ["~/notes"], "top_k": 5, "embed_backend": "auto"},
   "hud":     {"port": 0, "open_browser": true, "persist_seconds": 20},
   "transcript": {"writeback_dir": "~/Obsidian/LiveTranscripts"},
-  "diarization": {"enabled": false, "backend": "auto", "timeout_seconds": 300},
+  "diarization": {"enabled": false, "backend": "auto", "timeout_seconds": 300,
+                   "voice_profiles": {"enabled": true, "threshold": 0.78}},
   "speakers": {"enabled": true, "self_name": "You", "remote_name": "Others"},
   "api_keys": {"openrouter": "sk-or-..."}
 }

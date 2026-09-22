@@ -179,6 +179,12 @@
       <select id="diarization.backend"><option value="auto">auto</option><option value="whisperx">WhisperX</option><option value="off">off</option></select></div></div>
     <div class="row"><label>Diarization timeout</label><div class="ctl">
       <input type="number" step="30" min="30" id="diarization.timeout_seconds" /><span class="hint">seconds</span></div></div>
+    <div class="row"><label>Reuse confirmed voices</label><div class="ctl">
+      <input type="checkbox" id="diarization.voice_profiles.enabled" /></div></div>
+    <div class="row"><label>Voice match threshold</label><div class="ctl">
+      <input type="number" step="0.01" min="0.5" max="0.99" id="diarization.voice_profiles.threshold" /></div></div>
+    <div class="row"><label>Voice profile file</label><div class="ctl">
+      <input type="text" id="diarization.voice_profiles.path" placeholder="default: app config folder" /></div></div>
     <div class="hint">Optional and never part of the live path. Requires WhisperX plus a Hugging Face token; it writes only derived/ files after recording.</div>
   </section>
 
@@ -311,6 +317,10 @@
     setVal('diarization.enabled', c.diarization && c.diarization.enabled);
     setVal('diarization.backend', (c.diarization && c.diarization.backend) || 'auto');
     setVal('diarization.timeout_seconds', (c.diarization && c.diarization.timeout_seconds) || 300);
+    const vp = (c.diarization && c.diarization.voice_profiles) || {};
+    setVal('diarization.voice_profiles.enabled', vp.enabled !== false);
+    setVal('diarization.voice_profiles.threshold', vp.threshold || 0.78);
+    setVal('diarization.voice_profiles.path', vp.path || '');
     setVal('hud.port', c.hud.port); setVal('hud.open_browser', c.hud.open_browser);
     setVal('hud.persist_seconds', c.hud.persist_seconds);
     setVal('transcript.writeback_dir', c.transcript.writeback_dir);
@@ -353,7 +363,11 @@
                   remote_name: $('speakers.remote_name').value },
       diarization: { enabled: $('diarization.enabled').checked,
                      backend: $('diarization.backend').value,
-                     timeout_seconds: num('diarization.timeout_seconds') },
+                     timeout_seconds: num('diarization.timeout_seconds'),
+                     voice_profiles: {
+                       enabled: $('diarization.voice_profiles.enabled').checked,
+                       threshold: Number($('diarization.voice_profiles.threshold').value || 0.78),
+                       path: $('diarization.voice_profiles.path').value.trim() || null } },
       hud: { port: num('hud.port'), open_browser: $('hud.open_browser').checked,
              persist_seconds: num('hud.persist_seconds') },
       transcript: { writeback_dir: $('transcript.writeback_dir').value.trim() || null },

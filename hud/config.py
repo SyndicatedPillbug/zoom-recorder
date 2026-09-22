@@ -238,6 +238,9 @@ class HudConfig:
     diarization_enabled: bool = False
     diarization_backend: str = "auto"       # auto | whisperx | off
     diarization_timeout_seconds: float = 300.0
+    voice_profiles_enabled: bool = True
+    voice_profiles_path: Optional[str] = None
+    voice_profile_threshold: float = 0.78
 
     # Budget caps (0 == trust the provider's rate-limit headers)
     budget_tpm: int = 0
@@ -366,7 +369,9 @@ def _defaults() -> Dict[str, Any]:
         "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1", "persist_seconds": 20.0},
         "transcript": {"writeback_dir": None},
         "diarization": {"enabled": False, "backend": "auto",
-                         "timeout_seconds": 300.0},
+                         "timeout_seconds": 300.0,
+                         "voice_profiles": {"enabled": True, "path": None,
+                                            "threshold": 0.78}},
         "speakers": {"enabled": True, "self_name": "You", "remote_name": "Others"},
         "budget": {"tpm": 0, "tpd": 0},
         "privacy": {"offline": False, "notifications": True},
@@ -483,6 +488,11 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         diarization_backend=str(diarization.get("backend") or "auto"),
         diarization_timeout_seconds=_as_float(
             diarization.get("timeout_seconds"), 300.0),
+        voice_profiles_enabled=bool((diarization.get("voice_profiles") or {}).get(
+            "enabled", True)),
+        voice_profiles_path=(diarization.get("voice_profiles") or {}).get("path") or None,
+        voice_profile_threshold=_as_float(
+            (diarization.get("voice_profiles") or {}).get("threshold"), 0.78),
         budget_tpm=_as_int(budget.get("tpm"), 0),
         budget_tpd=_as_int(budget.get("tpd"), 0),
         offline=bool(privacy.get("offline", False)),
@@ -500,6 +510,11 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "enabled": cfg.diarization_enabled,
         "backend": cfg.diarization_backend,
         "timeout_seconds": cfg.diarization_timeout_seconds,
+        "voice_profiles": {
+            "enabled": cfg.voice_profiles_enabled,
+            "path": cfg.voice_profiles_path,
+            "threshold": cfg.voice_profile_threshold,
+        },
     })
     out["stt"].update({
         "backend": cfg.stt_backend,

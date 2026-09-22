@@ -18,6 +18,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from .voice_profiles import VoiceProfileStore, _vector
+
 
 def _speaker_id(raw: str, ids: Dict[str, str]) -> str:
     key = str(raw or "UNKNOWN").strip() or "UNKNOWN"
@@ -42,6 +44,7 @@ def _load_segments(path: Path) -> List[Dict[str, Any]]:
         if end <= start:
             continue
         raw_speaker = str(item.get("speaker") or "UNKNOWN")
+        embedding = _vector(item.get("embedding"))
         out.append({
             "start": start,
             "end": end,
@@ -50,8 +53,48 @@ def _load_segments(path: Path) -> List[Dict[str, Any]]:
             "speaker_source": "diarization",
             "speaker_confidence": float(item.get("speaker_confidence") or 0.5),
             "text": str(item.get("text") or "").strip(),
+            "_embedding": embedding,
         })
     return out
+
+
+def _add_optional_embeddings(audio_path: Path, segments: List[Dict[str, Any]],
+                             token: str, log: Callable[[str], None]) -> None:
+    """Attach one representative embedding per diarized speaker when available."""
+    try:
+        from pyannote.audio import Inference, Model
+        from pyannote.core import Segment
+    except ImportError:
+        return
+    try:
+        model = Model.from_pretrained("pyannote/embedding", token=token)
+        inference = Inference(model, window="whole")
+        representatives: Dict[str, Dict[str, Any]] = {}
+        for segment in segments:
+            current = representatives.get(segment["speaker_id"])
+            if current is None or (segment["end"] - segment["start"]
+                                   > current["end"] - current["start"]):
+                representatives[segment["speaker_id"]] = segment
+        embeddings: Dict[str, List[float]] = {}
+        for speaker_id, segment in representatives.items():
+            start = float(segment["start"])
+            end = min(float(segment["end"]), start + 30.0)
+            value = inference.crop(str(audio_path), Segment(start, end))
+            if hasattr(value, "tolist"):
+                value = value.tolist()
+            normalized = _vector(value)
+            if normalized is not None:
+                embeddings[speaker_id] = normalized
+        for segment in segments:
+            if segment["speaker_id"] in embeddings:
+                segment["_embedding"] = embeddings[segment["speaker_id"]]
+        if embeddings:
+            log("voice profiles: generated {} local speaker embedding(s)".format(
+                len(embeddings)))
+    except Exception as exc:  # noqa: BLE001
+        # An optional model must never turn a successful diarization into a
+        # failed recording or erase the generic speaker result.
+        log("voice profiles: embedding enrichment unavailable ({})".format(exc))
 
 
 def _render_transcript(events: Iterable[Dict[str, Any]], segments: List[Dict[str, Any]],
@@ -153,19 +196,79 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
     if not segments:
         log("diarization completed with no speaker segments")
         return None
+    if (getattr(cfg, "voice_profiles_enabled", True)
+            and not any(segment.get("_embedding") for segment in segments)):
+        _add_optional_embeddings(audio_path, segments, token, log)
     events_list = list(events)
     mapping = mappings or {}
+    store = None
+    if (getattr(cfg, "voice_profiles_enabled", True)
+            and getattr(cfg, "voice_profiles_path", None) is not False):
+        store = VoiceProfileStore(
+            Path(getattr(cfg, "voice_profiles_path", None)).expanduser()
+            if getattr(cfg, "voice_profiles_path", None) else None,
+            threshold=float(getattr(cfg, "voice_profile_threshold", 0.78)),
+            log=log)
+    diar_speaker_count = len({seg["speaker_id"] for seg in segments})
+    enrolled: List[Dict[str, Any]] = []
+    enrolled_speakers = set()
+    matched = 0
+    single_remote_label = None
+    if diar_speaker_count == 1:
+        remote_mapping = mapping.get("remote")
+        if remote_mapping and remote_mapping.get("source") == "user":
+            single_remote_label = str(remote_mapping.get("label") or "").strip() or None
+    for segment in segments:
+        embedding = segment.pop("_embedding", None)
+        if store is None or embedding is None:
+            continue
+        manual = mapping.get(segment["speaker_id"])
+        manual_label = None
+        if manual and manual.get("source") == "user":
+            manual_label = str(manual.get("label") or "").strip() or None
+        manual_label = manual_label or single_remote_label
+        if manual_label:
+            if segment["speaker_id"] in enrolled_speakers:
+                continue
+            profile = store.enroll(manual_label, embedding,
+                                   Path(audio_path).parent.name)
+            if profile:
+                segment.update({
+                    "speaker_label": manual_label,
+                    "speaker_source": "user",
+                    "speaker_confidence": 1.0,
+                    "profile_id": profile["profile_id"],
+                })
+                enrolled.append(profile)
+                enrolled_speakers.add(segment["speaker_id"])
+            continue
+        profile = store.match(embedding)
+        if profile and profile["confidence"] >= 0.65:
+            segment.update({
+                "speaker_label": profile["label"],
+                "speaker_source": "voice_profile",
+                "speaker_confidence": profile["confidence"],
+                "profile_id": profile["profile_id"],
+                "profile_similarity": profile["similarity"],
+            })
+            matched += 1
+
+    public_segments = [{key: value for key, value in segment.items()
+                        if not key.startswith("_")}
+                       for segment in segments]
     result = {
         "schema_version": 1,
         "backend": "whisperx",
         "audio": str(audio_path),
-        "segments": segments,
-        "speaker_count": len({seg["speaker_id"] for seg in segments}),
+        "segments": public_segments,
+        "speaker_count": diar_speaker_count,
+        "voice_profile_matches": matched,
+        "voice_profiles_enrolled": enrolled,
     }
     (output_dir / "diarization.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output_dir / "diarized_transcript.md").write_text(
-        _render_transcript(events_list, segments, started_epoch, mapping),
+        _render_transcript(events_list, public_segments, started_epoch, mapping),
         encoding="utf-8")
     log("diarization complete: {} speaker(s) in derived/diarization.json".format(
         result["speaker_count"]))

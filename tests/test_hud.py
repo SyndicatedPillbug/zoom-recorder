@@ -48,6 +48,7 @@ from hud.stt import (Chunker, LiveTranscriber, _Source, frame_rms_dbfs,  # noqa:
                      overlap_suffix_prefix,
                      pcm_to_wav, split_words)
 from hud.transcript_writeback import TranscriptWriteback  # noqa: E402
+from hud.voice_profiles import VoiceProfileStore  # noqa: E402
 from hud.vad import EnergyVAD, NoiseFloor, build_vad, frame_level_dbfs  # noqa: E402
 
 
@@ -659,6 +660,45 @@ class IdentityTests(unittest.TestCase):
             self.assertTrue((root / "derived" / "diarization.json").is_file())
             rendered = (root / "derived" / "diarized_transcript.md").read_text()
             self.assertIn("Remote 1", rendered)
+
+    def test_voice_profiles_require_manual_enrollment_and_match_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "voice_profiles.json"
+            store = VoiceProfileStore(path, threshold=0.8)
+            self.assertIsNone(store.match([1.0, 0.0]))
+            profile = store.enroll("Sarah", [1.0, 0.0], "session-a")
+            self.assertEqual(profile["label"], "Sarah")
+            match = store.match([0.99, 0.05])
+            self.assertEqual(match["label"], "Sarah")
+            self.assertGreaterEqual(match["confidence"], 0.65)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(store.forget(profile["profile_id"]))
+            self.assertIsNone(store.match([1.0, 0.0]))
+
+    def test_diarization_enrolls_only_explicit_single_speaker_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "remote.wav"
+            audio.write_bytes(b"audio")
+            cfg = HudConfig(diarization_enabled=True, diarization_backend="whisperx",
+                            voice_profiles_path=str(root / "profiles.json"))
+
+            def fake_run(command, **_kwargs):
+                outdir = Path(command[command.index("--output_dir") + 1])
+                (outdir / "remote.json").write_text(json.dumps({
+                    "segments": [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00",
+                                  "embedding": [1.0, 0.0], "text": "hello"}]
+                }), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.dict(os.environ, {"HF_TOKEN": "test-token"}), \
+                    mock.patch("hud.diarization.shutil.which", return_value="whisperx"), \
+                    mock.patch("hud.diarization.subprocess.run", side_effect=fake_run):
+                result = run_post_call_diarization(
+                    audio, [], root / "derived", cfg, lambda _m: None,
+                    mappings={"remote": {"label": "Sarah", "source": "user"}})
+            self.assertEqual(result["voice_profiles_enrolled"][0]["label"], "Sarah")
+            self.assertEqual(result["segments"][0]["speaker_source"], "user")
 
     def test_session_stop_finalizes_folder_and_metadata(self) -> None:
         from hud.session import LiveSession
