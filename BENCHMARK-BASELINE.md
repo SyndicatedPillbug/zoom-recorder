@@ -53,3 +53,17 @@ correct first stable word with low post-window publication cost. Stable-only WER
 must not be used to claim final transcription quality. Any candidate interim
 setting must beat this control on a broader corpus without violating the final
 Turbo WER or queue/drop gates.
+
+## Synthetic non-speech safety run
+
+The deterministic silence/noise fixtures were generated with
+`hud.synthetic_fixtures` and run through `hud.benchmark_suite` using the local
+`base.en` model. The AMI speech fixture was explicitly recorded as skipped in
+this run because its external WAV was not provisioned in the asset directory.
+
+| Fixture | Observations | Filtered hallucinations | Committed words |
+| --- | ---: | ---: | ---: |
+| synthetic silence, 10 seconds | 0 | 8 | 0 |
+| seeded low-level noise, 10 seconds | 0 | 0 | 0 |
+
+These results are safety evidence only; they are not speech accuracy results.

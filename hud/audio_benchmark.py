@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .benchmark_manifest import write_result
 from .evaluation import word_error_stats
-from .stt import LocalWhisperSTT, StablePartialDecoder
+from .stt import LocalWhisperSTT, StablePartialDecoder, looks_hallucinated
 
 
 def _percentile(values: List[float], percentile: float) -> Optional[float]:
@@ -82,6 +82,7 @@ def run_benchmark(audio: Path, model: Path, reference: Optional[Path] = None,
     committed: List[str] = []
     inference_seconds: List[float] = []
     observations = 0
+    hallucination_filtered = 0
     latest_hypothesis = ""
     first_stable_word: Optional[str] = None
     first_stable_window_end: Optional[float] = None
@@ -115,6 +116,9 @@ def run_benchmark(audio: Path, model: Path, reference: Optional[Path] = None,
             inference = published - request_started
             inference_seconds.append(inference)
             text = str(getattr(result, "text", "") or "").strip()
+            if text and looks_hallucinated(text, marginal=True):
+                hallucination_filtered += 1
+                text = ""
             if text:
                 observations += 1
                 stable = decoder.accept(text)
@@ -144,6 +148,7 @@ def run_benchmark(audio: Path, model: Path, reference: Optional[Path] = None,
         "interval_seconds": interval_seconds,
         "paced": pace,
         "observations": observations,
+        "hallucination_filtered": hallucination_filtered,
         "committed_words": len(committed_text.split()),
         "first_stable_word": first_stable_word,
         "first_stable_window_end_seconds": first_stable_window_end,

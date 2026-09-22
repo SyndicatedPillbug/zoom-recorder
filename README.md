@@ -611,6 +611,16 @@ python3 -m hud.benchmark_suite fixtures/manifest.json \
 The suite fails on missing assets by default. `--allow-missing` records them as
 skipped so an incomplete corpus cannot be mistaken for a clean accuracy run.
 
+Provision the deterministic non-speech safety fixtures with:
+
+```bash
+python3 -m hud.synthetic_fixtures \
+  --output-dir /tmp/zoom-recorder-fixtures
+```
+
+These fixtures test silence/noise hallucination handling only; they are not
+evidence of speech recognition accuracy.
+
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your
 `.md` files) is sent to the answer provider. If `kb.embed_backend` is `openai`,

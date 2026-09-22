@@ -29,7 +29,8 @@ from hud.answers import (AnswerEngine, Turn, detect_question_text,  # noqa: E402
                          estimate_tokens, grounded_in, parse_answer_claims,
                          verify_answer_claims, is_ambiguous_question, parse_bullets,
                          parse_point_objects)
-from hud.audio_benchmark import _load_reference, _percentile, _window_reference  # noqa: E402
+from hud.audio_benchmark import (_load_reference, _percentile, _window_reference,
+                                 run_benchmark)  # noqa: E402
 from hud.benchmark_manifest import ManifestError, load_manifest, write_result  # noqa: E402
 from hud.benchmark_suite import run_suite  # noqa: E402
 from hud.budget import BudgetGovernor  # noqa: E402
@@ -50,11 +51,12 @@ from hud.menu_state import describe  # noqa: E402
 from hud.replay import benchmark, replay, write_jsonl  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
-from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, _Source,  # noqa: E402
+from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, STTResult, _Source,  # noqa: E402
                      frame_rms_dbfs, StablePartialDecoder, fuzzy_overlap,
                      looks_hallucinated,
                      overlap_suffix_prefix,
                      pcm_to_wav, split_words)
+from hud.synthetic_fixtures import write_fixture  # noqa: E402
 from hud.transcript_writeback import TranscriptWriteback  # noqa: E402
 from hud.voice_profiles import VoiceProfileStore  # noqa: E402
 from hud.vad import EnergyVAD, NoiseFloor, build_vad, frame_level_dbfs  # noqa: E402
@@ -962,7 +964,8 @@ class MemoryAndReplayTests(unittest.TestCase):
     def test_benchmark_manifest_loads_external_audio_without_claiming_readiness(self) -> None:
         manifest = Path(__file__).resolve().parent.parent / "fixtures/manifest.json"
         specs = load_manifest(manifest)
-        self.assertEqual([spec.fixture_id for spec in specs], ["ami-es2002a-50-80"])
+        self.assertEqual([spec.fixture_id for spec in specs], [
+            "ami-es2002a-50-80", "synthetic-silence-10s", "synthetic-noise-10s"])
         self.assertFalse(specs[0].audio_exists)
         self.assertTrue(specs[0].reference_exists)
         with self.assertRaises(ManifestError):
@@ -970,6 +973,8 @@ class MemoryAndReplayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             audio = Path(tmp) / "ami-es2002a-50-80.wav"
             audio.write_bytes(b"external fixture")
+            (Path(tmp) / "synthetic-silence-10s.wav").write_bytes(b"silence fixture")
+            (Path(tmp) / "synthetic-noise-10s.wav").write_bytes(b"noise fixture")
             ready = load_manifest(manifest, require_files=True, asset_root=Path(tmp))
             self.assertTrue(ready[0].audio_exists)
 
@@ -1010,6 +1015,34 @@ class MemoryAndReplayTests(unittest.TestCase):
             self.assertEqual(suite["skipped_count"], 1)
             self.assertEqual(suite["results"][0]["fixture_id"], "speech")
             self.assertEqual(suite["skipped"][0]["reason"], "audio_missing")
+
+    def test_synthetic_safety_fixture_is_deterministic_pcm(self) -> None:
+        import wave
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = write_fixture(Path(tmp) / "first.wav", "noise", 0.25, seed=11)
+            second = write_fixture(Path(tmp) / "second.wav", "noise", 0.25, seed=11)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with wave.open(str(first), "rb") as audio:
+                self.assertEqual(audio.getnchannels(), 1)
+                self.assertEqual(audio.getsampwidth(), 2)
+                self.assertEqual(audio.getframerate(), 16000)
+                self.assertEqual(audio.getnframes(), 4000)
+
+    def test_audio_benchmark_filters_blank_audio_at_consumption(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "silence.wav"
+            audio.write_bytes(pcm_to_wav(tone(4.0)))
+            fake_backend = mock.Mock()
+            fake_backend.transcribe.return_value = STTResult("[BLANK_AUDIO]")
+            with mock.patch("hud.audio_benchmark.LocalWhisperSTT",
+                            return_value=fake_backend):
+                result = run_benchmark(audio, Path(tmp) / "model.bin",
+                                       window_seconds=4.0, interval_seconds=1.0,
+                                       pace=False)
+            self.assertEqual(result["observations"], 0)
+            self.assertEqual(result["hallucination_filtered"], 1)
+            self.assertEqual(result["committed_text"], "")
 
     def test_audio_benchmark_percentile_is_deterministic(self) -> None:
         self.assertEqual(_percentile([0.2, 0.1, 0.4, 0.3], 50), 0.2)
