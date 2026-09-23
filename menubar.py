@@ -26,6 +26,9 @@ import subprocess
 import sys
 import threading
 import time
+import json
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 from pathlib import Path
 from typing import Optional
 
@@ -68,6 +71,15 @@ def audio_menu_specs(outputs, paired):
     specs.append((None, None))
     specs.append(("Rebuild Routing", None))
     return specs
+
+
+def hud_endpoint_url(base: str, path: str) -> str:
+    """Append a local HUD route without dropping its per-run query token."""
+    parts = urlsplit(base)
+    root = parts.path.rstrip("/")
+    route = path if path.startswith("/") else "/" + path
+    return urlunsplit((parts.scheme, parts.netloc, root + route,
+                       parts.query, parts.fragment))
 
 
 def populate_submenu(parent_item, entries) -> None:
@@ -142,6 +154,33 @@ class RecorderApp(rumps.App):
         self.toggle_item = rumps.MenuItem("Start recording", callback=self.toggle)
         self.live_item = rumps.MenuItem("Start with live transcript", callback=self.start_live)
         self.open_hud_item = rumps.MenuItem("Open transcript window", callback=self.open_hud)
+        self.assistant_item = rumps.MenuItem("Live assistant")
+        self.pause_answers_item = rumps.MenuItem("Pause answers", callback=self.toggle_answers)
+        self.answer_settings_item = rumps.MenuItem(
+            "Answer and context settings…",
+            callback=lambda _s: self.open_control("settings"))
+        self.speaker_settings_item = rumps.MenuItem(
+            "Diarization and speaker labels…",
+            callback=lambda _s: self.open_control("settings"))
+        self.context_speaker_item = rumps.MenuItem(
+            "Diarization and speaker labels…",
+            callback=lambda _s: self.open_control("settings"))
+        self.hud_item = rumps.MenuItem("HUD: Window")
+        self.hud_window_item = rumps.MenuItem(
+            "Window (stable panel)", callback=lambda _s: self.set_hud_mode("window"))
+        self.hud_glass_item = rumps.MenuItem(
+            "Glass HUD overlay", callback=lambda _s: self.set_hud_mode("glass"))
+        self.hud_compact_item = rumps.MenuItem(
+            "Compact Glass layout", callback=self.toggle_hud_compact)
+        self.hud_settings_item = rumps.MenuItem(
+            "More HUD settings…", callback=lambda _s: self.open_control("settings"))
+        self.context_item = rumps.MenuItem("Transcript and context")
+        self.writeback_item = rumps.MenuItem(
+            "Transcript writeback settings…",
+            callback=lambda _s: self.open_control("settings"))
+        self.kb_item = rumps.MenuItem(
+            "Knowledge-base and Obsidian settings…",
+            callback=lambda _s: self.open_control("settings"))
         self.recordings_item = rumps.MenuItem("My recordings…",
                                               callback=lambda _s: self.open_control("recordings"))
         self.setup_item = rumps.MenuItem("Check my audio setup…",
@@ -152,10 +191,11 @@ class RecorderApp(rumps.App):
                                         callback=lambda _s: self.open_control("help"))
         self.audio_item = rumps.MenuItem("Play sound through")
         self.quit_item = rumps.MenuItem("Quit zoom-recorder", callback=self.quit_app)
-        self.menu = [self.volume_item, self.toggle_item, self.live_item,
-                     self.open_hud_item, None,
+        self.menu = [self.volume_item, self.toggle_item, self.assistant_item,
+                     self.hud_item, self.context_item, None,
                      self.recordings_item, self.setup_item, self.settings_item,
                      self.help_item, None, self.audio_item, None, self.quit_item]
+        self._answers_paused = False
         self._audio_sig = None
         self._volume_value = None
         self._volume_muted = None
@@ -194,14 +234,112 @@ class RecorderApp(rumps.App):
                 elapsed = 0.0
         state = describe(recording, self._hud_active(), elapsed_s=elapsed,
                          live_available=live_transcript_available(), stopping=stopping)
+        if not state["open_enabled"] and not recording:
+            self._answers_paused = False
         self.title = state["icon"]
         self.toggle_item.title = state["toggle_title"]
         self.toggle_item.set_callback(None if state["stopping"] else self.toggle)
         self.live_item.title = state["live_title"]
         self.live_item.set_callback(self.start_live if state["live_enabled"] else None)
         self.open_hud_item.set_callback(self.open_hud if state["open_enabled"] else None)
+        self.pause_answers_item.title = "Resume answers" if self._answers_paused else "Pause answers"
+        self.pause_answers_item.set_callback(
+            self.toggle_answers if state["open_enabled"] else None)
+        try:
+            from hud.config import load_config
+            cfg = load_config()
+            mode = cfg.hud_mode if cfg.hud_mode in ("window", "glass") else "window"
+            self.hud_item.title = "HUD: {}".format(
+                "Glass overlay" if mode == "glass" else "Window")
+            self.hud_window_item.title = ("✓ " if mode == "window" else "") + "Window (stable panel)"
+            self.hud_glass_item.title = ("✓ " if mode == "glass" else "") + "Glass HUD overlay"
+            self.hud_compact_item.title = ("✓ " if cfg.hud_compact else "") + "Compact Glass layout"
+            self.hud_compact_item.set_callback(self.toggle_hud_compact)
+            writeback = cfg.transcript_writeback_dir
+            self.writeback_item.title = (
+                "Transcript writeback: configured" if writeback
+                else "Transcript writeback settings…")
+        except Exception:  # noqa: BLE001 - menu must survive malformed config
+            pass
+        populate_submenu(self.assistant_item, [
+            self.live_item, self.open_hud_item, None,
+            self.pause_answers_item, self.answer_settings_item,
+            self.speaker_settings_item,
+        ])
+        populate_submenu(self.hud_item, [
+            self.hud_window_item, self.hud_glass_item, None,
+            self.hud_compact_item, self.hud_settings_item,
+        ])
+        populate_submenu(self.context_item, [
+            self.writeback_item, self.kb_item,
+            self.context_speaker_item,
+        ])
         self._sync_volume_if_changed()
         self._sync_audio_menu()
+
+    def _hud_request(self, path: str, payload=None):
+        """Call the active local HUD using its per-run token, if available."""
+        if not HUD_URLFILE.is_file():
+            return None
+        try:
+            base = HUD_URLFILE.read_text(encoding="utf-8").strip()
+            if not base:
+                return None
+            url = hud_endpoint_url(base, path)
+            if payload is None:
+                request = Request(url, method="GET")
+            else:
+                request = Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+            with urlopen(request, timeout=1.5) as response:
+                body = response.read().decode("utf-8")
+            value = json.loads(body)
+            return value if isinstance(value, dict) else None
+        except Exception:  # noqa: BLE001 - a closed HUD is not a menu error
+            return None
+
+    def toggle_answers(self, _sender) -> None:
+        snapshot = self._hud_request("/state")
+        if snapshot is None:
+            rumps.notification("zoom-recorder", "Live assistant",
+                               "Start a live recording before changing answer mode.")
+            return
+        meta = snapshot.get("meta") or {}
+        paused = not bool(meta.get("answers_paused", self._answers_paused))
+        result = self._hud_request("/pause", {"paused": paused})
+        if result and result.get("ok"):
+            self._answers_paused = paused
+            rumps.notification(
+                "zoom-recorder", "Live assistant",
+                "Answers paused." if paused else "Answers resumed.")
+        else:
+            rumps.notification("zoom-recorder", "Live assistant",
+                               "The live assistant did not respond.")
+        self._sync_ui()
+
+    def _save_config_change(self, title: str, change) -> None:
+        try:
+            from hud.config import load_config, save_config
+            cfg = load_config()
+            change(cfg)
+            save_config(cfg)
+            rumps.notification("zoom-recorder", title, "Saved for the next recording.")
+            self._sync_ui()
+        except Exception as exc:  # noqa: BLE001 - settings should never kill the menu bar
+            rumps.notification("zoom-recorder", title, str(exc))
+
+    def set_hud_mode(self, mode: str) -> None:
+        if mode not in ("window", "glass"):
+            return
+        self._save_config_change(
+            "HUD appearance", lambda cfg: setattr(cfg, "hud_mode", mode))
+
+    def toggle_hud_compact(self, _sender) -> None:
+        self._save_config_change(
+            "HUD appearance", lambda cfg: setattr(cfg, "hud_compact", not cfg.hud_compact))
 
     def open_control(self, tab: str) -> None:
         """Open the Control Center (Setup/Recordings/Settings/Help).

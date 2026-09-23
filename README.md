@@ -158,8 +158,14 @@ that could record something by accident. The icon shows three states —
 ```
 Volume 44%                                   (top-level: slider, ±5%, mute, presets)
 Start recording      ↔ Stop recording (12:34)
-Start with live transcript → Live transcript active ✓   (disabled while recording)
-Open transcript window                                   (enabled while it runs)
+Live assistant ▸
+  Start with live transcript → Live transcript active ✓ (disabled while recording)
+  Open transcript window                                (enabled while it runs)
+  Pause/resume answers                                  (live HUD only)
+  Answer and context settings…
+  Diarization and speaker labels…
+HUD: Window ▸                                          (Window / Glass / compact)
+Transcript and context ▸                               (writeback / Obsidian / speakers)
 My recordings…                                           (Control Center → Recordings)
 Check my audio setup…                                    (Control Center → Setup)
 Settings…                                                (Control Center → Settings)
@@ -177,9 +183,14 @@ Help. Setup also has **Save redacted diagnostics**, which writes a local report
 of checks and safe configuration/status metadata without transcript, audio, or
 API-key values. The first run opens Setup automatically and runs the audio check.
 
-Click "Stop recording" to send the same clean-shutdown signal Ctrl+C would;
-**Open transcript window** re-opens the window in the browser (you can also
-stop the recording from that window's **Stop recording** button).
+Click "Stop recording" to send the same clean-shutdown signal Ctrl+C would.
+**Live assistant** now groups the live transcript, answer pause/resume, and
+speaker controls. **HUD: Window** lets you choose the stable native panel or
+the translucent Glass HUD, with a compact layout option. **Transcript and
+context** keeps writeback, knowledge-base/Obsidian context, and diarization
+settings discoverable without opening the full settings form. Menu changes to
+HUD appearance are saved for the next recording; the answer pause/resume
+shortcut applies immediately to the active live HUD.
 
 The status icon is intentionally a **single glyph** (🎙 / 🔴 / 🧠) to keep it
 narrow. On MacBooks with a notch, macOS hides menu-bar items that don't fit,

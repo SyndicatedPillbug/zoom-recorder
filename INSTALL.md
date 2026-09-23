@@ -33,7 +33,12 @@ Look for 🎙 in the menu bar. Everything a non-technical user needs is there:
 
 - **Volume 44%** — top-level volume (slider, ±5%, mute, presets).
 - **Start recording** / **Stop recording (mm:ss)**.
-- **Open transcript window** — while a live transcript is running.
+- **Live assistant ▸** — start the live transcript, reopen its HUD, pause or
+  resume answers, and reach answer/diarization settings.
+- **HUD: Window ▸** — choose the stable native panel, Glass HUD overlay, or
+  compact Glass layout. Appearance changes apply to the next recording.
+- **Transcript and context ▸** — configure transcript writeback, Obsidian or
+  knowledge-base context, and speaker handling.
 - **My recordings…** — the Control Center's list of past recordings.
 - **Check my audio setup…** — guided checks with one-click fixes.
 - **Settings…** — the essentials (advanced form behind one button).

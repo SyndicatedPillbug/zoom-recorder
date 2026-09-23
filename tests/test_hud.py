@@ -2998,6 +2998,16 @@ class RoutingFixTests(unittest.TestCase):
 
 
 class AudioMenuTests(unittest.TestCase):
+    def test_hud_endpoint_preserves_auth_token(self) -> None:
+        from menubar import hud_endpoint_url
+
+        self.assertEqual(
+            hud_endpoint_url("http://127.0.0.1:4123/?token=secret", "/state"),
+            "http://127.0.0.1:4123/state?token=secret")
+        self.assertEqual(
+            hud_endpoint_url("http://127.0.0.1:4123/hud/?token=secret", "pause"),
+            "http://127.0.0.1:4123/hud/pause?token=secret")
+
     def test_specs_mark_current_pairing(self) -> None:
         from menubar import audio_menu_specs
 
