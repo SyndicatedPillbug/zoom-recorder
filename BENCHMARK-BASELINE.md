@@ -58,12 +58,15 @@ Turbo WER or queue/drop gates.
 
 The deterministic silence/noise fixtures were generated with
 `hud.synthetic_fixtures` and run through `hud.benchmark_suite` using the local
-`base.en` model. The AMI speech fixture was explicitly recorded as skipped in
-this run because its external WAV was not provisioned in the asset directory.
+`base.en` model alongside the provisioned AMI speech slice. The complete run
+finished 3/3 fixtures with zero skips.
 
 | Fixture | Observations | Filtered hallucinations | Committed words |
 | --- | ---: | ---: | ---: |
+| AMI ES2002a speech, 30 seconds | 33 | 0 | 44 |
 | synthetic silence, 10 seconds | 0 | 8 | 0 |
 | seeded low-level noise, 10 seconds | 0 | 0 | 0 |
 
-These results are safety evidence only; they are not speech accuracy results.
+The AMI rolling stable-only WER in this run was 49.33%; it is tail-biased and
+does not replace the whole-slice final-quality WER above. The silence/noise
+rows are safety evidence only, not speech accuracy results.
