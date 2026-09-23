@@ -2,7 +2,8 @@
 
 Status: active roadmap  
 Updated: 2026-09-22  
-Current baseline: `v2.7`
+Reference baseline: `v2.7`
+Latest shipped tag: `v2.8.14`
 
 This project is an app-agnostic meeting recorder and live conversation assistant. It must work
 with Zoom, Meet, Teams, Jitsi, browser calls, phone audio, and locally played recordings without
@@ -21,8 +22,14 @@ The most important foundations are now in place:
 - Revision-safe evidence boundaries prevent provisional text from contaminating saved transcripts,
   retrieval, memory extraction, or answers.
 - Stable-partial publication, writeback, Obsidian indexing, structured memory, identity editing,
-  diarization planning, Groq fallback behavior, replay, and latency instrumentation exist in
-  various implemented stages.
+  non-blocking diarization, Groq fallback behavior, replay, and latency instrumentation are
+  implemented and covered by deterministic lifecycle/replay tests.
+- The current release line has a 242-test green regression suite, 100/100 normal lifecycle runs,
+  20/20 injected-failure runs, forced-stop/restart coverage, and a manifest-driven benchmark
+  package.
+- Obsidian retrieval is hybrid and bounded: frontmatter/wikilinks are preserved, metadata can
+  rerank results, optional tag scope is exposed in Settings, unchanged vaults use a file-stat fast
+  path, interrupted indexing resumes from completed file caches, and the HUD shows retrieval time.
 - The aligned AMI 50–80 second slice currently measures Turbo at 20.0% WER and `base.en` at
   21.3% WER. The rolling benchmark shows that a 2-second interim window produced a wrong first
   stable word while 4 seconds produced the correct first word with roughly 0.13 seconds from
@@ -33,11 +40,12 @@ The largest remaining risks are not simply model speed:
 1. The benchmark corpus is too small to support aggressive tuning.
 2. The complete capture-to-shutdown lifecycle still needs a controlled, repeatable end-to-end
    test with real audio flowing through every lane.
-3. Answer latency and prompt/context costs need a single trace that separates capture, STT,
-   evidence finalization, retrieval, prompt assembly, provider queueing, and time-to-first-token.
-4. Participant attribution must remain optional and off the critical transcription path.
-5. The Obsidian vault needs ranked, bounded, provenance-preserving retrieval rather than simply
-   being made available wholesale.
+3. Long-replay answer aggregation, active-question reconstruction quality, and stable prompt-prefix
+   caching still need measured optimization; individual answer traces now exist.
+4. Participant quality still needs labeled two-speaker fixtures and speaker-error measurements;
+   attribution remains optional and off the critical transcription path.
+5. Permission recovery, redacted one-click diagnostics, adverse-environment recovery, and local
+   privacy/deletion verification need a final operational pass.
 
 ## Operating principles
 
@@ -184,6 +192,12 @@ Exit criteria:
 - Permission failures explain the exact fix instead of surfacing raw filesystem errors.
 - Offline recording and final transcription still work with retrieval disabled.
 
+Current status: bounded hybrid retrieval, optional tag scoping, provenance-preserving snippets,
+file-stat cache validation, and resumable per-file embedding checkpoints are shipped. The
+synthetic 6,000-chunk benchmark records 116.7 ms p50 / 210.3 ms p95 unscoped and 30.2 ms p50 /
+48.0 ms p95 with `enterprise` tag scope on the benchmark host. Target-machine measurements and
+permission recovery remain open.
+
 ## Phase 5 — Participant attribution and diarization
 
 Goal: improve speaker-aware transcripts for any call source while keeping the hot path safe.
@@ -215,6 +229,11 @@ Exit criteria:
 - Diarization can be disabled per run.
 - The transcript clearly distinguishes inferred, manually confirmed, and unknown speakers.
 
+Current status: the attribution worker is post-call and failure-safe; manual labels persist
+through session artifacts, replay, and writeback; reusable voice profiles are opt-in and
+owner-only. Derived diarization output includes unknown/generic/manual/profile rates and
+processing real-time factor. Labeled speaker-error fixtures remain open.
+
 Do not put WhisperX-style or other heavy diarization in the live hot path until it has passed the
 same lifecycle and latency gates as transcription.
 
@@ -242,6 +261,11 @@ Exit criteria:
 - The UI communicates what is live, provisional, final, inferred, and saved.
 - The common permission and model failures have actionable recovery paths.
 - Performance settings are understandable presets, not unexplained tuning knobs.
+
+Current status: Settings exposes audio, models, providers, writeback, Obsidian folders,
+diarization, and retrieval budgets/scope. The HUD exposes transcript/answer state, editable
+speaker labels, and technical latency details. One-click redacted diagnostics and integrated
+permission recovery remain open.
 
 ## Phase 7 — Privacy, security, and operational hardening
 
@@ -292,16 +316,17 @@ Before moving to the next major phase, use these gates:
 
 ## Recommended immediate sequence
 
-1. Complete Phase 0 with the expanded benchmark manifest and stable-prefix timing definitions.
-2. Build the controlled end-to-end audio-file lifecycle harness and pass Phase 1.
-3. Add the unified latency trace for Phase 3, including provider time-to-first-token and prompt
-   assembly size.
-4. Tune interim windows/local agreement using the larger corpus; keep 4 seconds as the safe default
-   unless the 3-second gate passes.
-5. Harden incremental Obsidian retrieval and permission recovery.
-6. Finish the non-blocking participant/diarization reconciliation flow and manual label feedback.
-7. Perform the UX pass over the now-measured, reliable system.
-8. Reassess packaging only after the above work is stable.
+1. Provision a broader timestamped speech and two-speaker corpus, then rerun interim/model gates
+   without changing the Turbo final baseline.
+2. Run the controlled end-to-end audio-file lifecycle harness through capture, STT, answers,
+   writeback, shutdown, and restart with real audio plumbing.
+3. Aggregate answer traces over long replays and measure active-question reconstruction, talking
+   point isolation, and provider fallback behavior.
+4. Complete permission recovery and one-click redacted diagnostics in the control center.
+5. Add labeled diarization fixtures and measure speaker error, unknown rate, corrections, and
+   added post-call latency.
+6. Run adverse-environment tests and local privacy/deletion verification.
+7. Reassess packaging only after the above work is stable.
 
 ## Non-goals for this cycle
 
