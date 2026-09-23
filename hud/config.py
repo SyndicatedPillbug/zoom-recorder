@@ -177,6 +177,7 @@ class HudConfig:
     stt_no_speech_prob_max: float = 0.75
     stt_avg_logprob_min: float = -1.5
     stt_compression_ratio_max: float = 2.4
+    stt_speech_activity_min: float = 0.20
     stt_hallucination_filter: bool = True
     stt_context_prompt: bool = True    # seed Whisper with previous transcript
     # Local-only rolling interim recognition. Partial text is UI-only until it
@@ -336,6 +337,7 @@ def _defaults() -> Dict[str, Any]:
             "no_speech_prob_max": 0.75,
             "avg_logprob_min": -1.5,
             "compression_ratio_max": 2.4,
+            "speech_activity_min": 0.20,
             "hallucination_filter": True,
             "context_prompt": True,
             "partial_enabled": True,
@@ -459,6 +461,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_no_speech_prob_max=_as_float(stt.get("no_speech_prob_max"), 0.75),
         stt_avg_logprob_min=_as_float(stt.get("avg_logprob_min"), -1.5),
         stt_compression_ratio_max=_as_float(stt.get("compression_ratio_max"), 2.4),
+        stt_speech_activity_min=_as_float(stt.get("speech_activity_min"), 0.20),
         stt_hallucination_filter=bool(stt.get("hallucination_filter", True)),
         stt_context_prompt=bool(stt.get("context_prompt", True)),
         stt_partial_enabled=bool(stt.get("partial_enabled", True)),
@@ -561,6 +564,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "no_speech_prob_max": cfg.stt_no_speech_prob_max,
         "avg_logprob_min": cfg.stt_avg_logprob_min,
         "compression_ratio_max": cfg.stt_compression_ratio_max,
+        "speech_activity_min": cfg.stt_speech_activity_min,
         "hallucination_filter": cfg.stt_hallucination_filter,
         "context_prompt": cfg.stt_context_prompt,
         "partial_enabled": cfg.stt_partial_enabled,

@@ -134,9 +134,11 @@ def looks_hallucinated(text: str, marginal: bool = False,
                        avg_logprob: Optional[float] = None,
                        no_speech_prob: Optional[float] = None,
                        compression_ratio: Optional[float] = None,
+                       speech_activity_ratio: Optional[float] = None,
                        no_speech_prob_max: float = 0.75,
                        avg_logprob_min: float = -1.5,
-                       compression_ratio_max: float = 2.4) -> bool:
+                       compression_ratio_max: float = 2.4,
+                       speech_activity_min: float = 0.20) -> bool:
     """Heuristic filter for Whisper's non-speech output.
 
     Catches known silence phrases, repetitive loops, and low-confidence
@@ -171,6 +173,15 @@ def looks_hallucinated(text: str, marginal: bool = False,
                 return True
 
     if marginal:
+        # A short result from a mostly non-speech window is not supported by
+        # enough acoustic evidence, even when its words look plausible. The
+        # chunker already requires some speech before emitting; this catches
+        # the remaining case where a brief noise/hum burst is surrounded by
+        # silence and Whisper fills the window with invented narration.
+        if (speech_activity_ratio is not None
+                and speech_activity_ratio < speech_activity_min
+                and len(words) <= 8):
+            return True
         # Whisper commonly invents slide-transition narration when a short
         # low-signal chunk gives it no lexical evidence. Keep this narrow and
         # marginal-only so a clearly spoken real sentence is never discarded.
@@ -347,6 +358,7 @@ class Chunker:
         self.vad = vad
         self.frame_bytes = int(frame_ms / 1000.0 * SAMPLE_RATE * SAMPLE_WIDTH)
         self.last_margin_db = 0.0
+        self.last_speech_ratio = 0.0
         self._buf = bytearray()
         self._speech_bytes = 0
         self._silence_run = 0
@@ -368,6 +380,8 @@ class Chunker:
 
     def _emit_target(self, pending: bytearray) -> bytes:
         """Emit a target-sized window while retaining a small audio overlap."""
+        self.last_speech_ratio = min(
+            1.0, self._speech_bytes / float(max(1, len(pending))))
         emit_bytes = min(len(pending), self.chunk_bytes)
         overlap_bytes = min(
             int(self.overlap_seconds * SAMPLE_RATE * SAMPLE_WIDTH),
@@ -413,6 +427,8 @@ class Chunker:
                 if len(pending) >= self.chunk_bytes:
                     out.append(self._emit_target(pending))
                 elif self._silence_run >= self.silence_flush_bytes:
+                    self.last_speech_ratio = min(
+                        1.0, self._speech_bytes / float(max(1, len(pending))))
                     out.append(bytes(pending))
                     pending.clear()
                     self._speech_bytes = 0
@@ -422,6 +438,8 @@ class Chunker:
                     # A natural phrase pause after enough speech: emit now for
                     # lower latency without adding a billed STT request (the
                     # provider bills a 10 s minimum anyway).
+                    self.last_speech_ratio = min(
+                        1.0, self._speech_bytes / float(max(1, len(pending))))
                     out.append(bytes(pending))
                     pending.clear()
                     self._speech_bytes = 0
@@ -431,6 +449,8 @@ class Chunker:
     def flush(self) -> Optional[bytes]:
         pending = getattr(self, "_pending", bytearray())
         if self._speech_bytes >= self.min_speech_bytes and len(pending) > SAMPLE_RATE:
+            self.last_speech_ratio = min(
+                1.0, self._speech_bytes / float(max(1, len(pending))))
             data = bytes(pending)
             pending.clear()
             self._speech_bytes = 0
@@ -1000,7 +1020,8 @@ class LiveTranscriber:
             for block in self._iter_blocks(source.proc.stdout):
                 self._feed_partial(source, block)
                 for chunk in chunker.feed(block):
-                    self._enqueue(source, chunk, chunker.last_margin_db)
+                    self._enqueue(source, chunk, chunker.last_margin_db,
+                                  chunker.last_speech_ratio)
                 # Publish the live level even when the gate is rejecting
                 # everything, so the HUD can show why nothing is transcribed.
                 now = time.time()
@@ -1009,7 +1030,8 @@ class LiveTranscriber:
                     self._publish_lag()
             tail = chunker.flush()
             if tail:
-                self._enqueue(source, tail, chunker.last_margin_db)
+                self._enqueue(source, tail, chunker.last_margin_db,
+                              chunker.last_speech_ratio)
         except Exception as exc:  # noqa: BLE001
             self.log("live transcription loop stopped ({}): {}".format(
                 source.speaker or "mixed", exc))
@@ -1021,10 +1043,12 @@ class LiveTranscriber:
                 return
             yield data
 
-    def _enqueue(self, source: _Source, chunk: bytes, margin_db: float = 0.0) -> None:
+    def _enqueue(self, source: _Source, chunk: bytes, margin_db: float = 0.0,
+                 speech_activity_ratio: Optional[float] = None) -> None:
         if self._stop.is_set():
             return
-        item = (time.time(), chunk, margin_db)
+        item = ((time.time(), chunk, margin_db) if speech_activity_ratio is None
+                else (time.time(), chunk, margin_db, speech_activity_ratio))
         try:
             source.queue.put_nowait(item)
         except queue.Full:
@@ -1069,8 +1093,13 @@ class LiveTranscriber:
                 continue
             if item is None:
                 break
-            captured_at, chunk, margin_db = item
-            self._transcribe_chunk(chunk, source, captured_at, margin_db)
+            if len(item) >= 4:
+                captured_at, chunk, margin_db, speech_activity_ratio = item
+            else:  # Backward-compatible with tests and older in-memory callers.
+                captured_at, chunk, margin_db = item
+                speech_activity_ratio = None
+            self._transcribe_chunk(chunk, source, captured_at, margin_db,
+                                   speech_activity_ratio)
 
     def _feed_partial(self, source: "_Source", block: bytes) -> None:
         """Queue the newest short rolling window without blocking capture."""
@@ -1245,7 +1274,8 @@ class LiveTranscriber:
 
     def _transcribe_chunk(self, chunk: bytes, source: "_Source",
                           captured_at: Optional[float] = None,
-                          margin_db: float = 0.0) -> None:
+                          margin_db: float = 0.0,
+                          speech_activity_ratio: Optional[float] = None) -> None:
         if self._stop.is_set():
             return
         if (self.cfg.stt_backend or "").lower() not in LOCAL_STT_BACKENDS:
@@ -1296,8 +1326,11 @@ class LiveTranscriber:
                 compression_ratio=result.compression_ratio,
                 no_speech_prob_max=self.cfg.stt_no_speech_prob_max,
                 avg_logprob_min=self.cfg.stt_avg_logprob_min,
-                compression_ratio_max=self.cfg.stt_compression_ratio_max):
-            self.log("live STT: dropped likely hallucination ({!r}...)".format(text[:40]))
+                compression_ratio_max=self.cfg.stt_compression_ratio_max,
+                speech_activity_ratio=speech_activity_ratio,
+                speech_activity_min=self.cfg.stt_speech_activity_min):
+            self.log("live STT: dropped likely hallucination ({!r}..., speech {:.0%})".format(
+                text[:40], speech_activity_ratio if speech_activity_ratio is not None else 0.0))
             return
         self._publish_committed(source, text, started, finalized=True,
                                 captured_at=captured_at)

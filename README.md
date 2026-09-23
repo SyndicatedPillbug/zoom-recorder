@@ -343,8 +343,10 @@ published segment to carry passing `no_speech_prob` / `avg_logprob` /
 text is discarded rather than trusted. Remote providers use the same segment
 gate when they support `verbose_json`. The lightweight interim lane remains
 JSON-only for latency and is never itself authoritative. A second text filter
-drops repetition loops and canned silence phrases. The HUD then runs two
-independent streams:
+drops repetition loops and canned silence phrases. Final chunks also carry the
+VAD's speech-activity ratio; short text from a mostly silent window is rejected
+even if it happens to look plausible. The HUD then runs two independent
+streams:
 **questions** are detected across the recent conversation (not just the newest
 chunk), including indirect interview questions without a question mark and
 questions split across adjacent STT chunks. They are answered with the stronger
@@ -519,7 +521,8 @@ to drift minutes behind the call.
                "partial_model": "~/.cache/whisper-cpp/ggml-base.en.bin",
                "partial_window_seconds": 4, "partial_interval_seconds": 0.8,
                "glossary": ["Acme", "Q3"],
-               "vad_backend": "auto", "vad_margin_db": 6, "hallucination_filter": true},
+               "vad_backend": "auto", "vad_margin_db": 6,
+               "speech_activity_min": 0.20, "hallucination_filter": true},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
                "context_minutes": 5, "question_rewrite": true,
                "answer_self_questions": false, "summary_enabled": true,

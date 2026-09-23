@@ -503,6 +503,15 @@ class VADTests(unittest.TestCase):
         self.assertEqual(chunker.feed(hum * 2), [])  # 2s of steady hum
         self.assertTrue(chunker.feed(tone(1.2, freq=300.0, amp=12000)))
 
+    def test_chunker_reports_speech_activity_for_emitted_window(self) -> None:
+        chunker = Chunker(chunk_seconds=1.0, min_speech_seconds=0.2,
+                          silence_flush_seconds=0.4)
+        emitted = chunker.feed(tone(0.5, freq=300.0, amp=12000)
+                               + b"\x00\x00" * int(0.5 * 16000))
+        self.assertTrue(emitted)
+        self.assertGreater(chunker.last_speech_ratio, 0.0)
+        self.assertLessEqual(chunker.last_speech_ratio, 1.0)
+
     def test_energy_vad_non_adaptive_matches_old_gate(self) -> None:
         vad = EnergyVAD(absolute_db=-50.0, adaptive=False)
         self.assertFalse(vad.is_speech(tone(0.1, freq=300.0, amp=50)))
@@ -551,6 +560,14 @@ class HallucinationTests(unittest.TestCase):
             "Some plausible words here now", no_speech_prob=0.9))
         self.assertTrue(looks_hallucinated(
             "Some plausible words here now", compression_ratio=3.0))
+
+    def test_short_text_from_low_activity_window_is_dropped(self) -> None:
+        self.assertTrue(looks_hallucinated(
+            "I'm going to go to the next slide.", marginal=True,
+            speech_activity_ratio=0.08))
+        self.assertFalse(looks_hallucinated(
+            "The rollout starts tomorrow morning for everyone on Monday.", marginal=True,
+            speech_activity_ratio=0.08))
 
     def test_verbose_segments_filtered(self) -> None:
         from hud.llm import LLMResult
