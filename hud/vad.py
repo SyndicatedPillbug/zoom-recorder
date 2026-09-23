@@ -7,10 +7,11 @@ hallucinates repetitive filler on that non-speech audio. Instead we track a
 per-source adaptive noise floor and only treat energy clearly above it as
 speech.
 
-Detection uses *peak* level, which is what the recorder's original gate used
-and is far more forgiving of quiet call/loopback audio than RMS. ``webrtcvad``
-is used for a real VAD when installed; otherwise the stdlib energy detector is
-used, so nothing new is required.
+The stdlib detector uses RMS energy for the decision, with a peak/crest check
+to reject isolated clicks. This matters in practice: the benchmark recording
+had a high peak level from low-level noise but Whisper decoded it as repeated
+"Thank you" despite containing no supported speech. ``webrtcvad`` is used for
+a real VAD when installed; otherwise this dependency-free detector is used.
 """
 
 from __future__ import annotations
@@ -26,17 +27,27 @@ SAMPLE_WIDTH = 2
 def frame_level_dbfs(pcm: bytes) -> float:
     """Peak level in dBFS for a small PCM block (0 dB == full scale).
 
-    Peak (not RMS) keeps the gate sensitive to quiet speech, matching the
-    recorder's original behaviour; the adaptive floor handles steady noise.
+    This remains available for diagnostics and capture checks.
     """
+    return _frame_levels(pcm)[0]
+
+
+def frame_rms_dbfs(pcm: bytes) -> float:
+    """RMS level in dBFS, which is more stable than a single-sample peak."""
+    return _frame_levels(pcm)[1]
+
+
+def _frame_levels(pcm: bytes) -> tuple[float, float]:
     count = len(pcm) // SAMPLE_WIDTH
     if count <= 0:
-        return -120.0
+        return -120.0, -120.0
     samples = struct.unpack("<{}h".format(count), pcm[: count * SAMPLE_WIDTH])
     peak = max(abs(sample) for sample in samples)
-    if peak == 0:
-        return -120.0
-    return 20.0 * math.log10(peak / 32768.0)
+    mean_square = sum(sample * sample for sample in samples) / float(count)
+    if peak == 0 or mean_square <= 0.0:
+        return -120.0, -120.0
+    return (20.0 * math.log10(peak / 32768.0),
+            10.0 * math.log10(mean_square / (32768.0 * 32768.0)))
 
 
 class NoiseFloor:
@@ -71,7 +82,8 @@ class EnergyVAD:
 
     def __init__(self, absolute_db: float = -50.0, margin_db: float = 6.0,
                  adaptive: bool = True, calibration_frames: int = 10,
-                 max_rise_db: float = 30.0) -> None:
+                 max_rise_db: float = 30.0, speech_start_frames: int = 2,
+                 max_crest_db: float = 24.0) -> None:
         self.absolute_db = absolute_db
         self.margin_db = margin_db
         self.adaptive = adaptive
@@ -80,8 +92,12 @@ class EnergyVAD:
         self._noise = NoiseFloor(initial_db=absolute_db)
         self._calibrated = not adaptive or self.calibration_frames == 0
         self._calibration: List[float] = []
+        self.speech_start_frames = max(1, int(speech_start_frames))
+        self.max_crest_db = max(0.0, float(max_crest_db))
+        self._speech_run = 0
         self.last_margin_db = 0.0
         self.last_level_db = -120.0
+        self.last_peak_db = -120.0
 
     def threshold_db(self) -> float:
         if not self.adaptive:
@@ -90,7 +106,8 @@ class EnergyVAD:
         return max(self.absolute_db, floor + self.margin_db)
 
     def is_speech(self, frame: bytes) -> bool:
-        level = frame_level_dbfs(frame)
+        peak, level = _frame_levels(frame)
+        self.last_peak_db = peak
         self.last_level_db = level
         if not self._calibrated:
             # Ignore the first fraction of a second entirely: assume it is
@@ -100,14 +117,21 @@ class EnergyVAD:
             self._calibration.append(level)
             self.last_margin_db = 0.0
             if len(self._calibration) >= self.calibration_frames:
-                floor = min(self._calibration)
+                # Ignore one unusually quiet startup frame. A low percentile
+                # tracks the ambient bed without setting the floor to a peak.
+                ordered = sorted(self._calibration)
+                floor = ordered[min(len(ordered) - 1,
+                                    max(0, int(len(ordered) * 0.2)))]
                 self._noise.noise_db = max(self._noise.floor_db,
                                            min(self.max_noise_db, floor))
                 self._calibrated = True
             return False
 
         threshold = self.threshold_db()
-        speech = level > threshold
+        raw_speech = (level > threshold
+                      and (peak - level) <= self.max_crest_db)
+        self._speech_run = self._speech_run + 1 if raw_speech else 0
+        speech = raw_speech and self._speech_run >= self.speech_start_frames
         self.last_margin_db = level - threshold
         self._noise.update(level, self.margin_db)
         return speech

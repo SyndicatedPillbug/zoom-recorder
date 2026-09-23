@@ -63,7 +63,8 @@ from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, STTResult, _Sour
 from hud.synthetic_fixtures import write_fixture  # noqa: E402
 from hud.transcript_writeback import TranscriptWriteback  # noqa: E402
 from hud.voice_profiles import VoiceProfileStore  # noqa: E402
-from hud.vad import EnergyVAD, NoiseFloor, build_vad, frame_level_dbfs  # noqa: E402
+from hud.vad import (EnergyVAD, NoiseFloor, build_vad, frame_level_dbfs,
+                     frame_rms_dbfs)  # noqa: E402
 
 
 def tone(seconds: float, freq: float = 440.0, amp: int = 16000) -> bytes:
@@ -496,6 +497,8 @@ class VADTests(unittest.TestCase):
     def test_frame_level_dbfs(self) -> None:
         self.assertLess(frame_level_dbfs(b"\x00\x00" * 100), -100)
         self.assertGreater(frame_level_dbfs(tone(0.1)), -20)
+        self.assertLess(frame_rms_dbfs(tone(0.1, amp=1200)),
+                        frame_level_dbfs(tone(0.1, amp=1200)))
 
     def test_noise_floor_absorbs_steady_noise(self) -> None:
         nf = NoiseFloor(initial_db=-45.0)
@@ -511,7 +514,17 @@ class VADTests(unittest.TestCase):
         for _ in range(5):
             vad.is_speech(hum)
         self.assertFalse(vad.is_speech(hum))
+        self.assertFalse(vad.is_speech(speech))
         self.assertTrue(vad.is_speech(speech))
+
+    def test_energy_vad_rejects_low_level_click_bed(self) -> None:
+        vad = EnergyVAD(absolute_db=-50.0, margin_db=6.0, calibration_frames=10)
+        bed = tone(0.1, freq=120.0, amp=400)
+        click = b"\xff\x7f" + b"\x00\x00" * (1600 - 1)
+        for _ in range(10):
+            vad.is_speech(bed)
+        self.assertFalse(vad.is_speech(click))
+        self.assertFalse(vad.is_speech(bed))
 
     def test_build_vad_forced_energy(self) -> None:
         vad = build_vad(HudConfig(stt_vad_backend="energy"), lambda _m: None)
@@ -541,6 +554,7 @@ class VADTests(unittest.TestCase):
     def test_energy_vad_non_adaptive_matches_old_gate(self) -> None:
         vad = EnergyVAD(absolute_db=-50.0, adaptive=False)
         self.assertFalse(vad.is_speech(tone(0.1, freq=300.0, amp=50)))
+        self.assertFalse(vad.is_speech(tone(0.1, freq=300.0, amp=2000)))
         self.assertTrue(vad.is_speech(tone(0.1, freq=300.0, amp=2000)))
 
     def test_energy_vad_captures_quiet_speech(self) -> None:
@@ -549,7 +563,9 @@ class VADTests(unittest.TestCase):
         for _ in range(3):
             vad.is_speech(quiet)
         self.assertFalse(vad.is_speech(quiet))
-        self.assertTrue(vad.is_speech(tone(0.1, freq=300.0, amp=2000)))
+        quiet_speech = tone(0.1, freq=300.0, amp=2000)
+        self.assertFalse(vad.is_speech(quiet_speech))
+        self.assertTrue(vad.is_speech(quiet_speech))
 
 
 class HallucinationTests(unittest.TestCase):
