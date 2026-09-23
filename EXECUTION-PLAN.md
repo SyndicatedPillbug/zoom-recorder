@@ -146,6 +146,10 @@ manifest. Keep Turbo final and the 4-second interim setting as the control.
 Gate: a candidate wins only if it improves stable publication latency by at least 15% while staying
 within the final-WER and first-word gates and producing no queue growth.
 
+Current status: the 3-second candidate was rejected on the AMI control (wrong first stable word,
+34 committed words, 62.67% stable-only WER) versus the 4-second control (correct first word, 44
+committed words, 49.33% stable-only WER). The 4-second default remains in force.
+
 ### Step 2.3 — Compare model candidates
 
 Benchmark `base.en`, `small.en` if installed, and Turbo under identical settings. Investigate

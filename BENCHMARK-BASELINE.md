@@ -70,3 +70,17 @@ finished 3/3 fixtures with zero skips.
 The AMI rolling stable-only WER in this run was 49.33%; it is tail-biased and
 does not replace the whole-slice final-quality WER above. The silence/noise
 rows are safety evidence only, not speech accuracy results.
+
+## Interim-window decision: 3 seconds versus 4 seconds
+
+Same AMI slice, `base.en`, paced 0.8-second cadence, same hallucination filter:
+
+| Window | First stable word | Window-to-publication | Committed words | Stable-only WER |
+| ---: | --- | ---: | ---: | ---: |
+| 3 seconds | `Nice.` (wrong) | 0.133 seconds | 34 | 62.67% |
+| 4 seconds | `Okay.` (correct) | 0.115 seconds | 44 | 49.33% |
+
+The 3-second candidate is rejected. It is both less accurate at the opening
+boundary and less complete, while not improving publication latency. Keep the
+4-second interim default until a broader speech corpus produces a different
+result.
