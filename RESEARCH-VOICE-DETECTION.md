@@ -94,3 +94,20 @@ The present implementation keeps the low-latency adaptive energy path as the
 default, preserves quiet-speech sensitivity and the stronger Whisper evidence
 gates, and leaves RMS/neural VAD selection as an evidence-driven next phase
 rather than adding a model or hard gate without measured benefit.
+
+## Labeled speech/silence/click benchmark
+
+The follow-up recording is
+`2026-09-23/08-39-40_to-be-or-not-to-be_07c58449/.work/session_0001/seg_00000_mic.wav`.
+Its saved transcript provides a verifiable speech reference: repeated
+Hamlet passages, deliberate pauses, short isolated sounds, and later noisy
+test utterances. The capture is 233.93 seconds at 48 kHz; the saved session
+produced 216 transcript words with no STT drops.
+
+After normalization to the live detector's 16 kHz mono format, the current
+peak-sensitive gate classified 1,302 of 2,339 100 ms frames as speech
+(55.7%). It captured the sustained recitation regions and rejected most of the
+long silence, but produced 159 separate short speech regions around the
+click/noise portion. This is a useful result: quiet speech is no longer being
+silently lost, while the remaining false opens are measurable and justify the
+next neural/frequency-aware VAD experiment.

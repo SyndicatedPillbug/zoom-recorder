@@ -20,7 +20,7 @@ import sys
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from Foundation import NSObject
+from Foundation import NSMakeRect, NSObject
 
 
 def _load_frameworks() -> dict[str, Any]:
@@ -69,6 +69,70 @@ class _WindowDelegate(NSObject):
         # The Glass HUD is non-activating so clicks outside it return to the
         # meeting app, but its WebKit text field still needs keyboard focus.
         return True
+
+
+class _GlassRegionBridge(NSObject):
+    """Make only declared HUD controls receive mouse events.
+
+    WebKit renders the whole overlay as one native view. The page reports its
+    interactive rectangles here; the bridge converts them to screen space and
+    toggles the panel's native mouse transparency as the pointer moves. This
+    preserves true click-through over blank glass while keeping the question
+    field and arrange handles clickable.
+    """
+
+    def initWithWindow_(self, window: Any) -> Any:  # noqa: N802
+        import objc
+        self = objc.super(_GlassRegionBridge, self).init()
+        if self is not None:
+            self.window = window
+            self.webview = None
+            self.regions = []
+            self._ignores = False
+        return self
+
+    def setWebView_(self, webview: Any) -> None:  # noqa: N802
+        self.webview = webview
+
+    def userContentController_didReceiveScriptMessage_(  # noqa: N802
+            self, _controller: Any, message: Any) -> None:
+        body = message.body()
+        try:
+            values = body.get("regions", []) if hasattr(body, "get") else []
+            self.regions = [
+                (float(item.get("x", 0)), float(item.get("y", 0)),
+                 float(item.get("width", 0)), float(item.get("height", 0)))
+                for item in values if hasattr(item, "get")
+            ]
+        except (TypeError, ValueError):
+            self.regions = []
+        self.sync_mouse_transparency()
+
+    def sync_mouse_transparency(self) -> None:
+        if self.window is None or self.webview is None or not self.regions:
+            return
+        try:
+            content = self.window.contentView()
+            screen_rects = []
+            for x, y, width, height in self.regions:
+                local = NSMakeRect(x, y, width, height)
+                in_content = self.webview.convertRect_toView_(local, content)
+                screen_rects.append(self.window.convertRectToScreen_(in_content))
+            point = __import__("AppKit").NSEvent.mouseLocation()
+            interactive = any(
+                rect.origin.x <= point.x <= rect.origin.x + rect.size.width
+                and rect.origin.y <= point.y <= rect.origin.y + rect.size.height
+                for rect in screen_rects)
+            ignores = not interactive
+            if ignores != self._ignores:
+                self.window.setIgnoresMouseEvents_(ignores)
+                self._ignores = ignores
+        except Exception:  # noqa: BLE001 - click-through is non-critical
+            self.window.setIgnoresMouseEvents_(False)
+            self._ignores = False
+
+    def poll_(self, _timer: Any) -> None:  # noqa: N802
+        self.sync_mouse_transparency()
 
 
 def _with_surface_query(url: str, mode: str, opacity: float, compact: bool) -> str:
@@ -125,7 +189,10 @@ def run(url: str, title: str = "Meeting HUD", mode: str = "window",
         # recommends false when a panel has text fields; true can leave the
         # WebKit input visible but unable to become first responder.
         window.setBecomesKeyOnlyIfNeeded_(False)
-        window.setMovableByWindowBackground_(True)
+        # The page supplies its own drag handles for the independent HUD
+        # modules. Letting AppKit move the whole borderless panel from any
+        # background click prevents reliable click-through and text entry.
+        window.setMovableByWindowBackground_(False)
         window.setHasShadow_(True)
         window.setHidesOnDeactivate_(False)
         window.setOpaque_(False)
@@ -159,6 +226,10 @@ def run(url: str, title: str = "Meeting HUD", mode: str = "window",
         pass
 
     config = fw["WKWebViewConfiguration"].alloc().init()
+    bridge = None
+    if glass:
+        bridge = _GlassRegionBridge.alloc().initWithWindow_(window)
+        config.userContentController().addScriptMessageHandler_name_(bridge, "hudRegions")
     webview = fw["WKWebView"].alloc().initWithFrame_configuration_(
         window.contentView().bounds(), config)
     webview.setAutoresizingMask_(18)  # width + height sizable
@@ -171,6 +242,14 @@ def run(url: str, title: str = "Meeting HUD", mode: str = "window",
         fw["NSURL"].URLWithString_(_with_surface_query(url, mode, opacity, compact)))
     webview.loadRequest_(request)
     window.setContentView_(webview)
+    if bridge is not None:
+        bridge.setWebView_(webview)
+        # Keep polling even while another app owns the mouse. The native
+        # window becomes transparent over non-interactive page regions and
+        # re-enables events when the pointer reaches a control.
+        from AppKit import NSTimer
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.08, bridge, "poll:", None, True)
     window.setDelegate_(_WindowDelegate.alloc().init())
     window.makeKeyAndOrderFront_(None)
     app.activateIgnoringOtherApps_(True)

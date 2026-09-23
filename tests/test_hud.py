@@ -2651,6 +2651,20 @@ class SummaryTests(unittest.TestCase):
         source = Path("hud/native_window.py").read_text(encoding="utf-8")
         self.assertIn("window.setBecomesKeyOnlyIfNeeded_(False)", source)
         self.assertIn("def windowShouldBecomeKey_", source)
+        self.assertIn("window.setMovableByWindowBackground_(False)", source)
+        self.assertIn("setIgnoresMouseEvents_", source)
+        self.assertIn("hudRegions", source)
+
+    def test_glass_hud_has_independent_arrangeable_modules(self) -> None:
+        source = Path("hud/static/hud.html").read_text(encoding="utf-8")
+        for module in ("transcript", "suggestions", "answers"):
+            self.assertIn('data-module="{}"'.format(module), source)
+            self.assertIn('data-drag-handle="{}"'.format(module), source)
+        self.assertIn('id="arrangeBtn"', source)
+        self.assertIn('id="askInput"', source)
+        self.assertIn('class="askbar hud-interactive"', source)
+        self.assertIn("sendInteractiveRegions", source)
+        self.assertIn("localStorage", source)
 
 
 class DevicesTests(unittest.TestCase):

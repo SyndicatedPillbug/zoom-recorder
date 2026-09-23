@@ -53,13 +53,16 @@
     flex: 1 1 auto;
     display: grid;
     grid-template-columns: 1fr 1fr;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
     min-height: 0;
   }
   section { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  section + section { border-left: 1px solid var(--border); }
-  .right { display: flex; flex-direction: column; }
-  .pane { flex: 1 1 50%; display: flex; flex-direction: column; min-height: 0; }
-  .pane + .pane { border-top: 1px solid var(--border); }
+  .module-transcript { grid-column: 1; grid-row: 1 / span 2; border-right: 1px solid var(--border); }
+  .module-suggestions { grid-column: 2; grid-row: 1; border-bottom: 1px solid var(--border); }
+  .module-answers { grid-column: 2; grid-row: 2; }
+  .module-handle { user-select: none; }
+  .arrange-hint { display: none; margin-left: auto; font-size: 10px; color: var(--accent); text-transform: none; letter-spacing: 0; }
+  body.arrange-mode .arrange-hint { display: inline; }
   .point { margin: 0 0 8px; padding-left: 14px; position: relative; }
   .point::before { content: "•"; position: absolute; left: 0; color: var(--accent-2); }
   .point .pt { color: var(--muted); font-size: 11px; margin-left: 6px; }
@@ -117,6 +120,7 @@
     color: var(--text); border-radius: 6px; padding: 6px 10px; font: inherit;
   }
   .askbar input:focus { outline: none; border-color: var(--accent); }
+  .askbar, .askbar input, .askbar button { position: relative; z-index: 2; }
   body.overlay .askbar input:focus {
     background: rgba(30, 45, 70, .92);
     border-color: var(--accent);
@@ -147,7 +151,7 @@ body.overlay .footerbar {
   -webkit-backdrop-filter: blur(18px) saturate(1.35);
   backdrop-filter: blur(18px) saturate(1.35);
 }
-body.overlay header { margin: 0; cursor: move; }
+body.overlay header { margin: 0; }
 body.overlay .details { margin-top: -1px; }
 body.overlay .warnbar { margin-top: -1px; }
 body.overlay main { gap: 8px; }
@@ -160,7 +164,8 @@ body.overlay section {
   -webkit-backdrop-filter: blur(14px) saturate(1.25);
   backdrop-filter: blur(14px) saturate(1.25);
 }
-body.overlay section + section { border-left: 1px solid rgba(255,255,255,.15); }
+body.overlay .module-transcript { border-right-color: rgba(255,255,255,.15); }
+body.overlay .module-suggestions { border-bottom-color: rgba(255,255,255,.15); }
 body.overlay .col-head { background: rgba(7, 9, 14, .58); border-bottom-color: rgba(255,255,255,.14); }
 body.overlay .scroll { text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 1px rgba(0,0,0,.9); }
 body.overlay .line { margin-bottom: 10px; }
@@ -176,6 +181,30 @@ body.overlay.compact .col-head { padding: 6px 10px; }
 body.overlay.compact .card { padding: 7px 9px; margin-bottom: 8px; }
 body.overlay.compact .point { margin-bottom: 5px; }
 body.overlay.compact .footerbar { padding: 5px 10px; }
+
+body.arrange-mode main {
+  display: block;
+  position: relative;
+  overflow: hidden;
+}
+body.arrange-mode .hud-module {
+  position: absolute;
+  min-width: 220px;
+  min-height: 120px;
+  width: calc(50% - 6px);
+  height: calc(50% - 6px);
+  resize: both;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,.24);
+  border-radius: 12px;
+  box-shadow: 0 12px 30px rgba(0,0,0,.36);
+}
+body.arrange-mode .module-transcript { left: 0; top: 0; width: calc(50% - 6px); height: 100%; border-right: 1px solid rgba(255,255,255,.24); }
+body.arrange-mode .module-suggestions { left: 50%; top: 0; }
+body.arrange-mode .module-answers { left: 50%; top: 50%; }
+body.arrange-mode .module-handle { cursor: grab; }
+body.arrange-mode .module-handle:active { cursor: grabbing; }
+body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
 </style>
 </head>
 <body>
@@ -184,8 +213,9 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
   <h1>zoom-recorder</h1>
   <span class="pill" id="status">connecting…</span>
   <div class="spacer"></div>
-  <button class="mini secondary" id="detailsBtn" title="Show technical details">Details</button>
-  <button class="mini" id="stopBtn">Stop recording</button>
+  <button class="mini hud-interactive" id="arrangeBtn" title="Move transcript, suggestions, and answers independently">Arrange</button>
+  <button class="mini secondary hud-interactive" id="detailsBtn" title="Show technical details">Details</button>
+  <button class="mini hud-interactive" id="stopBtn">Stop recording</button>
 </header>
 <div class="details" id="details" hidden>
   <span class="pill egress" id="egress" title="Only transcript text leaves this Mac when answers are enabled.">answers: unknown</span>
@@ -195,33 +225,31 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
   <span class="pill" id="answerMetrics" title="Latest answer queue, prompt, and provider timing">answer —</span>
   <span class="pill" id="level" title="Current input level vs the speech threshold (dBFS)">lvl —</span>
   <span class="pill" id="devices" title="Microphone / system audio source">mic — · sys —</span>
-  <button class="mini" id="pauseBtn" title="Pause AI answers (transcript keeps running)">Pause answers</button>
+  <button class="mini hud-interactive" id="pauseBtn" title="Pause AI answers (transcript keeps running)">Pause answers</button>
   <span class="pill" id="budgetLabel">budget —</span>
   <div class="budget" title="Daily token budget used"><span id="budgetBar"></span></div>
 </div>
 <div class="warnbar" id="warnbar" hidden></div>
-<main>
-  <section>
-    <div class="col-head">Live transcript</div>
+<main id="hudMain">
+  <section class="hud-module module-transcript" data-module="transcript">
+    <div class="col-head module-handle hud-interactive" data-drag-handle="transcript">Live transcript <span class="arrange-hint">drag to move</span></div>
     <div class="scroll" id="transcript"><p class="empty">Waiting for speech…</p></div>
   </section>
-  <section class="right">
-    <div class="pane">
-      <div class="col-head">Suggestions</div>
-      <div class="scroll" id="points"><p class="empty">Suggestions will appear here during the call.</p></div>
-    </div>
-    <div class="pane">
-      <div class="col-head">Ask about the call</div>
-      <div class="scroll" id="answers"><p class="empty">Answers will appear here.</p></div>
-      <form class="askbar" id="askForm">
-        <input id="askInput" type="text" placeholder="Ask a question…" autocomplete="off" />
-        <button class="mini" type="submit">Ask</button>
-      </form>
-    </div>
+  <section class="hud-module module-suggestions" data-module="suggestions">
+    <div class="col-head module-handle hud-interactive" data-drag-handle="suggestions">Suggestions <span class="arrange-hint">drag to move</span></div>
+    <div class="scroll" id="points"><p class="empty">Suggestions will appear here during the call.</p></div>
+  </section>
+  <section class="hud-module module-answers" data-module="answers">
+    <div class="col-head module-handle hud-interactive" data-drag-handle="answers">Ask about the call <span class="arrange-hint">drag to move</span></div>
+    <div class="scroll" id="answers"><p class="empty">Answers will appear here.</p></div>
+    <form class="askbar hud-interactive" id="askForm">
+      <input id="askInput" class="hud-interactive" type="text" placeholder="Ask a question…" autocomplete="off" />
+      <button class="mini hud-interactive" type="submit">Ask</button>
+    </form>
   </section>
 </main>
 <div class="footerbar">
-  <button class="mini secondary" id="openRecordings">Open recordings folder</button>
+  <button class="mini secondary hud-interactive" id="openRecordings">Open recordings folder</button>
 </div>
 <script>
 (function () {
@@ -252,6 +280,9 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
   const detailsEl = document.getElementById('details');
   const stopBtn = document.getElementById('stopBtn');
   const openRecordingsBtn = document.getElementById('openRecordings');
+  const arrangeBtn = document.getElementById('arrangeBtn');
+  const hudMain = document.getElementById('hudMain');
+  const modules = [...document.querySelectorAll('.hud-module[data-module]')];
   if (detailsBtn) detailsBtn.onclick = () => {
     detailsEl.hidden = !detailsEl.hidden;
     detailsBtn.textContent = detailsEl.hidden ? 'Details' : 'Hide details';
@@ -263,6 +294,79 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     stopBtn.textContent = 'Saved';
   };
   if (openRecordingsBtn) openRecordingsBtn.onclick = () => api('/open-recordings', 'POST', {});
+  const LAYOUT_KEY = 'hud.module-layout.v1';
+  let arranging = false;
+  function sendInteractiveRegions() {
+    const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hudRegions;
+    if (!handler) return;
+    const regions = [...document.querySelectorAll('.hud-interactive')].map(node => {
+      const r = node.getBoundingClientRect();
+      return { x: r.left, y: r.top, width: r.width, height: r.height };
+    }).filter(r => r.width > 0 && r.height > 0);
+    try { handler.postMessage({ regions: regions }); } catch (e) {}
+  }
+  function saveLayout() {
+    if (!hudMain) return;
+    const mainRect = hudMain.getBoundingClientRect();
+    const layout = {};
+    modules.forEach(module => {
+      const r = module.getBoundingClientRect();
+      layout[module.dataset.module] = {
+        left: Math.round(r.left - mainRect.left), top: Math.round(r.top - mainRect.top),
+        width: Math.round(r.width), height: Math.round(r.height)
+      };
+    });
+    try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch (e) {}
+  }
+  function restoreLayout() {
+    let layout = {};
+    try { layout = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}') || {}; } catch (e) {}
+    modules.forEach(module => {
+      const saved = layout[module.dataset.module];
+      if (!saved) return;
+      ['left', 'top', 'width', 'height'].forEach(key => {
+        if (Number.isFinite(Number(saved[key]))) module.style[key] = Number(saved[key]) + 'px';
+      });
+    });
+  }
+  function setArrangeMode(enabled) {
+    arranging = !!enabled;
+    document.body.classList.toggle('arrange-mode', arranging);
+    if (arranging) restoreLayout();
+    if (arrangeBtn) arrangeBtn.textContent = arranging ? 'Done arranging' : 'Arrange';
+    if (arrangeBtn) arrangeBtn.classList.toggle('on', arranging);
+    if (!arranging) saveLayout();
+    setTimeout(sendInteractiveRegions, 0);
+  }
+  if (arrangeBtn) arrangeBtn.onclick = () => setArrangeMode(!arranging);
+  modules.forEach(module => {
+    const handle = module.querySelector('[data-drag-handle]');
+    if (!handle) return;
+    handle.addEventListener('pointerdown', e => {
+      if (!arranging || !hudMain) return;
+      e.preventDefault(); e.stopPropagation(); handle.setPointerCapture(e.pointerId);
+      const mainRect = hudMain.getBoundingClientRect();
+      const rect = module.getBoundingClientRect();
+      const offsetX = e.clientX - rect.left, offsetY = e.clientY - rect.top;
+      module.dataset.dragging = '1';
+      const move = event => {
+        const maxX = Math.max(0, mainRect.width - module.offsetWidth);
+        const maxY = Math.max(0, mainRect.height - module.offsetHeight);
+        module.style.left = Math.max(0, Math.min(maxX, event.clientX - mainRect.left - offsetX)) + 'px';
+        module.style.top = Math.max(0, Math.min(maxY, event.clientY - mainRect.top - offsetY)) + 'px';
+        sendInteractiveRegions();
+      };
+      const end = () => {
+        handle.releasePointerCapture?.(e.pointerId); module.dataset.dragging = '0';
+        module.removeEventListener('pointermove', move); module.removeEventListener('pointerup', end);
+        saveLayout(); sendInteractiveRegions();
+      };
+      module.addEventListener('pointermove', move); module.addEventListener('pointerup', end);
+    });
+  });
+  window.addEventListener('resize', sendInteractiveRegions);
+  if (window.ResizeObserver && hudMain) new ResizeObserver(sendInteractiveRegions).observe(hudMain);
+  setTimeout(sendInteractiveRegions, 100);
   const askInput = document.getElementById('askInput');
   const TOKEN = new URLSearchParams(location.search).get('token') || '';
   const PINS_KEY = 'hud.pins';
@@ -307,7 +411,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     const label = speakerLabel(ev);
     if (!label) return '';
     const id = String(ev.speaker_id || '');
-    const attr = id ? ' class="spk editable-speaker" data-speaker-id="' + esc(id) + '" data-speaker-default="' + esc(ev.speaker || '') + '" title="Click to rename"' : ' class="spk"';
+    const attr = id ? ' class="spk editable-speaker hud-interactive" data-speaker-id="' + esc(id) + '" data-speaker-default="' + esc(ev.speaker || '') + '" title="Click to rename"' : ' class="spk"';
     return '<span' + attr + '>' + esc(label) + '</span>';
   }
 
@@ -324,6 +428,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     transcriptCount++;
     drafts.forEach(addPartial);
     if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    setTimeout(sendInteractiveRegions, 0);
   }
 
   function addPartial(ev) {
@@ -344,6 +449,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     const speaker = speakerMarkup(ev);
     p.innerHTML = '<span class="t">live</span>' + speaker + esc(text);
     if (atBottom(transcriptEl)) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    setTimeout(sendInteractiveRegions, 0);
   }
 
   function pointNode(p, fresh) {
@@ -352,8 +458,8 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     el.className = 'point' + (fresh ? ' fresh' : '') + (isPinned ? ' pinned' : '');
     let html = esc(p.text) + '<span class="pt">' + esc(clock(p.ts)) + '</span>';
     (p.sources || []).forEach(s => { html += '<span class="src">' + esc(s) + '</span>'; });
-    html += '<button class="copy pin" title="Pin or unpin">' + (isPinned ? 'unpin' : 'pin') + '</button>';
-    html += '<button class="copy" title="Copy">copy</button>';
+    html += '<button class="copy pin hud-interactive" title="Pin or unpin">' + (isPinned ? 'unpin' : 'pin') + '</button>';
+    html += '<button class="copy hud-interactive" title="Copy">copy</button>';
     el.innerHTML = html;
     const [pinBtn, copyBtn] = el.querySelectorAll('button');
     copyBtn.onclick = () => copyText(p.text, copyBtn);
@@ -382,6 +488,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     }
     rest.forEach(p => pointsEl.appendChild(pointNode(p, p.fresh)));
     if (stick) pointsEl.scrollTop = pointsEl.scrollHeight;
+    setTimeout(sendInteractiveRegions, 0);
   }
 
   function addPoint(ev) {
@@ -401,7 +508,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     if (ev.model) html += '<span class="src">' + esc(ev.model) + '</span>';
     (ev.sources || []).forEach(s => { html += '<span class="src">' + esc(s) + '</span>'; });
     if (ev.error) html += '<span class="err">' + esc(ev.error) + '</span>';
-    html += '<button class="copy" title="Copy answer">copy</button>';
+    html += '<button class="copy hud-interactive" title="Copy answer">copy</button>';
     html += '</div>';
     card.innerHTML = html;
     const copyBtn = card.querySelector('.copy');
@@ -419,6 +526,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
       answerMetricsEl.textContent = label;
     }
     if (stick) answersEl.scrollTop = answersEl.scrollHeight;
+    setTimeout(sendInteractiveRegions, 0);
   }
 
   function setPaused(p) {
@@ -450,7 +558,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
     if (!id || node.querySelector('input')) return;
     const old = node.textContent || '';
     const input = document.createElement('input');
-    input.className = 'speaker-edit';
+    input.className = 'speaker-edit hud-interactive';
     input.maxLength = 80;
     input.value = old;
     let committed = false;
