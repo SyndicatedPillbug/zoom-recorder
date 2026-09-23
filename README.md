@@ -308,7 +308,10 @@ has a timeout, and writes only derived files. If WhisperX, the model, or the
 token is missing, the call completes with the normal channel-labelled
 transcript. Speaker IDs remain generic (`Remote 1`, `Remote 2`) until the user
 renames them; acoustic attribution never silently claims a real person's
-identity.
+identity. The derived `diarization.json` also records quality diagnostics
+(unknown/generic/manual/profile segment rates, audio duration, processing time,
+and real-time factor); these are measurements, not a replacement for manual
+verification.
 
 **Reusable voice matches.** When a diarization backend supplies acoustic
 embeddings, an explicit manual name can enroll one representative sample into

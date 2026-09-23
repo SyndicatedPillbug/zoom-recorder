@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -58,10 +59,33 @@ def _load_segments(path: Path) -> List[Dict[str, Any]]:
             "speaker_label": "Remote {}".format(len(ids)),
             "speaker_source": "diarization",
             "speaker_confidence": float(item.get("speaker_confidence") or 0.5),
+            "speaker_unknown": raw_speaker.upper() in ("UNKNOWN", "UNK"),
             "text": str(item.get("text") or "").strip(),
             "_embedding": embedding,
         })
     return out
+
+
+def _quality_summary(segments: List[Dict[str, Any]], processing_seconds: float
+                     ) -> Dict[str, Any]:
+    duration = sum(max(0.0, float(item.get("end", 0.0)) -
+                     float(item.get("start", 0.0))) for item in segments)
+    count = len(segments)
+    unknown = sum(1 for item in segments if item.get("speaker_unknown"))
+    manual = sum(1 for item in segments if item.get("speaker_source") == "user")
+    profile = sum(1 for item in segments if item.get("speaker_source") == "voice_profile")
+    generic = sum(1 for item in segments if item.get("speaker_source") == "diarization")
+    return {
+        "segment_count": count,
+        "audio_duration_seconds": round(duration, 3),
+        "processing_seconds": round(max(0.0, processing_seconds), 3),
+        "real_time_factor": (round(processing_seconds / duration, 3)
+                             if duration > 0 else None),
+        "unknown_rate": round(unknown / count, 4) if count else None,
+        "generic_segment_rate": round(generic / count, 4) if count else None,
+        "manual_segment_rate": round(manual / count, 4) if count else None,
+        "voice_profile_segment_rate": round(profile / count, 4) if count else None,
+    }
 
 
 def _resolve_hf_token() -> Optional[str]:
@@ -212,6 +236,7 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
     The command is assembled from fixed arguments and never through a shell.
     No API key is logged.  Output is written only below ``derived/``.
     """
+    processing_started = time.perf_counter()
     if not getattr(cfg, "diarization_enabled", False):
         return None
     backend = str(getattr(cfg, "diarization_backend", "auto") or "auto").lower()
@@ -334,6 +359,7 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
         "speaker_count": diar_speaker_count,
         "voice_profile_matches": matched,
         "voice_profiles_enrolled": enrolled,
+        "quality": _quality_summary(segments, time.perf_counter() - processing_started),
     }
     (output_dir / "diarization.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

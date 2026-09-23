@@ -229,6 +229,11 @@ profiles and allow deletion.
 Gate: disabling diarization or failing its worker changes no capture, final text, answer, or
 writeback behavior.
 
+Current status: post-call diarization is isolated and failure-safe, with optional reusable voice
+profiles. Derived output now includes non-authoritative quality diagnostics for unknown/generic/
+manual/profile attribution rates and processing real-time factor. Live diarization remains off the
+critical path.
+
 ### Step 5.3 — Evaluate post-call quality
 
 Use labeled two-speaker fixtures to measure speaker error rate, unknown rate, correction rate, and

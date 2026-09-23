@@ -916,6 +916,10 @@ class IdentityTests(unittest.TestCase):
             self.assertTrue((root / "derived" / "diarization.json").is_file())
             rendered = (root / "derived" / "diarized_transcript.md").read_text()
             self.assertIn("Remote 1", rendered)
+            self.assertEqual(result["quality"]["segment_count"], 1)
+            self.assertEqual(result["quality"]["audio_duration_seconds"], 2.0)
+            self.assertEqual(result["quality"]["unknown_rate"], 0.0)
+            self.assertIsNotNone(result["quality"]["real_time_factor"])
 
     def test_voice_profiles_require_manual_enrollment_and_match_locally(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
