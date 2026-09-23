@@ -141,6 +141,7 @@
   <span class="pill egress" id="egress" title="Only transcript text leaves this Mac when answers are enabled.">answers: unknown</span>
   <span class="pill" id="lag" title="How far the live transcription is behind the audio">lag —</span>
   <span class="pill" id="partialLag" title="Interim local transcription delay">interim —</span>
+  <span class="pill" id="captureSurface" title="Whether this HUD surface requests macOS capture exclusion">capture —</span>
   <span class="pill" id="answerMetrics" title="Latest answer queue, prompt, and provider timing">answer —</span>
   <span class="pill" id="level" title="Current input level vs the speech threshold (dBFS)">lvl —</span>
   <span class="pill" id="devices" title="Microphone / system audio source">mic — · sys —</span>
@@ -181,6 +182,7 @@
   const egressEl = document.getElementById('egress');
   const lagEl = document.getElementById('lag');
   const partialLagEl = document.getElementById('partialLag');
+  const captureSurfaceEl = document.getElementById('captureSurface');
   const answerMetricsEl = document.getElementById('answerMetrics');
   const levelEl = document.getElementById('level');
   const devicesEl = document.getElementById('devices');
@@ -437,6 +439,14 @@
     }
     if (meta.stt_partial_latency !== undefined) {
       partialLagEl.textContent = 'interim ' + Number(meta.stt_partial_latency).toFixed(1) + 's';
+    }
+    if (meta.hud_surface) {
+      const native = meta.hud_surface === 'native';
+      captureSurfaceEl.textContent = native ? 'capture: best effort' : 'capture: visible';
+      captureSurfaceEl.className = 'pill ' + (native ? 'egress' : '');
+      captureSurfaceEl.title = native
+        ? (meta.hud_capture_protection || 'macOS sharing exclusion requested; verify with your call app')
+        : 'Browser HUD has no native capture exclusion';
     }
     if (meta.stt_vad_level_db !== undefined) {
       const lvl = Number(meta.stt_vad_level_db);

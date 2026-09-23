@@ -215,10 +215,15 @@ otherwise. Safe to run at any time, including while it's already up.
 
 ### Live transcript + AI answer HUD (`--live`)
 
-`--live` opens a small local window in your browser: **live transcript on the
-left**, and on the right a persistent **talking-points** bullet list above a
-**Q&A** column. Both are generated from the conversation and, when configured,
-a background database of `.md` files:
+`--live` opens a native Mac HUD by default: **live transcript on the left**, and
+on the right a persistent **talking-points** bullet list above a **Q&A** column.
+The window stays above normal windows and follows Spaces, so it can sit beside
+or over a call. The native surface requests macOS's window capture-exclusion
+setting as a best-effort privacy feature; meeting apps and newer capture paths
+may not honor it, so use window sharing or a second display when privacy is
+critical. If the native surface cannot start, the existing browser HUD opens
+instead. Both are generated from the conversation and, when configured, a
+background database of `.md` files:
 
 ```bash
 ./zoom_record.py --live                          # Groq STT + Groq answers
@@ -227,6 +232,11 @@ a background database of `.md` files:
 ./zoom_record.py --live --transcript-dir ~/Obsidian/LiveTranscripts
 ./zoom_record.py --live --answer-backend openrouter   # use OpenRouter instead
 ```
+
+The native/browser choice is available in Settings under **HUD & budget**.
+Turning off **Open live HUD automatically** keeps the local HUD server available
+without opening a surface; turning off **Use native Mac window** selects the
+browser fallback.
 
 The window is served from `127.0.0.1` (a random free port) and closes when the
 recording stops. These files are written under `derived/` (flushed every

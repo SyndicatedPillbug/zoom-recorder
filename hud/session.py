@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import json
 import secrets
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -58,6 +60,8 @@ class LiveSession:
         self._stop = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
         self._writeback: Optional[TranscriptWriteback] = None
+        self._native_proc: Optional[subprocess.Popen] = None
+        self._hud_surface = "none"
         self._lifecycle_stages: Dict[str, float] = {}
 
     def _record_lifecycle_stage(self, name: str, started_at: float) -> None:
@@ -116,7 +120,7 @@ class LiveSession:
             self.state.set_status("recording", answers_error=str(exc))
 
         if self.cfg.open_browser:
-            threading.Thread(target=self._open_browser, daemon=True).start()
+            self._open_surface()
 
         if self.cfg.persist_seconds > 0:
             self._flush_thread = threading.Thread(target=self._flush_loop,
@@ -197,6 +201,7 @@ class LiveSession:
             HUD_URLFILE.unlink(missing_ok=True)
         except OSError:
             pass
+        self._stop_native_window()
         if self.server is not None:
             stage_started = time.time()
             try:
@@ -310,6 +315,52 @@ class LiveSession:
             webbrowser.open(self.url)
         except Exception:  # noqa: BLE001
             pass
+
+    def _open_surface(self) -> None:
+        """Open the native Mac HUD, falling back to the browser safely."""
+        if self.cfg.native_window and sys.platform == "darwin":
+            try:
+                from .native_window import capture_protection_label
+                host = Path(__file__).with_name("native_window.py")
+                self._native_proc = subprocess.Popen(
+                    [sys.executable, str(host), "--url", self.url,
+                     "--title", "Meeting HUD"],
+                    cwd=str(host.parent.parent),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                # AppKit startup is asynchronous. A process that exits during
+                # import/window creation is a failed surface, not success.
+                time.sleep(0.2)
+                if self._native_proc.poll() is None:
+                    self._hud_surface = "native"
+                    self.state.set_meta(
+                        hud_surface="native",
+                        hud_capture_protection=capture_protection_label())
+                    self.log("Live HUD: native Mac window active")
+                    return
+                self._native_proc = None
+            except Exception as exc:  # noqa: BLE001 - browser remains valid
+                self.log("Live HUD: native window unavailable ({}); using browser".format(exc))
+
+        self._hud_surface = "browser"
+        self.state.set_meta(hud_surface="browser", hud_capture_protection="none")
+        threading.Thread(target=self._open_browser, daemon=True).start()
+
+    def _stop_native_window(self) -> None:
+        proc = self._native_proc
+        self._native_proc = None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.5)
+        except Exception:  # noqa: BLE001 - shutdown must remain best effort
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:

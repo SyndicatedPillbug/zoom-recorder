@@ -24,7 +24,7 @@ The most important foundations are now in place:
 - Stable-partial publication, writeback, Obsidian indexing, structured memory, identity editing,
   non-blocking diarization, Groq fallback behavior, replay, and latency instrumentation are
   implemented and covered by deterministic lifecycle/replay tests.
-- The current release line has a 259-test green regression suite, 100/100 normal lifecycle runs,
+- The current release line has a 264-test green regression suite, 100/100 normal lifecycle runs,
   20/20 injected-failure runs, forced-stop/restart coverage, and a manifest-driven benchmark
   package.
 - Obsidian retrieval is hybrid and bounded: frontmatter/wikilinks are preserved, metadata can
@@ -265,7 +265,8 @@ Exit criteria:
 Current status: Settings exposes audio, models, providers, writeback, Obsidian folders,
 diarization, and retrieval budgets/scope. The HUD exposes transcript/answer state, editable
 speaker labels, and technical latency details. Setup now exports one-click redacted diagnostics;
-integrated permission recovery remains open.
+the Mac HUD now opens in a native AppKit/WebKit surface by default with browser fallback and
+explicit best-effort capture-protection status; integrated permission recovery remains open.
 
 ## Phase 7 — Privacy, security, and operational hardening
 
@@ -299,6 +300,25 @@ This is explicitly out of scope for the current roadmap pass:
 - production support packaging.
 
 Revisit only after the current Mac workflow is polished, benchmarked, and stable across real calls.
+
+## Deferred product idea — private presenter view / hardware-separated HUD
+
+Keep this separate from the current software-only overlay work. Some meeting applications may
+force hardware-level full-monitor capture and ignore per-window capture-exclusion mechanisms. In
+that case, a truly private HUD may require physical or compositor-level separation:
+
+- a second physical display for the presenter HUD;
+- a clean virtual presenter display shared with the meeting application while the private HUD stays
+  on the physical display;
+- a transparent optical or "clear glass" HUD overlay that is visible to the presenter but is not
+  part of the captured framebuffer; or
+- a future hardware/compositor integration using a display overlay plane, if its capture behavior
+  can be demonstrated reliably on a supported device.
+
+This is a product exploration, not an implementation commitment for the current release line.
+The eventual investigation should compare portability, eye focus, setup friction, capture
+reliability, accessibility, cost, and whether the approach works with Zoom, Teams, Meet, and
+browser-based calls that capture the physical display directly.
 
 ## Decision gates
 

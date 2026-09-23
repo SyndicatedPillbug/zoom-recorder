@@ -236,6 +236,7 @@ class HudConfig:
 
     # HUD server
     port: int = 0
+    native_window: bool = True
     open_browser: bool = True
     host: str = "127.0.0.1"
     persist_seconds: float = 20.0     # periodic crash-safe flush of derived/
@@ -387,7 +388,8 @@ def _defaults() -> Dict[str, Any]:
             "embed_model": None,
             "min_score": 0.1,
         },
-        "hud": {"port": 0, "open_browser": True, "host": "127.0.0.1", "persist_seconds": 20.0},
+        "hud": {"port": 0, "native_window": True, "open_browser": True,
+                "host": "127.0.0.1", "persist_seconds": 20.0},
         "transcript": {"writeback_dir": None},
         "diarization": {"enabled": True, "backend": "auto",
                          "timeout_seconds": 300.0,
@@ -513,6 +515,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         self_name=str(speakers.get("self_name") or "You"),
         remote_name=str(speakers.get("remote_name") or "Others"),
         port=_as_int(hud.get("port"), 0),
+        native_window=bool(hud.get("native_window", True)),
         open_browser=bool(hud.get("open_browser", True)),
         host=str(hud.get("host") or "127.0.0.1"),
         persist_seconds=_as_float(hud.get("persist_seconds"), 20.0),
@@ -625,6 +628,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
     })
     out["hud"].update({
         "port": cfg.port,
+        "native_window": cfg.native_window,
         "open_browser": cfg.open_browser,
         "host": cfg.host,
         "persist_seconds": cfg.persist_seconds,

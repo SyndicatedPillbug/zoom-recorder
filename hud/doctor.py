@@ -89,6 +89,25 @@ def check_local_http() -> Check:
             server.server_close()
 
 
+def check_native_hud() -> Check:
+    """Check the optional native Mac surface without opening a window."""
+    if platform.system() != "Darwin":
+        return Check("native HUD", False, "macOS only; browser HUD remains available",
+                     critical=False)
+    try:
+        from .native_window import native_window_available
+    except Exception as exc:  # noqa: BLE001 - browser fallback remains valid
+        return Check("native HUD", False, "capability check unavailable: {}".format(exc),
+                     "Use the browser HUD or install the AppKit/WebKit runtime",
+                     critical=False)
+    if native_window_available():
+        return Check("native HUD", True, "AppKit/WebKit surface available",
+                     critical=False)
+    return Check("native HUD", False, "AppKit/WebKit surface unavailable",
+                 "Use the browser HUD; recording and local transcription are unaffected",
+                 critical=False)
+
+
 def check_rumps() -> Check:
     try:
         import rumps  # noqa: F401
@@ -226,7 +245,8 @@ def run_doctor(probe_seconds: float = 1.5) -> bool:
     checks: List[Check] = [check_macos(), check_python()]
     checks += check_tools()
     checks += [check_rumps(), check_blackhole(), check_routing(),
-               check_output_volume(), check_local_http(), check_microphone(probe_seconds),
+               check_output_volume(), check_local_http(), check_native_hud(),
+               check_microphone(probe_seconds),
                check_transcription(), check_tap()]
 
     print("zoom-recorder doctor")

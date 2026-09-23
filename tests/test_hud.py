@@ -1599,7 +1599,7 @@ class ConfigTests(unittest.TestCase):
             answers_backend="openrouter", answers_fallback=["groq", "ollama"],
             kb_dirs=["/a", "/b"], kb_top_k=7, kb_scope_tags=["enterprise"],
             budget_tpm=100, budget_tpd=200,
-            port=1234, open_browser=False, answer_interval=20.0,
+            port=1234, native_window=False, open_browser=False, answer_interval=20.0,
             chat_model="m1", rolling_model="m2", answers_enabled=False,
             context_max_chars=4321, question_lookback_seconds=42.0,
             question_rewrite=False, kb_embed_backend="ollama",
@@ -1618,7 +1618,7 @@ class ConfigTests(unittest.TestCase):
         for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
                      "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
                      "kb_max_chars", "kb_scope_tags",
-                     "open_browser", "answer_interval", "chat_model", "rolling_model",
+                     "native_window", "open_browser", "answer_interval", "chat_model", "rolling_model",
                      "answers_enabled", "context_max_chars", "question_lookback_seconds",
                      "question_rewrite", "kb_embed_backend", "kb_embed_model",
                      "kb_min_score", "answer_self_questions", "point_dedupe_score",
@@ -1633,6 +1633,14 @@ class ConfigTests(unittest.TestCase):
                      "stt_partial_enabled", "stt_partial_window_seconds",
                      "stt_partial_interval_seconds"):
             self.assertEqual(getattr(cfg, attr), getattr(again, attr), attr)
+
+    def test_native_hud_defaults_on_mac_and_has_explicit_capture_label(self) -> None:
+        from hud.native_window import capture_protection_label, native_window_available
+
+        self.assertTrue(HudConfig().native_window)
+        self.assertIn("best-effort", capture_protection_label())
+        # Capability probing must be safe even when a test runner has no GUI.
+        self.assertIsInstance(native_window_available(), bool)
 
     def test_save_preserves_unknown_keys_and_backs_up(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2591,6 +2599,26 @@ class SummaryTests(unittest.TestCase):
             # No leftover temp files from the atomic writes.
             self.assertEqual(list(derived.glob("*.tmp")), [])
 
+    def test_session_prefers_native_surface_and_can_stop_it(self) -> None:
+        from hud.session import LiveSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = LiveSession(
+                HudConfig(native_window=True, open_browser=True),
+                Path(tmp), lambda _m: None, "Mic")
+            fake_proc = mock.Mock()
+            fake_proc.poll.return_value = None
+            with mock.patch("hud.session.subprocess.Popen", return_value=fake_proc), \
+                    mock.patch("hud.session.time.sleep"):
+                session._port = 1234
+                session.server = mock.Mock(host="127.0.0.1")
+                session._open_surface()
+            self.assertEqual(session._hud_surface, "native")
+            self.assertEqual(session.state.meta.get("hud_surface"), "native")
+            session._stop_native_window()
+            fake_proc.terminate.assert_called_once_with()
+            fake_proc.wait.assert_called_once()
+
 
 class DevicesTests(unittest.TestCase):
     def _topology(self, items, default_input=None, default_output=None):
@@ -3196,6 +3224,15 @@ class HardeningTests(unittest.TestCase):
         import zoom_record
         llm.set_offline(False)
         zoom_record.set_notifications(True)
+
+    def test_doctor_native_hud_is_optional_and_reports_capability(self) -> None:
+        from hud import doctor
+
+        with mock.patch.object(doctor.platform, "system", return_value="Darwin"), \
+                mock.patch("hud.native_window.native_window_available", return_value=True):
+            check = doctor.check_native_hud()
+        self.assertTrue(check.ok)
+        self.assertFalse(check.critical)
 
     def test_offline_blocks_remote_and_allows_loopback(self) -> None:
         from hud.llm import LLMClient, LLMError, set_offline

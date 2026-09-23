@@ -207,8 +207,11 @@
     <h2>HUD &amp; budget</h2>
     <div class="row"><label>HUD port</label><div class="ctl">
       <input type="number" step="1" min="0" id="hud.port" /><span class="hint">0 = random</span></div></div>
-    <div class="row"><label>Open browser</label><div class="ctl">
+    <div class="row"><label>Open live HUD automatically</label><div class="ctl">
       <input type="checkbox" id="hud.open_browser" /></div></div>
+    <div class="row"><label>Use native Mac window</label><div class="ctl">
+      <input type="checkbox" id="hud.native_window" /></div></div>
+    <div class="hint">The native window stays above the call and can request macOS capture exclusion. Browser mode remains the fallback.</div>
     <div class="row"><label>Flush seconds</label><div class="ctl">
       <input type="number" step="5" min="0" id="hud.persist_seconds" />
       <span class="hint">crash-safe derived/</span></div></div>
@@ -341,6 +344,7 @@
     setVal('diarization.voice_profiles.threshold', vp.threshold || 0.78);
     setVal('diarization.voice_profiles.path', vp.path || '');
     setVal('hud.port', c.hud.port); setVal('hud.open_browser', c.hud.open_browser);
+    setVal('hud.native_window', c.hud.native_window !== false);
     setVal('hud.persist_seconds', c.hud.persist_seconds);
     setVal('transcript.writeback_dir', c.transcript.writeback_dir);
     setVal('budget.tpm', c.budget.tpm); setVal('budget.tpd', c.budget.tpd);
@@ -393,6 +397,7 @@
                        threshold: Number($('diarization.voice_profiles.threshold').value || 0.78),
                        path: $('diarization.voice_profiles.path').value.trim() || null } },
       hud: { port: num('hud.port'), open_browser: $('hud.open_browser').checked,
+             native_window: $('hud.native_window').checked,
              persist_seconds: num('hud.persist_seconds') },
       transcript: { writeback_dir: $('transcript.writeback_dir').value.trim() || null },
       budget: { tpm: num('budget.tpm'), tpd: num('budget.tpd') },

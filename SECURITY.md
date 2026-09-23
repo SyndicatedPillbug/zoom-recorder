@@ -22,6 +22,14 @@ That is the only macOS privacy permission the default path uses. It does
 Audio Recording / Audio Capture permission. System audio is captured through
 BlackHole, a normal CoreAudio device.
 
+When the live HUD is enabled, it normally opens as a native AppKit/WebKit
+window. The window requests macOS's legacy sharing-exclusion setting so some
+screen-capture paths can omit it while it remains visible locally. This is a
+best-effort privacy feature, not a security boundary: meeting applications or
+newer capture frameworks may ignore it. The HUD reports the active surface and
+capture status, and the browser fallback is explicitly marked as visible to
+capture.
+
 The optional Core Audio **tap** mode (`--system-capture tap`, not used
 automatically) is the one path that needs the System Audio Recording
 permission; it exists because it leaves output routing completely untouched,
