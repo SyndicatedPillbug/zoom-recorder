@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import wave
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -38,6 +39,7 @@ from hud.config import (HudConfig, config_from_dict, config_to_dict,  # noqa: E4
                         load_config, save_config)
 from hud.diarization import (diarization_readiness,  # noqa: E402
                              run_post_call_diarization)
+from hud.e2e_audio import build_config, run_audio_e2e  # noqa: E402
 from hud.evaluation import (first_stable_publication_stats, normalize_words,  # noqa: E402
                             stable_prefix_stats, word_error_stats)
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
@@ -52,6 +54,7 @@ from hud.menu_state import describe  # noqa: E402
 from hud.replay import benchmark, replay, write_jsonl  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
+from hud.trace_report import build_report  # noqa: E402
 from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, STTResult, _Source,  # noqa: E402
                      frame_rms_dbfs, StablePartialDecoder, fuzzy_overlap,
                      looks_hallucinated,
@@ -851,6 +854,15 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(meaningful_folder_name("10-11-12_ab12cd34", identity),
                          "10-11-12_we-agreed-to-launch-the-new-onboarding-flow-next-week_ab12cd34")
 
+    def test_identity_word_count_excludes_rendering_decorations(self) -> None:
+        cfg = mock.Mock(record_mic=True, stt_backend="local",
+                        stt_model="turbo", answers_backend="groq",
+                        chat_model="model")
+        identity = build_identity(
+            datetime(2026, 9, 22, 10, 11, 12), None, "10-11-12_ab12cd34",
+            "[10:00:00] **Dana:** We agreed to launch the new flow.", cfg)
+        self.assertEqual(identity["transcript_words"], 7)
+
     def test_identity_persists_user_speaker_mappings(self) -> None:
         cfg = mock.Mock(record_mic=True, stt_backend="local", stt_model="turbo",
                         answers_backend="groq", chat_model="model")
@@ -1082,6 +1094,83 @@ class MemoryAndReplayTests(unittest.TestCase):
             (Path(tmp) / "synthetic-noise-10s.wav").write_bytes(b"noise fixture")
             ready = load_manifest(manifest, require_files=True, asset_root=Path(tmp))
             self.assertTrue(ready[0].audio_exists)
+
+    def test_real_audio_e2e_config_uses_local_stt_and_disables_answers(self) -> None:
+        cfg = build_config(Path("/tmp/dialogue.wav"), Path("/tmp/mirror"))
+        self.assertEqual(cfg.stt_backend, "local")
+        self.assertEqual(cfg.audio_file, "/tmp/dialogue.wav")
+        self.assertFalse(cfg.answers_enabled)
+        self.assertFalse(cfg.kb_enabled)
+        self.assertEqual(cfg.transcript_writeback_dir, "/tmp/mirror")
+
+    def test_real_audio_e2e_creates_output_before_session_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "dialogue.wav"
+            with wave.open(str(audio), "wb") as source:
+                source.setnchannels(1)
+                source.setsampwidth(2)
+                source.setframerate(16000)
+                source.writeframes(b"\x00\x00" * 16000)
+            model = root / "model.bin"
+            model.write_bytes(b"model")
+            outdir = root / "nested" / "session"
+
+            class FakeState:
+                def snapshot(self):
+                    return {"meta": {}}
+
+                def transcript_text(self):
+                    return "[10:00:00] hello world"
+
+            class FakeSession:
+                start_seen_dir = False
+
+                def __init__(self, _cfg, session_outdir, _log, *_args, **_kwargs):
+                    self.outdir = session_outdir
+                    self.state = FakeState()
+
+                def start(self):
+                    FakeSession.start_seen_dir = self.outdir.is_dir()
+                    return 123
+
+                def stop(self):
+                    return None
+
+            with mock.patch("hud.e2e_audio.LiveSession", FakeSession):
+                result = run_audio_e2e(audio, model, outdir)
+
+            self.assertTrue(outdir.is_dir())
+            self.assertTrue(FakeSession.start_seen_dir)
+            self.assertEqual(result["transcript_words"], 2)
+
+    def test_trace_report_aggregates_boundaries_without_text(self) -> None:
+        events = [
+            {"type": "answer_trace", "trace_id": "a", "stage": "queued",
+             "kind": "question"},
+            {"type": "answer_trace", "trace_id": "a", "stage": "assembled",
+             "queue_wait_seconds": 0.2, "assembly_seconds": 0.1,
+             "retrieval_seconds": 0.03, "prompt_chars": 100},
+            {"type": "answer_trace", "trace_id": "a", "stage": "provider_complete",
+             "provider_ttft_seconds": 0.4, "provider_request_seconds": 1.0,
+             "total_seconds": 1.5},
+            {"type": "answer_trace", "trace_id": "b", "stage": "queued",
+             "kind": "question"},
+            {"type": "answer_trace", "trace_id": "b", "stage": "assembled",
+             "queue_wait_seconds": 0.6, "assembly_seconds": 0.2,
+             "retrieval_seconds": 0.05, "prompt_chars": 200},
+            {"type": "answer_trace", "trace_id": "b", "stage": "failed",
+             "reason": "all providers failed", "total_seconds": 2.0},
+            {"type": "answer", "question": "must not appear in report"},
+        ]
+
+        report = build_report(events)
+
+        self.assertEqual((report["trace_count"], report["completed_count"],
+                          report["failed_count"]), (2, 1, 1))
+        self.assertEqual(report["metrics"]["queue_wait_seconds"]["p50"], 0.4)
+        self.assertEqual(report["metrics"]["total_seconds"]["p95"], 1.975)
+        self.assertNotIn("must not appear", json.dumps(report))
 
     def test_benchmark_result_is_atomic_and_versioned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

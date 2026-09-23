@@ -107,3 +107,26 @@ or production hardware. Memory was not measured and is recorded as `null` by
 the result schema. The tag-scoped result demonstrates the expected latency
 benefit when a large vault is organized with useful frontmatter; target-machine
 measurements remain the release gate.
+
+## Production local audio replay
+
+On 2026-09-22, the production capture-to-finalization path was exercised with
+the provisioned AMI ES2002a 50–80 slice (`30.0 s`, mono 16-bit 16 kHz) and
+`ggml-large-v3-turbo-q5_0.bin` on this Mac. Answers and KB retrieval were
+disabled for this control so the measurement isolates audio, local STT,
+session persistence, and transcript writeback.
+
+| Measurement | Result |
+| --- | ---: |
+| Wall time including 8 s drain | 41.10 s |
+| Transcript event records / canonical speech words | 18 / 31 |
+| Final STT inferences | 10 |
+| Dropped STT chunks | 0 |
+| Final latency p50 / p95 | 1.850 s / 2.079 s |
+| Interim latency p50 / p95 | 0.392 s / 1.166 s |
+| Additional transcript writeback | passed |
+
+This is a lifecycle and latency control, not a transcription-accuracy score:
+the replay intentionally uses the production audio-file source without a
+timestamped reference in this runner. The answer-enabled path is measured from
+the same `derived/live_events.jsonl` format with `python3 -m hud.trace_report`.

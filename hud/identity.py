@@ -51,6 +51,11 @@ def _words(text: str) -> List[str]:
     return _WORD_RE.findall(text or "")
 
 
+def count_transcript_words(transcript: str) -> int:
+    """Count speech words while ignoring rendered timestamps and speaker labels."""
+    return sum(len(_words(line)) for _speaker, line in _transcript_lines(transcript))
+
+
 def derive_title(transcript: str, fallback: str = "Meeting") -> Tuple[str, str]:
     """Return ``(title, evidence_line)`` from the earliest useful speech.
 
@@ -109,7 +114,7 @@ def build_identity(started_at: datetime, ended_at: Optional[datetime],
         "speaker_mappings": {
             str(key): dict(value) for key, value in (speaker_mappings or {}).items()
         },
-        "transcript_words": len(_words(transcript)),
+        "transcript_words": count_transcript_words(transcript),
         "recording_mode": (
             "microphone + other party" if getattr(cfg, "record_mic", True)
             and getattr(cfg, "use_system", True) else

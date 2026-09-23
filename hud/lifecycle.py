@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .config import HudConfig
+from .identity import count_transcript_words
 from .replay import load_jsonl
 from .session import LiveSession
 from .transcript_writeback import TranscriptWriteback
@@ -109,7 +110,7 @@ def run_fixture(events: Iterable[Dict[str, Any]], outdir: Path,
     return {
         "original_outdir": str(original),
         "outdir": str(session.outdir),
-        "transcript_words": len(session.state.transcript_text().split()),
+        "transcript_words": count_transcript_words(session.state.transcript_text()),
         "latest_event_id": session.state.latest_id(),
         "writeback": str(session._writeback.path) if session._writeback else None,
         "status": session.state.status,

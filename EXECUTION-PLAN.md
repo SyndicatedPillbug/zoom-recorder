@@ -119,6 +119,12 @@ Current status: **100/100 normal deterministic lifecycle runs passed, 20/20 inje
 STT, writeback, and permission runs preserved durable artifacts, and the process-level forced-stop
 plus restart check passed with two distinct persisted sessions.** Phase 1.3 is complete.
 
+The real-audio replay runner is now available as `hud.e2e_audio`; it uses the production
+audio-file source and local STT path, while the deterministic harness remains the fast control.
+The provisioned 30-second AMI replay completed with Turbo, zero dropped chunks, and a successful
+additional transcript writeback. The runner also creates its output directory before session
+startup, so identity and diagnostic persistence cannot race a missing path.
+
 ### Step 1.4 — Add lifecycle observability — complete
 
 Add run ID, stage timestamps, stage duration, queue counters, and shutdown reason to the redacted
@@ -167,7 +173,8 @@ Measure capture-to-final, retrieval, prompt assembly, prompt tokens, provider qu
 answer, and talking-point completion.
 
 Gate: a slow answer can be attributed to a specific stage with p50/p95 values. **Met for answer
-queue/start/assembly/provider-complete/final states; aggregation and UI presentation remain open.**
+queue/start/assembly/provider-complete/final states; `hud.trace_report` now aggregates those
+boundaries across long replays, while UI presentation remains open.**
 
 ### Step 3.2 — Protect direct answers
 
@@ -184,9 +191,9 @@ and evidence status in the answer event.
 
 Gate: prompt size and assembly time remain below configured caps in a long meeting replay.
 
-Current status: prompt character budgets, retrieval metrics, and provider timing are visible in
-the answer event and HUD technical-details strip. Stable prompt-prefix caching and long-replay
-cap measurements remain open.
+Current status: prompt character budgets, retrieval metrics, provider timing, and a provider-free
+long-replay aggregation report are available. Stable prompt-prefix caching and a measured long-
+replay cap remain open.
 
 ## Phase 4 — Obsidian retrieval
 
@@ -298,6 +305,6 @@ test, and failure-injection results to the phase notes.
 1. [x] Add the fixture manifest and result persistence.
 2. [x] Run and record the control benchmark in `BENCHMARK-BASELINE.md`.
 3. [x] Build the controlled lifecycle harness.
-4. Run failure injection and repeated start/stop tests.
+4. [x] Run failure injection and repeated start/stop tests.
 5. [x] Correct latency clocks and add the unified trace.
 6. Only then tune windows, local agreement, models, retrieval, attribution, and UX.

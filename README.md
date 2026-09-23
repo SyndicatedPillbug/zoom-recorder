@@ -598,6 +598,21 @@ canonical transcript and writeback artifacts. The resulting diagnostics include
 shutdown stage durations and the answer pipeline emits trace IDs connecting
 queue wait, prompt assembly, provider TTFT, and final answer state.
 
+To aggregate those redacted answer traces across a long replay without
+including transcript or prompt text, run:
+
+```bash
+python3 -m hud.trace_report \
+  ~/ZoomRecordings/2026-09-22/14-32-08_enrollment-planning_a1b2c3d4/derived/live_events.jsonl \
+  --output /tmp/answer-trace-report.json
+```
+
+The report groups each answer by trace ID and reports p50/p95/max for queue
+wait, prompt assembly, retrieval, provider TTFT, provider time, total answer
+time, and context-size fields. Incomplete and failed traces are counted
+separately, so a long replay cannot hide degraded provider behavior behind a
+single average.
+
 For a paced local rolling-window benchmark, use the offline audio harness. It
 uses the same local Whisper backend and stable-prefix decoder as live mode, but
 does not touch capture, providers, or meeting state:
@@ -641,6 +656,21 @@ python3 -m hud.benchmark_suite fixtures/manifest.json \
 
 The suite fails on missing assets by default. `--allow-missing` records them as
 skipped so an incomplete corpus cannot be mistaken for a clean accuracy run.
+
+For a real local end-to-end replay through the production audio-file source,
+VAD/chunking, Turbo STT, session persistence, and optional transcript mirror:
+
+```bash
+python3 -m hud.e2e_audio /path/to/fixture.wav \
+  --model ~/.cache/whisper-cpp/ggml-large-v3-turbo-q5_0.bin \
+  --outdir /tmp/zoom-recorder-e2e \
+  --writeback-dir /tmp/zoom-recorder-mirror \
+  --output /tmp/zoom-recorder-e2e-result.json
+```
+
+This runner is intentionally separate from the fast deterministic lifecycle
+harness: it requires ffmpeg and a local model, runs at audio speed, and reports
+real transcript events, queue drops, writeback destination, and shutdown stages.
 
 Provision the deterministic non-speech safety fixtures with:
 
