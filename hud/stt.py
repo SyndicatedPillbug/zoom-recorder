@@ -64,6 +64,72 @@ class STTResult:
     compression_ratio: Optional[float] = None
 
 
+def _number(value) -> Optional[float]:
+    """Return a finite-looking numeric field from provider JSON, if present."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _result_from_verbose_payload(payload: dict, fallback_text: str,
+                                 no_speech_prob_max: float = 0.75,
+                                 avg_logprob_min: float = -1.5,
+                                 compression_ratio_max: float = 2.4) -> STTResult:
+    """Turn Whisper verbose JSON into text supported by segment evidence.
+
+    A provider-level ``text`` field is not sufficient evidence: Whisper can
+    populate it with an invented continuation even when every segment is
+    low-confidence. When segments are present, only segments that pass all
+    configured confidence gates are allowed into the result. If a provider
+    omits segments entirely, preserve its text for compatibility and let the
+    normal text-level filter make the final decision.
+    """
+    segments = payload.get("segments") or []
+    if not segments:
+        return STTResult(
+            text=(fallback_text or payload.get("text") or "").strip(),
+            avg_logprob=_number(payload.get("avg_logprob")),
+            no_speech_prob=_number(payload.get("no_speech_prob")),
+            compression_ratio=_number(payload.get("compression_ratio")),
+        )
+
+    kept: List[str] = []
+    logprobs: List[float] = []
+    no_speech: List[float] = []
+    ratios: List[float] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        segment_no_speech = _number(seg.get("no_speech_prob"))
+        segment_logprob = _number(seg.get("avg_logprob"))
+        segment_ratio = _number(seg.get("compression_ratio"))
+        if (segment_no_speech is not None and segment_no_speech > no_speech_prob_max):
+            continue
+        if segment_logprob is not None and segment_logprob < avg_logprob_min:
+            continue
+        if segment_ratio is not None and segment_ratio > compression_ratio_max:
+            continue
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        kept.append(text)
+        if segment_logprob is not None:
+            logprobs.append(segment_logprob)
+        if segment_no_speech is not None:
+            no_speech.append(segment_no_speech)
+        if segment_ratio is not None:
+            ratios.append(segment_ratio)
+    return STTResult(
+        # Deliberately do not fall back to the provider-level text here. If
+        # every segment failed, the text has no surviving audio evidence.
+        text=" ".join(kept).strip(),
+        avg_logprob=(sum(logprobs) / len(logprobs)) if logprobs else None,
+        no_speech_prob=max(no_speech) if no_speech else None,
+        compression_ratio=max(ratios) if ratios else None,
+    )
+
+
 def looks_hallucinated(text: str, marginal: bool = False,
                        avg_logprob: Optional[float] = None,
                        no_speech_prob: Optional[float] = None,
@@ -425,32 +491,11 @@ class RemoteSTT:
         return False
 
     def _from_verbose(self, result) -> STTResult:
-        segments = (result.data or {}).get("segments") or []
-        if not segments:
-            return STTResult(text=result.text)
-        kept: List[str] = []
-        logprobs: List[float] = []
-        no_speech: List[float] = []
-        ratios: List[float] = []
-        for seg in segments:
-            if not isinstance(seg, dict) or self._segment_bad(seg):
-                continue
-            text = str(seg.get("text") or "").strip()
-            if not text:
-                continue
-            kept.append(text)
-            for value, bucket in ((seg.get("avg_logprob"), logprobs),
-                                  (seg.get("no_speech_prob"), no_speech),
-                                  (seg.get("compression_ratio"), ratios)):
-                try:
-                    bucket.append(float(value))
-                except (TypeError, ValueError):
-                    pass
-        return STTResult(
-            text=" ".join(kept).strip() or result.text,
-            avg_logprob=(sum(logprobs) / len(logprobs)) if logprobs else None,
-            no_speech_prob=max(no_speech) if no_speech else None,
-            compression_ratio=max(ratios) if ratios else None,
+        return _result_from_verbose_payload(
+            result.data or {}, result.text,
+            no_speech_prob_max=self.no_speech_prob_max,
+            avg_logprob_min=self.avg_logprob_min,
+            compression_ratio_max=self.compression_ratio_max,
         )
 
 
@@ -465,13 +510,17 @@ class LocalWhisperSTT:
                  bin_name: str = "whisper-server",
                  allow_cli_fallback: bool = True,
                  no_speech_threshold: float = 0.60,
-                 no_fallback: bool = True) -> None:
+                 no_fallback: bool = True,
+                 verbose: bool = True) -> None:
         self.model = Path(model_path)
         self.log = log
         self.bin_name = bin_name
         self.allow_cli_fallback = allow_cli_fallback
         self.no_speech_threshold = float(no_speech_threshold)
         self.no_fallback = bool(no_fallback)
+        # Final recognition needs segment evidence; the separate interim lane
+        # can use the smaller, lower-latency JSON response instead.
+        self.verbose = bool(verbose)
         self._server: Optional[subprocess.Popen] = None
         self._port: Optional[int] = None
         self._cli = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
@@ -532,7 +581,8 @@ class LocalWhisperSTT:
         wav = pcm_to_wav(pcm)
         if self._server is not None and self._port is not None:
             try:
-                return STTResult(text=self._server_transcribe(wav, prompt))
+                result = self._server_transcribe(wav, prompt)
+                return result if isinstance(result, STTResult) else STTResult(text=result)
             except Exception as exc:  # noqa: BLE001
                 if not self.allow_cli_fallback:
                     self.log("local STT interim server request failed ({}); skipping draft".format(exc))
@@ -540,9 +590,10 @@ class LocalWhisperSTT:
                 self.log("local STT: server request failed ({}); using whisper-cli".format(exc))
         return STTResult(text=self._cli_transcribe(wav, prompt))
 
-    def _server_transcribe(self, wav: bytes, prompt: Optional[str] = None) -> str:
+    def _server_transcribe(self, wav: bytes, prompt: Optional[str] = None):
         from .llm import _encode_multipart  # reuse encoder
-        fields = {"response_format": "json", "temperature": "0.0"}
+        fields = {"response_format": ("verbose_json" if self.verbose else "json"),
+                  "temperature": "0.0"}
         if prompt:
             fields["prompt"] = prompt
         body, content_type = _encode_multipart(
@@ -556,6 +607,11 @@ class LocalWhisperSTT:
         with urllib.request.urlopen(req, timeout=60) as resp:
             import json
             obj = json.loads(resp.read().decode("utf-8"))
+        if self.verbose:
+            return _result_from_verbose_payload(
+                obj, obj.get("text") or "",
+                no_speech_prob_max=getattr(self, "no_speech_threshold", 0.60),
+            )
         return (obj.get("text") or "").strip()
 
     def _cli_transcribe(self, wav: bytes, prompt: Optional[str] = None) -> str:
@@ -838,7 +894,8 @@ class LiveTranscriber:
                 raise RuntimeError("local STT needs --model pointing at a ggml model")
             return LocalWhisperSTT(
                 self.model_path, self.log, self.cfg.stt_whisper_bin,
-                no_speech_threshold=min(0.60, self.cfg.stt_no_speech_prob_max))
+                no_speech_threshold=min(0.60, self.cfg.stt_no_speech_prob_max),
+                verbose=self.cfg.stt_verbose_stt)
         provider = self.cfg.provider_for_stt()
         if provider is None:
             raise RuntimeError("unknown STT backend '{}'".format(self.cfg.stt_backend))
@@ -874,7 +931,7 @@ class LiveTranscriber:
                 pass
         self.log("local STT: starting dedicated interim model {}".format(path.name))
         return LocalWhisperSTT(path, self.log, self.cfg.stt_whisper_bin,
-                               allow_cli_fallback=False)
+                               allow_cli_fallback=False, verbose=False)
 
     # -- sources -----------------------------------------------------------
     def _device_cmd(self, name: str) -> List[str]:

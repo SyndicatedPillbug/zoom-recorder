@@ -200,6 +200,27 @@ class SttPipelineTests(unittest.TestCase):
         stt._server_transcribe.assert_called_once()
         self.assertTrue(any("warmup skipped" in item for item in logs))
 
+    def test_local_server_verbose_response_is_confidence_gated(self) -> None:
+        import json
+
+        stt = LocalWhisperSTT.__new__(LocalWhisperSTT)
+        stt.verbose = True
+        stt._port = 1234
+        stt.no_speech_threshold = 0.60
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps({
+            "text": "I'm going to go to the next slide.",
+            "segments": [{"text": "I'm going to go to the next slide.",
+                          "no_speech_prob": 0.95, "avg_logprob": -2.2}],
+        }).encode("utf-8")
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = response
+            result = stt._server_transcribe(b"wav")
+        self.assertIsInstance(result, STTResult)
+        self.assertEqual(result.text, "")
+        request = urlopen.call_args.args[0]
+        self.assertIn(b"verbose_json", request.data)
+
     def test_interim_server_failure_never_falls_back_to_slow_cli(self) -> None:
         stt = LocalWhisperSTT.__new__(LocalWhisperSTT)
         stt.model = Path("/tmp/base.bin")
@@ -224,7 +245,8 @@ class SttPipelineTests(unittest.TestCase):
                 factory.return_value = expected
                 self.assertIs(tr._build_partial_stt(), expected)
                 factory.assert_called_once_with(
-                    model, mock.ANY, "whisper-server", allow_cli_fallback=False)
+                    model, mock.ANY, "whisper-server", allow_cli_fallback=False,
+                    verbose=False)
 
     def test_local_final_lane_uses_strict_no_speech_defaults(self) -> None:
         cfg = HudConfig(stt_backend="local", stt_no_speech_prob_max=0.8)
@@ -233,6 +255,7 @@ class SttPipelineTests(unittest.TestCase):
         with mock.patch("hud.stt.LocalWhisperSTT") as factory:
             tr._build_stt()
         self.assertEqual(factory.call_args.kwargs["no_speech_threshold"], 0.60)
+        self.assertTrue(factory.call_args.kwargs["verbose"])
 
     def test_partial_lane_can_run_while_final_lane_is_busy(self) -> None:
         cfg = HudConfig(stt_backend="local", stt_partial_window_seconds=0.2,
@@ -301,6 +324,20 @@ class SttPipelineTests(unittest.TestCase):
         events = tr.state.snapshot()["transcript"]
         self.assertEqual(events[0]["text"], "hello Acme world")
         self.assertIn("Acme", seen["prompt"])
+
+    def test_confidence_rejected_result_never_reaches_authoritative_transcript(self) -> None:
+        tr = self._transcriber(HudConfig(stt_hallucination_filter=True))
+
+        class FakeSTT:
+            def transcribe(self, pcm, prompt=None):
+                return STTResult(text="invented words", no_speech_prob=0.96,
+                                 avg_logprob=-2.2)
+
+        tr._stt = FakeSTT()
+        src = _Source("You", [])
+        tr._sources = [src]
+        tr._transcribe_chunk(b"audio", src, margin_db=10.0)
+        self.assertEqual(tr.state.snapshot()["transcript"], [])
 
     def test_local_partial_worker_keeps_draft_out_of_authoritative_text(self) -> None:
         cfg = HudConfig(stt_backend="local", stt_hallucination_filter=False)
@@ -529,6 +566,47 @@ class HallucinationTests(unittest.TestCase):
         self.assertIn("This is real speech", out.text)
         self.assertNotIn("we can see", out.text)
         self.assertGreater(out.no_speech_prob or 0, 0)
+
+    def test_local_verbose_payload_requires_segment_evidence(self) -> None:
+        from hud.stt import _result_from_verbose_payload
+
+        out = _result_from_verbose_payload({
+            "text": "I'm going to go to the next slide.",
+            "segments": [{
+                "text": "I'm going to go to the next slide.",
+                "no_speech_prob": 0.94,
+                "avg_logprob": -2.1,
+            }],
+        }, "I'm going to go to the next slide.")
+        self.assertEqual(out.text, "")
+
+    def test_local_verbose_payload_keeps_only_supported_segments(self) -> None:
+        from hud.stt import _result_from_verbose_payload
+
+        out = _result_from_verbose_payload({
+            "text": "real speech invented speech",
+            "segments": [
+                {"text": "The rollout starts tomorrow.",
+                 "no_speech_prob": 0.03, "avg_logprob": -0.22},
+                {"text": "invented speech", "no_speech_prob": 0.91,
+                 "avg_logprob": -2.0},
+            ],
+        }, "real speech invented speech")
+        self.assertEqual(out.text, "The rollout starts tomorrow.")
+
+    def test_local_verbose_payload_normal_sentence_survives_confidence_gate(self) -> None:
+        from hud.stt import _result_from_verbose_payload
+
+        out = _result_from_verbose_payload({
+            "text": "Can you send the revised deck this afternoon?",
+            "segments": [{
+                "text": "Can you send the revised deck this afternoon?",
+                "no_speech_prob": 0.02,
+                "avg_logprob": -0.18,
+                "compression_ratio": 1.4,
+            }],
+        }, "Can you send the revised deck this afternoon?")
+        self.assertEqual(out.text, "Can you send the revised deck this afternoon?")
 
 
 class TextTests(unittest.TestCase):

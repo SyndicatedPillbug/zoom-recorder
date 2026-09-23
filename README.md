@@ -336,10 +336,15 @@ workers (a slow call never makes the tap fall behind; if it does, the lag is
 shown and stale audio is dropped to stay live). The transcript is either
 transcribed by a remote OpenAI-compatible endpoint or locally with whisper.cpp,
 seeded with a short, sentence-aligned context prompt plus a configurable
-glossary (`stt.glossary`). Whisper's known non-speech output is filtered twice:
-at the segment level (using `verbose_json` `no_speech_prob` / `avg_logprob` /
-`compression_ratio`) and with a text filter that drops repetition loops and
-canned silence phrases. The HUD then runs two independent streams:
+glossary (`stt.glossary`). Whisper's known non-speech output is filtered twice.
+The authoritative/final local lane requests `verbose_json` and requires each
+published segment to carry passing `no_speech_prob` / `avg_logprob` /
+`compression_ratio` evidence; if all segments fail, the provider's aggregate
+text is discarded rather than trusted. Remote providers use the same segment
+gate when they support `verbose_json`. The lightweight interim lane remains
+JSON-only for latency and is never itself authoritative. A second text filter
+drops repetition loops and canned silence phrases. The HUD then runs two
+independent streams:
 **questions** are detected across the recent conversation (not just the newest
 chunk), including indirect interview questions without a question mark and
 questions split across adjacent STT chunks. They are answered with the stronger
