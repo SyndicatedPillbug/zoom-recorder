@@ -353,7 +353,12 @@
     if (ev.answer_queue_wait !== undefined || ev.prompt_chars !== undefined) {
       const wait = Number(ev.answer_queue_wait || 0).toFixed(1);
       const chars = Number(ev.prompt_chars || 0);
-      answerMetricsEl.textContent = 'answer q ' + wait + 's · prompt ' + chars;
+      let label = 'answer q ' + wait + 's · prompt ' + chars;
+      if (ev.retrieval_seconds !== undefined) {
+        label += ' · KB ' + Number(ev.retrieval_seconds).toFixed(2) + 's/' +
+          Number(ev.retrieved_count || 0) + ' snippets';
+      }
+      answerMetricsEl.textContent = label;
     }
     if (stick) answersEl.scrollTop = answersEl.scrollHeight;
   }

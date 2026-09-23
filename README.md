@@ -554,6 +554,10 @@ They contribute a small reranking signal after semantic and lexical matching,
 while the answer trace records retrieval duration, candidate count, selected
 count, and selected characters.
 
+The HUD's technical-details strip also shows the retrieval duration and selected
+snippet count next to answer queue and provider timing, so a slow response can
+be diagnosed without opening raw logs.
+
 For a very large vault, `kb.scope_tags` can limit static retrieval to notes whose
 frontmatter contains one of the configured tags (for example,
 `["enterprise", "active-client"]`). This changes retrieval scope only; indexing

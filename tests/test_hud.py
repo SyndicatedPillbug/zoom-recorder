@@ -1962,6 +1962,8 @@ class AnswerEngineTests(unittest.TestCase):
         answers = state.snapshot()["answers"]
         self.assertEqual(answers[0]["bullets"], ["first point", "second point"])
         self.assertEqual(answers[0]["kind"], "question")
+        self.assertIn("retrieval_seconds", answers[0])
+        self.assertIn("retrieved_count", answers[0])
         self.assertTrue(answers[0]["trace_id"])
         traces = [event for event in state.since(0) if event["type"] == "answer_trace"]
         self.assertEqual([event["stage"] for event in traces],

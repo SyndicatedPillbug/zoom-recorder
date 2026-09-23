@@ -184,6 +184,10 @@ and evidence status in the answer event.
 
 Gate: prompt size and assembly time remain below configured caps in a long meeting replay.
 
+Current status: prompt character budgets, retrieval metrics, and provider timing are visible in
+the answer event and HUD technical-details strip. Stable prompt-prefix caching and long-replay
+cap measurements remain open.
+
 ## Phase 4 — Obsidian retrieval
 
 ### Step 4.1 — Harden permissions and indexing

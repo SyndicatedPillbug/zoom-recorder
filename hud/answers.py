@@ -1312,7 +1312,12 @@ class AnswerEngine:
             prompt_chars=prompt_chars,
             prompt_estimated_tokens=prompt_tokens,
             context_chars=len(window),
-            reference_chars=reference_chars)
+            reference_chars=reference_chars,
+            retrieval_seconds=retrieval["retrieval_seconds"],
+            retrieved_count=retrieval["retrieved_count"],
+            retrieved_chars=retrieval["retrieved_chars"],
+            static_retrieved_count=retrieval["static_count"],
+            live_retrieved_count=retrieval["live_count"])
         event_id = placeholder["id"]
         accumulated = []
 
