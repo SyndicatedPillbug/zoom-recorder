@@ -658,6 +658,30 @@ class KBTests(unittest.TestCase):
                 self.assertTrue(again.build())
             self.assertTrue(again.query("alpha"))
 
+    def test_index_resumes_from_completed_file_cache_after_embed_failure(self) -> None:
+        class FailingEmbedder(self.KeywordEmbedder):
+            def encode(self, texts):
+                if self.calls:
+                    raise RuntimeError("synthetic embedding failure")
+                return super().encode(texts)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "a.md").write_text("# Alpha\n\nalpha content\n")
+            (root / "b.md").write_text("# Beta\n\nbeta content\n")
+            cache = Path(tmp) / "cache"
+            with mock.patch("hud.kb.EMBED_CHUNK_BATCH", 1):
+                self.assertFalse(KBIndex([str(root)], FailingEmbedder(),
+                                         cache_dir=str(cache),
+                                         log=lambda _m: None).build())
+                resumed_embedder = self.KeywordEmbedder()
+                self.assertTrue(KBIndex([str(root)], resumed_embedder,
+                                        cache_dir=str(cache),
+                                        log=lambda _m: None).build())
+            self.assertEqual(len(resumed_embedder.calls), 1)
+            self.assertIn("beta", resumed_embedder.calls[0][0].lower())
+
     def test_index_uses_metadata_to_break_semantic_ties(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "notes"

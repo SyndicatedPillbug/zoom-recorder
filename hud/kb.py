@@ -40,6 +40,7 @@ LEXICAL_STOPWORDS = {
     "that", "the", "this", "to", "was", "we", "what", "when", "where", "which",
     "who", "why", "with", "would", "you", "your",
 }
+EMBED_CHUNK_BATCH = 64
 
 
 # --------------------------------------------------------------------------
@@ -512,7 +513,7 @@ class KBIndex:
                 self._ready = True
                 return True
 
-        entries: List[Tuple[Path, str, List[Dict[str, str]],
+        entries: List[Tuple[Path, str, List[Dict[str, Any]],
                              Optional[List[List[float]]]]] = []
         reused_files = 0
         unreadable_files = 0
@@ -540,32 +541,42 @@ class KBIndex:
         pending_indices = [index for index, (_path, _fingerprint, file_chunks, vectors)
                            in enumerate(entries) if vectors is None and file_chunks]
         if pending_indices:
-            pending_chunks = [chunk for index in pending_indices
-                              for chunk in entries[index][2]]
-            try:
-                pending_vectors = self.embedder.encode(
-                    [self._embedding_text(c) for c in pending_chunks])
-            except Exception as exc:  # noqa: BLE001
-                self.log("KB: failed to embed ({}); continuing without KB".format(exc))
-                return False
-            if len(pending_vectors) != len(pending_chunks):
-                self.log("KB: embedding count mismatch ({} != {}); skipping KB".format(
-                    len(pending_vectors), len(pending_chunks)))
-                return False
-            offset = 0
-            for index in pending_indices:
-                path, content_fingerprint, file_chunks, _old_vectors = entries[index]
-                count = len(file_chunks)
-                file_vectors = pending_vectors[offset:offset + count]
-                offset += count
-                entries[index] = (path, content_fingerprint, file_chunks, file_vectors)
-                embedded_files += 1
+            batch_start = 0
+            while batch_start < len(pending_indices):
+                batch_indices: List[int] = []
+                batch_chunks: List[Dict[str, Any]] = []
+                for index in pending_indices[batch_start:]:
+                    file_chunks = entries[index][2]
+                    if (batch_indices and
+                            len(batch_chunks) + len(file_chunks) > EMBED_CHUNK_BATCH):
+                        break
+                    batch_indices.append(index)
+                    batch_chunks.extend(file_chunks)
                 try:
-                    self._save_file_cache(path, content_fingerprint,
-                                          file_chunks, file_vectors)
-                except OSError as exc:
-                    self.log("KB: could not write per-file cache for {} ({})".format(
-                        path, exc))
+                    batch_vectors = self.embedder.encode(
+                        [self._embedding_text(c) for c in batch_chunks])
+                except Exception as exc:  # noqa: BLE001
+                    self.log("KB: failed to embed batch ({}); continuing without KB".format(exc))
+                    return False
+                if len(batch_vectors) != len(batch_chunks):
+                    self.log("KB: embedding count mismatch ({} != {}); skipping KB".format(
+                        len(batch_vectors), len(batch_chunks)))
+                    return False
+                offset = 0
+                for index in batch_indices:
+                    path, content_fingerprint, file_chunks, _old_vectors = entries[index]
+                    count = len(file_chunks)
+                    file_vectors = batch_vectors[offset:offset + count]
+                    offset += count
+                    entries[index] = (path, content_fingerprint, file_chunks, file_vectors)
+                    embedded_files += 1
+                    try:
+                        self._save_file_cache(path, content_fingerprint,
+                                              file_chunks, file_vectors)
+                    except OSError as exc:
+                        self.log("KB: could not write per-file cache for {} ({})".format(
+                            path, exc))
+                batch_start += len(batch_indices)
 
         # Cached chunks and newly embedded chunks are accumulated together in
         # file order, keeping the vector list aligned with the chunk list.
