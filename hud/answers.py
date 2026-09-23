@@ -1023,7 +1023,7 @@ class AnswerEngine:
     def _flush_buffer(self) -> None:
         self._buffer = []
 
-    def _query_all(self, query_text: str, top_k: int) -> List:
+    def _query_all(self, query_text: str, top_k: int, return_metrics: bool = False):
         """Query the static KB and the live transcript index, merge by score.
 
         Both indexes share the same embedder, so cosine scores are directly
@@ -1032,11 +1032,18 @@ class AnswerEngine:
         user-provided reference docs and past recording transcripts.
         """
         from .kb import KBSnippet
+        started = time.time()
         results: List[KBSnippet] = []
+        static_count = 0
+        live_count = 0
         if self._kb is not None:
-            results.extend(self._kb.query(query_text, top_k))
+            static = self._kb.query(query_text, top_k)
+            static_count = len(static)
+            results.extend(static)
         if self._live_kb is not None:
-            results.extend(self._live_kb.query(query_text, top_k))
+            live = self._live_kb.query(query_text, top_k)
+            live_count = len(live)
+            results.extend(live)
         results.sort(key=lambda s: s.score, reverse=True)
         selected = []
         remaining = max(0, int(getattr(self.cfg, "kb_max_chars", 6000)))
@@ -1048,11 +1055,28 @@ class AnswerEngine:
                 text = text[:remaining]
             if not text:
                 continue
-            selected.append(KBSnippet(source=snippet.source,
-                                      heading=snippet.heading,
-                                      text=text, score=snippet.score))
+            selected.append(KBSnippet(
+                source=snippet.source,
+                heading=snippet.heading,
+                text=text,
+                score=snippet.score,
+                source_path=getattr(snippet, "source_path", ""),
+                metadata=dict(getattr(snippet, "metadata", {}) or {}),
+                links=list(getattr(snippet, "links", []) or []),
+            ))
             remaining -= len(text)
-        return selected
+        metrics = {
+            "retrieval_seconds": round(max(0.0, time.time() - started), 4),
+            "retrieved_candidates": len(results),
+            "retrieved_count": len(selected),
+            "retrieved_chars": sum(len(item.text) for item in selected),
+            "static_count": static_count,
+            "live_count": live_count,
+        }
+        for name, value in metrics.items():
+            if name.endswith("_seconds"):
+                self.state.observe_metric("kb_" + name, value)
+        return (selected, metrics) if return_metrics else selected
 
     # -- generation --------------------------------------------------------
     def _qa_recent(self) -> List[Dict[str, Any]]:
@@ -1250,7 +1274,8 @@ class AnswerEngine:
             query_text = "{} {}".format(effective, context or window[-1200:]).strip()
         else:
             query_text = window[-1500:]
-        snippets = self._query_all(query_text, self.cfg.kb_top_k)
+        snippets, retrieval = self._query_all(
+            query_text, self.cfg.kb_top_k, return_metrics=True)
 
         system = self._system_prompt("question")
         prompt = self._build_prompt("question", effective, context, window, snippets,
@@ -1266,7 +1291,13 @@ class AnswerEngine:
         self._trace(trace_id, "assembled", queue_wait_seconds=round(queue_wait, 4),
                     assembly_seconds=assembly_seconds, prompt_chars=prompt_chars,
                     prompt_estimated_tokens=prompt_tokens,
-                    context_chars=len(window), reference_chars=reference_chars)
+                    context_chars=len(window), reference_chars=reference_chars,
+                    retrieval_seconds=retrieval["retrieval_seconds"],
+                    retrieved_candidates=retrieval["retrieved_candidates"],
+                    retrieved_count=retrieval["retrieved_count"],
+                    retrieved_chars=retrieval["retrieved_chars"],
+                    static_retrieved_count=retrieval["static_count"],
+                    live_retrieved_count=retrieval["live_count"])
 
         # Create a placeholder answer event so the UI shows the question is
         # being answered immediately, then stream the raw text in.

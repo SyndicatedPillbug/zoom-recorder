@@ -202,8 +202,9 @@ Gate: every retrieved chunk carries file/heading provenance and retrieval stays 
 budget; full-vault prompt insertion is impossible.
 
 Current status: the merged static/live retrieval path now enforces `kb.max_chars` (6,000 by
-default) and is covered at the answer-consumption point. Tag/link-aware reranking and large-vault
-latency measurements remain open.
+default), preserves Obsidian frontmatter and wikilinks, applies a bounded metadata reranking
+signal, and records retrieval timing/candidate/selection counts in answer traces. Large-vault
+latency measurements and explicit tag/link scope controls remain open.
 
 ## Phase 5 — Participant attribution
 

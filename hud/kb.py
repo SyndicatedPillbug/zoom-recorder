@@ -23,13 +23,14 @@ import re
 import sqlite3
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 DEFAULT_CACHE = Path.home() / ".cache" / "zoom-recorder" / "kb"
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'_-]+", re.I)
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
 IGNORED_DIRS = {".obsidian", ".git", ".trash", ".stfolder", "node_modules",
                 "__pycache__"}
 LEXICAL_STOPWORDS = {
@@ -44,14 +45,22 @@ LEXICAL_STOPWORDS = {
 # Pure chunking (unit-tested, no third-party deps)
 # --------------------------------------------------------------------------
 def chunk_markdown(text: str, source: str, target_chars: int = 2400,
-                   overlap_chars: int = 300) -> List[Dict[str, str]]:
+                   overlap_chars: int = 300) -> List[Dict[str, Any]]:
     """Split markdown into heading-anchored, paragraph-aligned chunks."""
     if not text or not text.strip():
         return []
     heading_stack: List[str] = []
     blocks: List["tuple[str, str]"] = []  # (heading, paragraph)
 
-    for raw_line in text.splitlines():
+    in_frontmatter = False
+    for line_number, raw_line in enumerate(text.splitlines()):
+        if line_number == 0 and raw_line.strip() == "---":
+            in_frontmatter = True
+            continue
+        if in_frontmatter:
+            if raw_line.strip() == "---":
+                in_frontmatter = False
+            continue
         m = HEADING_RE.match(raw_line)
         if m:
             level = len(m.group(1))
@@ -80,7 +89,7 @@ def chunk_markdown(text: str, source: str, target_chars: int = 2400,
     if current_lines:
         paragraphs.append((current_heading, "\n".join(current_lines).strip()))
 
-    chunks: List[Dict[str, str]] = []
+    chunks: List[Dict[str, Any]] = []
     buf = ""
     buf_heading = ""
     for heading, para in paragraphs:
@@ -96,14 +105,19 @@ def chunk_markdown(text: str, source: str, target_chars: int = 2400,
     if buf:
         chunks.append(_make_chunk(buf_heading, buf, source))
     metadata = _frontmatter(text)
-    if metadata:
-        for chunk in chunks:
-            chunk["metadata"] = dict(metadata)
+    for chunk in chunks:
+        chunk["metadata"] = dict(metadata)
+        chunk["links"] = _wikilinks(chunk.get("text", ""))
     return chunks
 
 
-def _make_chunk(heading: str, body: str, source: str) -> Dict[str, str]:
+def _make_chunk(heading: str, body: str, source: str) -> Dict[str, Any]:
     return {"source": source, "heading": heading or source, "text": body.strip()}
+
+
+def _wikilinks(text: str) -> List[str]:
+    return sorted({match.group(1).strip() for match in WIKILINK_RE.finditer(text or "")
+                   if match.group(1).strip()})
 
 
 def _frontmatter(text: str) -> Dict[str, str]:
@@ -145,7 +159,7 @@ class SQLiteLexicalIndex:
         except (OSError, sqlite3.Error) as exc:
             self.log("KB: SQLite FTS unavailable; using in-memory lexical index ({})".format(exc))
 
-    def replace(self, chunks: List[Dict[str, str]]) -> None:
+    def replace(self, chunks: List[Dict[str, Any]]) -> None:
         if not self.enabled:
             return
         try:
@@ -153,11 +167,11 @@ class SQLiteLexicalIndex:
                 db.execute("DELETE FROM chunks")
                 db.executemany("INSERT INTO chunks(source, heading, text) VALUES (?, ?, ?)",
                                 [(str(c.get("source", "")), str(c.get("heading", "")),
-                                  str(c.get("text", ""))) for c in chunks])
+                                  _lexical_text(c)) for c in chunks])
         except sqlite3.Error as exc:
             self.log("KB: SQLite lexical update failed ({})".format(exc))
 
-    def query(self, text: str, limit: int = 1000) -> List[Tuple[str, str, str]]:
+    def query(self, text: str, limit: int = 1000) -> List[Tuple[str, str]]:
         if not self.enabled:
             return []
         terms = [t for t in _tokens(text) if len(t) > 1]
@@ -167,9 +181,9 @@ class SQLiteLexicalIndex:
         try:
             with sqlite3.connect(str(self.path)) as db:
                 rows = db.execute(
-                    "SELECT source, heading, text FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?",
+                    "SELECT source, heading FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?",
                     (match, int(limit))).fetchall()
-            return [(str(a), str(b), str(c)) for a, b, c in rows]
+            return [(str(a), str(b)) for a, b in rows]
         except sqlite3.Error:
             return []
 
@@ -233,6 +247,28 @@ def _lexical_score(query: str, chunk: Dict[str, str]) -> float:
     if phrase and phrase in body:
         overlap = min(1.0, overlap + 0.15)
     return overlap
+
+
+def _metadata_score(query: str, chunk: Dict[str, Any]) -> float:
+    """Score query-term overlap with frontmatter values and Obsidian links."""
+    query_tokens = set(_tokens(query))
+    if not query_tokens:
+        return 0.0
+    metadata = chunk.get("metadata") or {}
+    values = [str(value) for value in metadata.values()]
+    values.extend(str(link) for link in (chunk.get("links") or []))
+    metadata_tokens = set(_tokens(" ".join(values)))
+    if not metadata_tokens:
+        return 0.0
+    return len(query_tokens & metadata_tokens) / len(query_tokens)
+
+
+def _lexical_text(chunk: Dict[str, Any]) -> str:
+    """Text indexed by SQLite FTS, including metadata retrieval signals."""
+    metadata = chunk.get("metadata") or {}
+    values = [str(value) for value in metadata.values()]
+    values.extend(str(link) for link in (chunk.get("links") or []))
+    return "\n".join([str(chunk.get("text", "")), *values])
 
 
 # --------------------------------------------------------------------------
@@ -317,6 +353,9 @@ class KBSnippet:
     heading: str
     text: str
     score: float
+    source_path: str = ""
+    metadata: Dict[str, str] = field(default_factory=dict)
+    links: List[str] = field(default_factory=list)
 
 
 class KBIndex:
@@ -329,7 +368,7 @@ class KBIndex:
         self.log = log or (lambda _m: None)
         self.min_score = min_score
         self.max_chunks = max_chunks
-        self._chunks: List[Dict[str, str]] = []
+        self._chunks: List[Dict[str, Any]] = []
         self._vectors: List[List[float]] = []
         self._token_index: Dict[str, List[int]] = {}
         self._ready = False
@@ -340,7 +379,7 @@ class KBIndex:
         index: Dict[str, List[int]] = {}
         for number, chunk in enumerate(self._chunks):
             for token in set(_tokens("{}\n{}".format(
-                    chunk.get("heading", ""), chunk.get("text", "")))):
+                    chunk.get("heading", ""), _lexical_text(chunk)))):
                 index.setdefault(token, []).append(number)
         self._token_index = index
 
@@ -483,7 +522,7 @@ class KBIndex:
 
         # Cached chunks and newly embedded chunks are accumulated together in
         # file order, keeping the vector list aligned with the chunk list.
-        chunks: List[Dict[str, str]] = []
+        chunks: List[Dict[str, Any]] = []
         vectors: List[List[float]] = []
         for _path, _content_fingerprint, file_chunks, file_vectors in entries:
             chunks.extend(file_chunks)
@@ -610,12 +649,10 @@ class KBIndex:
         if len(vectors) > 5000:
             lexical_rows = self._sqlite.query(text, limit=2000)
             if lexical_rows:
-                wanted = {(source, heading, body)
-                          for source, heading, body in lexical_rows}
+                wanted = {(source, heading) for source, heading in lexical_rows}
                 candidates = {idx for idx, chunk in enumerate(chunks)
                               if (str(chunk.get("source", "")),
-                                  str(chunk.get("heading", "")),
-                                  str(chunk.get("text", ""))) in wanted}
+                                  str(chunk.get("heading", ""))) in wanted}
             else:
                 query_tokens = set(_tokens(text))
                 candidates = {idx for token in query_tokens
@@ -631,7 +668,8 @@ class KBIndex:
                 continue
             semantic = _dot(query_vec, vec) / (qnorm * norm)
             lexical = _lexical_score(text, chunks[idx])
-            score = (0.8 * semantic) + (0.2 * lexical)
+            metadata = _metadata_score(text, chunks[idx])
+            score = (0.8 * semantic) + (0.2 * lexical) + (0.1 * metadata)
             if score > self.min_score or lexical >= 0.5:
                 scored.append((score, idx))
         scored.sort(reverse=True)
@@ -646,5 +684,8 @@ class KBIndex:
                 heading=chunk.get("heading", ""),
                 text=chunk["text"],
                 score=float(score),
+                source_path=str(chunk.get("source", "")),
+                metadata=dict(chunk.get("metadata") or {}),
+                links=list(chunk.get("links") or []),
             ))
         return out

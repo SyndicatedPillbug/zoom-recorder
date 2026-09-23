@@ -608,6 +608,13 @@ class KBTests(unittest.TestCase):
     def test_chunk_markdown_empty(self) -> None:
         self.assertEqual(chunk_markdown("", "x.md"), [])
 
+    def test_chunk_preserves_obsidian_metadata_and_links(self) -> None:
+        md = ("---\ntags: [pricing, enterprise]\n---\n"
+              "# Account plan\n\nSee [[Enterprise pricing]] for details.")
+        chunks = chunk_markdown(md, "notes.md")
+        self.assertEqual(chunks[0]["metadata"]["tags"], "pricing, enterprise")
+        self.assertEqual(chunks[0]["links"], ["Enterprise pricing"])
+
     def test_index_builds_and_queries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "notes"
@@ -634,6 +641,23 @@ class KBTests(unittest.TestCase):
                             cache_dir=str(cache), log=lambda _m: None)
             self.assertTrue(again.build())
             self.assertTrue(again.query("alpha"))
+
+    def test_index_uses_metadata_to_break_semantic_ties(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "general.md").write_text(
+                "# Pricing\n\nPricing is discussed here.\n")
+            (root / "enterprise.md").write_text(
+                "---\ntags: [enterprise]\n---\n# Pricing\n\n"
+                "Pricing is discussed here.\n")
+            index = KBIndex([str(root)], self.KeywordEmbedder(),
+                            cache_dir=str(Path(tmp) / "cache"),
+                            log=lambda _m: None, min_score=0.0)
+            self.assertTrue(index.build())
+            hits = index.query("pricing enterprise", top_k=2)
+            self.assertEqual(hits[0].source, "enterprise.md")
+            self.assertEqual(hits[0].metadata.get("tags"), "enterprise")
 
     def test_index_reembeds_only_changed_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1001,6 +1025,10 @@ class MemoryAndReplayTests(unittest.TestCase):
         self.assertEqual(sum(len(item.text) for item in snippets), 10)
         self.assertEqual(snippets[0].text, "123456789")
         self.assertEqual(snippets[1].text, "a")
+        snippets, metrics = engine._query_all("question", 5, return_metrics=True)
+        self.assertEqual(len(snippets), 2)
+        self.assertEqual(metrics["retrieved_chars"], 10)
+        self.assertIn("retrieval_seconds", metrics)
 
     def test_benchmark_suite_records_completed_and_skipped_fixtures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1861,6 +1889,8 @@ class AnswerEngineTests(unittest.TestCase):
         self.assertEqual([event["stage"] for event in traces],
                          ["started", "assembled", "provider_complete"])
         self.assertIn("prompt_estimated_tokens", traces[1])
+        self.assertIn("retrieval_seconds", traces[1])
+        self.assertIn("retrieved_chars", traces[1])
         self.assertIn("provider_ttft_seconds", traces[2])
 
     def test_rate_limited_primary_uses_answer_fallback(self) -> None:

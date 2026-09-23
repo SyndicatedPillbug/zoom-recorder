@@ -549,6 +549,11 @@ Knowledge retrieval is bounded by `kb.max_chars` (6,000 by default) across the
 merged static-vault and live-transcript results, so a large vault cannot expand
 answer prompts without limit.
 
+Obsidian frontmatter and `[[wikilinks]]` are retained with each indexed chunk.
+They contribute a small reranking signal after semantic and lexical matching,
+while the answer trace records retrieval duration, candidate count, selected
+count, and selected characters.
+
 ```bash
 python3 -m hud.replay ~/ZoomRecordings/2026-09-22/14-32-08_enrollment-planning_a1b2c3d4/derived/live_events.jsonl
 ```
