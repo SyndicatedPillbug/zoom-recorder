@@ -151,6 +151,12 @@
     </div></div>
     <div class="row"><label>Snippets (top k)</label><div class="ctl">
       <input type="number" step="1" min="1" id="kb.top_k" /></div></div>
+    <div class="row"><label>Prompt cap (chars)</label><div class="ctl">
+      <input type="number" step="500" min="500" id="kb.max_chars" />
+      <span class="hint">total retrieved note text</span></div></div>
+    <div class="row"><label>Scope tags</label><div class="ctl">
+      <input type="text" id="kb.scope_tags" placeholder="enterprise, active-client (optional)" />
+      <span class="hint">frontmatter or inline #tags</span></div></div>
     <div class="row"><label>Embeddings</label><div class="ctl">
       <select id="kb.embed_backend">
         <option value="auto">auto (recommended)</option>
@@ -312,7 +318,8 @@
     setVal('answers.talking_points_grounded', c.answers.talking_points_grounded);
     setVal('answers.talking_points_max', c.answers.talking_points_max);
     setVal('answers.talking_points_min_new_words', c.answers.talking_points_min_new_words);
-    setVal('kb.enabled', c.kb.enabled); setVal('kb.top_k', c.kb.top_k); setVal('kb.model', c.kb.model);
+    setVal('kb.enabled', c.kb.enabled); setVal('kb.top_k', c.kb.top_k); setVal('kb.max_chars', c.kb.max_chars);
+    setVal('kb.scope_tags', (c.kb.scope_tags || []).join(', ')); setVal('kb.model', c.kb.model);
     setVal('kb.embed_backend', c.kb.embed_backend); setVal('kb.embed_model', c.kb.embed_model);
     setVal('kb.min_score', c.kb.min_score);
     kbDirs = (c.kb.dirs || []).slice(); renderDirs();
@@ -359,7 +366,9 @@
                  talking_points_max: num('answers.talking_points_max'),
                  talking_points_min_new_words: num('answers.talking_points_min_new_words') },
       kb: { enabled: $('kb.enabled').checked, dirs: kbDirs.slice(),
-            top_k: num('kb.top_k'), model: $('kb.model').value,
+            top_k: num('kb.top_k'), max_chars: num('kb.max_chars'),
+            scope_tags: $('kb.scope_tags').value.split(',').map(s => s.trim()).filter(Boolean),
+            model: $('kb.model').value,
             embed_backend: $('kb.embed_backend').value,
             embed_model: $('kb.embed_model').value || null,
             min_score: Number($('kb.min_score').value || 0.1) },
