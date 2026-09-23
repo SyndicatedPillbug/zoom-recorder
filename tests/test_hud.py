@@ -43,6 +43,7 @@ from hud.evaluation import (first_stable_publication_stats, normalize_words,  # 
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
 from hud.kb import KBIndex, KBSnippet, _lexical_score, chunk_markdown  # noqa: E402
+from hud.kb_benchmark import run_benchmark as run_kb_benchmark  # noqa: E402
 from hud.lifecycle import run_fixture  # noqa: E402
 from hud.local_http import host_from_header, url_host  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
@@ -658,6 +659,29 @@ class KBTests(unittest.TestCase):
             hits = index.query("pricing enterprise", top_k=2)
             self.assertEqual(hits[0].source, "enterprise.md")
             self.assertEqual(hits[0].metadata.get("tags"), "enterprise")
+
+    def test_index_can_scope_retrieval_to_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "general.md").write_text(
+                "---\ntags: [general]\n---\n# Pricing\n\nPricing is discussed.\n")
+            (root / "enterprise.md").write_text(
+                "---\ntags: [enterprise]\n---\n# Pricing\n\nPricing is discussed.\n")
+            index = KBIndex([str(root)], self.KeywordEmbedder(),
+                            cache_dir=str(Path(tmp) / "cache"),
+                            log=lambda _m: None, min_score=0.0,
+                            scope_tags=["enterprise"])
+            self.assertTrue(index.build())
+            hits = index.query("pricing", top_k=5)
+            self.assertEqual([hit.source for hit in hits], ["enterprise.md"])
+
+    def test_retrieval_benchmark_reports_latency_samples(self) -> None:
+        result = run_kb_benchmark(chunk_count=40, query_count=3, top_k=2)
+        self.assertEqual(result["chunk_count"], 40)
+        self.assertEqual(result["query_count"], 3)
+        self.assertIsNotNone(result["query_seconds"]["p50"])
+        self.assertIsNotNone(result["query_seconds"]["p95"])
 
     def test_index_reembeds_only_changed_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1280,7 +1304,8 @@ class ConfigTests(unittest.TestCase):
         cfg = HudConfig(
             speakers_enabled=True, self_name="Dana", remote_name="Client",
             answers_backend="openrouter", answers_fallback=["groq", "ollama"],
-            kb_dirs=["/a", "/b"], kb_top_k=7, budget_tpm=100, budget_tpd=200,
+            kb_dirs=["/a", "/b"], kb_top_k=7, kb_scope_tags=["enterprise"],
+            budget_tpm=100, budget_tpd=200,
             port=1234, open_browser=False, answer_interval=20.0,
             chat_model="m1", rolling_model="m2", answers_enabled=False,
             context_max_chars=4321, question_lookback_seconds=42.0,
@@ -1299,7 +1324,7 @@ class ConfigTests(unittest.TestCase):
         again = config_from_dict(config_to_dict(cfg))
         for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
                      "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
-                     "kb_max_chars",
+                     "kb_max_chars", "kb_scope_tags",
                      "open_browser", "answer_interval", "chat_model", "rolling_model",
                      "answers_enabled", "context_max_chars", "question_lookback_seconds",
                      "question_rewrite", "kb_embed_backend", "kb_embed_model",

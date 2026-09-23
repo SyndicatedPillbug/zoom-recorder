@@ -621,7 +621,8 @@ class AnswerEngine:
                             self.log("KB: auto-included recordings dir {}".format(parent))
                     kb = KBIndex(dirs, embedder,
                                  cache_dir=self.cfg.kb_cache_dir, log=self.log,
-                                 min_score=self.cfg.kb_min_score)
+                                 min_score=self.cfg.kb_min_score,
+                                 scope_tags=self.cfg.kb_scope_tags)
                     if kb.build(force=self.cfg.kb_reindex):
                         self._kb = kb
                     else:

@@ -84,3 +84,26 @@ The 3-second candidate is rejected. It is both less accurate at the opening
 boundary and less complete, while not improving publication latency. Keep the
 4-second interim default until a broader speech corpus produces a different
 result.
+
+## Large-vault retrieval control
+
+The reproducible synthetic benchmark is:
+
+```bash
+python3 -m hud.kb_benchmark --chunks 6000 --queries 40 --top-k 5 \
+  --output /tmp/kb-retrieval-6000.json
+```
+
+On 2026-09-22, using the production `KBIndex`, deterministic hashing embeddings,
+and SQLite FTS candidate filtering:
+
+| Scope | Query p50 | Query p95 | Max query | Setup |
+| --- | ---: | ---: | ---: | ---: |
+| Unscoped 6,000 chunks | 116.7 ms | 210.3 ms | 295.9 ms | 5.37 s |
+| `enterprise` tag scope | 30.2 ms | 48.0 ms | 66.3 ms | 1.70 s |
+
+This is a retrieval-latency control, not a claim about embedding-model quality
+or production hardware. Memory was not measured and is recorded as `null` by
+the result schema. The tag-scoped result demonstrates the expected latency
+benefit when a large vault is organized with useful frontmatter; target-machine
+measurements remain the release gate.

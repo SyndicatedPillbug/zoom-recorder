@@ -554,6 +554,16 @@ They contribute a small reranking signal after semantic and lexical matching,
 while the answer trace records retrieval duration, candidate count, selected
 count, and selected characters.
 
+For a very large vault, `kb.scope_tags` can limit static retrieval to notes whose
+frontmatter contains one of the configured tags (for example,
+`["enterprise", "active-client"]`). This changes retrieval scope only; indexing
+and live capture remain background work. The deterministic retrieval benchmark
+can be run with:
+
+```bash
+python3 -m hud.kb_benchmark --chunks 6000 --queries 40 --output /tmp/kb-retrieval.json
+```
+
 ```bash
 python3 -m hud.replay ~/ZoomRecordings/2026-09-22/14-32-08_enrollment-planning_a1b2c3d4/derived/live_events.jsonl
 ```

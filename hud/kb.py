@@ -263,6 +263,14 @@ def _metadata_score(query: str, chunk: Dict[str, Any]) -> float:
     return len(query_tokens & metadata_tokens) / len(query_tokens)
 
 
+def _chunk_tags(chunk: Dict[str, Any]) -> set:
+    """Return normalized Obsidian tags from frontmatter for optional scoping."""
+    metadata = chunk.get("metadata") or {}
+    raw = str(metadata.get("tags") or metadata.get("tag") or "")
+    return {token.lower().lstrip("#") for token in re.split(r"[,\s]+", raw)
+            if token.strip().lstrip("#")}
+
+
 def _lexical_text(chunk: Dict[str, Any]) -> str:
     """Text indexed by SQLite FTS, including metadata retrieval signals."""
     metadata = chunk.get("metadata") or {}
@@ -361,13 +369,16 @@ class KBSnippet:
 class KBIndex:
     def __init__(self, dirs: List[str], embedder, cache_dir: Optional[str] = None,
                  log: Optional[Callable[[str], None]] = None,
-                 min_score: float = 0.1, max_chunks: int = 0) -> None:
+                 min_score: float = 0.1, max_chunks: int = 0,
+                 scope_tags: Optional[List[str]] = None) -> None:
         self.dirs = [d for d in dirs if d]
         self.embedder = embedder
         self.cache_dir = Path(os.path.expanduser(cache_dir)) if cache_dir else DEFAULT_CACHE
         self.log = log or (lambda _m: None)
         self.min_score = min_score
         self.max_chunks = max_chunks
+        self.scope_tags = {str(tag).strip().lower().lstrip("#")
+                           for tag in (scope_tags or []) if str(tag).strip()}
         self._chunks: List[Dict[str, Any]] = []
         self._vectors: List[List[float]] = []
         self._token_index: Dict[str, List[int]] = {}
@@ -642,10 +653,15 @@ class KBIndex:
             token_index = {token: list(indices)
                            for token, indices in self._token_index.items()}
 
+        allowed_indices = None
+        if self.scope_tags:
+            allowed_indices = {idx for idx, chunk in enumerate(chunks)
+                               if self.scope_tags.intersection(_chunk_tags(chunk))}
+
         # Large vaults benefit from a cheap exact-term candidate set. If the
         # query has no lexical anchor, fall back to the full semantic scan so
         # conceptual/synonym matches are never discarded.
-        candidate_indices = range(len(vectors))
+        candidate_indices = allowed_indices if allowed_indices is not None else range(len(vectors))
         if len(vectors) > 5000:
             lexical_rows = self._sqlite.query(text, limit=2000)
             if lexical_rows:
@@ -657,6 +673,8 @@ class KBIndex:
                 query_tokens = set(_tokens(text))
                 candidates = {idx for token in query_tokens
                               for idx in token_index.get(token, [])}
+            if allowed_indices is not None:
+                candidates &= allowed_indices
             if candidates and len(candidates) < len(vectors) * 0.75:
                 candidate_indices = candidates
 

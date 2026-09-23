@@ -203,8 +203,9 @@ budget; full-vault prompt insertion is impossible.
 
 Current status: the merged static/live retrieval path now enforces `kb.max_chars` (6,000 by
 default), preserves Obsidian frontmatter and wikilinks, applies a bounded metadata reranking
-signal, and records retrieval timing/candidate/selection counts in answer traces. Large-vault
-latency measurements and explicit tag/link scope controls remain open.
+signal, records retrieval timing/candidate/selection counts in answer traces, and supports the
+optional `kb.scope_tags` static-vault filter. The deterministic `hud.kb_benchmark` is available;
+target-hardware latency measurements remain open.
 
 ## Phase 5 — Participant attribution
 

@@ -219,6 +219,7 @@ class HudConfig:
     kb_model: str = "all-MiniLM-L6-v2"
     kb_top_k: int = 5
     kb_max_chars: int = 6000
+    kb_scope_tags: List[str] = field(default_factory=list)
     kb_reindex: bool = False
     kb_cache_dir: Optional[str] = None
     kb_embed_backend: str = "auto"      # auto | sentence-transformers | ollama | openai
@@ -373,6 +374,7 @@ def _defaults() -> Dict[str, Any]:
             "model": "all-MiniLM-L6-v2",
             "top_k": 5,
             "max_chars": 6000,
+            "scope_tags": [],
             "reindex": False,
             "cache_dir": None,
             "embed_backend": "auto",
@@ -492,6 +494,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         kb_model=str(kb.get("model") or "all-MiniLM-L6-v2"),
         kb_top_k=_as_int(kb.get("top_k"), 5),
         kb_max_chars=_as_int(kb.get("max_chars"), 6000),
+        kb_scope_tags=_as_str_list(kb.get("scope_tags")),
         kb_reindex=bool(kb.get("reindex", False)),
         kb_cache_dir=kb.get("cache_dir") or None,
         kb_embed_backend=str(kb.get("embed_backend") or "auto"),
@@ -596,6 +599,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "model": cfg.kb_model,
         "top_k": cfg.kb_top_k,
         "max_chars": cfg.kb_max_chars,
+        "scope_tags": list(cfg.kb_scope_tags),
         "reindex": cfg.kb_reindex,
         "cache_dir": cfg.kb_cache_dir,
         "embed_backend": cfg.kb_embed_backend,
