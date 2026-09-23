@@ -210,7 +210,8 @@ default), preserves Obsidian frontmatter and wikilinks, applies a bounded metada
 signal, records retrieval timing/candidate/selection counts in answer traces, supports the
 optional `kb.scope_tags` static-vault filter, and uses a conservative file-stat fast path before
 falling back to content fingerprints. The deterministic `hud.kb_benchmark` is available;
-target-hardware latency measurements and resumable mid-build checkpoints remain open.
+resumable mid-build checkpoints are covered; target-hardware latency measurements and permission
+recovery remain open.
 
 ## Phase 5 — Participant attribution
 
