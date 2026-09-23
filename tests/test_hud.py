@@ -2631,6 +2631,11 @@ class SummaryTests(unittest.TestCase):
             fake_proc.terminate.assert_called_once_with()
             fake_proc.wait.assert_called_once()
 
+    def test_glass_hud_keeps_webkit_text_input_keyable(self) -> None:
+        source = Path("hud/native_window.py").read_text(encoding="utf-8")
+        self.assertIn("window.setBecomesKeyOnlyIfNeeded_(False)", source)
+        self.assertIn("def windowShouldBecomeKey_", source)
+
 
 class DevicesTests(unittest.TestCase):
     def _topology(self, items, default_input=None, default_output=None):

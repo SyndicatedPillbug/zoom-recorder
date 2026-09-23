@@ -65,6 +65,11 @@ class _WindowDelegate(NSObject):
         window.orderOut_(None)
         return False
 
+    def windowShouldBecomeKey_(self, window: Any) -> bool:  # noqa: N802
+        # The Glass HUD is non-activating so clicks outside it return to the
+        # meeting app, but its WebKit text field still needs keyboard focus.
+        return True
+
 
 def _with_surface_query(url: str, mode: str, opacity: float, compact: bool) -> str:
     parts = urlsplit(url)
@@ -116,7 +121,10 @@ def run(url: str, title: str = "Meeting HUD", mode: str = "window",
         window = fw["NSPanel"].alloc().initWithContentRect_styleMask_backing_defer_(
             rect, style, fw["NSBackingStoreBuffered"], False)
         window.setFloatingPanel_(True)
-        window.setBecomesKeyOnlyIfNeeded_(True)
+        # This panel contains an editable question field. Apple specifically
+        # recommends false when a panel has text fields; true can leave the
+        # WebKit input visible but unable to become first responder.
+        window.setBecomesKeyOnlyIfNeeded_(False)
         window.setMovableByWindowBackground_(True)
         window.setHasShadow_(True)
         window.setHidesOnDeactivate_(False)

@@ -117,6 +117,11 @@
     color: var(--text); border-radius: 6px; padding: 6px 10px; font: inherit;
   }
   .askbar input:focus { outline: none; border-color: var(--accent); }
+  body.overlay .askbar input:focus {
+    background: rgba(30, 45, 70, .92);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(94,160,255,.28), 0 2px 10px rgba(0,0,0,.35);
+  }
   .copy { float: right; opacity: 0; border: none; background: none; color: var(--muted); cursor: pointer; font-size: 11px; }
   .point:hover .copy, .card:hover .copy { opacity: 1; }
 .point.pinned { border-left: 2px solid var(--accent); padding-left: 10px; }

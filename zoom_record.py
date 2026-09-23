@@ -1560,9 +1560,15 @@ def main(argv: List[str]) -> int:
                 try:
                     from hud.routing_fix import fix_routing
                     result = fix_routing(topo, assume_yes=True)
-                    if result.changed:
-                        log.info("Routing: {}".format(result.message.splitlines()[0]))
+                    detail = result.message.splitlines()[0] if result.message else ""
+                    if result.ok:
+                        log.info("Routing: {}".format(
+                            detail or ("Multi-Output route ready" if result.changed
+                                       else "existing loopback route verified")))
                         topo = load_topology(force=True)
+                    else:
+                        log.warn("Loopback routing setup failed: {}".format(
+                            detail or "unknown routing error"))
                 except Exception as exc:  # noqa: BLE001
                     log.warn("Loopback routing setup skipped ({})".format(exc))
                 if topo is not None:
