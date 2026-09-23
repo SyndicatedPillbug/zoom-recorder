@@ -269,10 +269,12 @@ folder, Obsidian folder, provider mode, diarization toggle, and performance pres
 
 Gate: a clean install/configuration can start a fixture run without terminal intervention.
 
-The live surface now defaults to a native Mac AppKit/WebKit window with an always-on-top,
-all-Spaces presentation and a browser fallback. Its capture-sharing status is exposed in the HUD
-so the user can distinguish a native best-effort privacy request from an ordinary browser window.
-The setting is reversible without changing existing recording or transcript paths.
+The live surface now defaults to a native Mac AppKit/WebKit Window mode with an always-on-top,
+all-Spaces presentation and a browser fallback. A selectable Glass HUD mode adds a transparent,
+borderless `NSPanel`, persistent geometry, opacity and compact-density controls, and a
+background-readable glass treatment. Its capture-sharing status is exposed in the HUD so the user
+can distinguish a native best-effort privacy request from an ordinary browser window. The setting
+is reversible without changing existing recording or transcript paths.
 
 ### Step 6.2 — Make state legible
 

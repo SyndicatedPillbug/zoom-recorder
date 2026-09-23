@@ -265,8 +265,9 @@ Exit criteria:
 Current status: Settings exposes audio, models, providers, writeback, Obsidian folders,
 diarization, and retrieval budgets/scope. The HUD exposes transcript/answer state, editable
 speaker labels, and technical latency details. Setup now exports one-click redacted diagnostics;
-the Mac HUD now opens in a native AppKit/WebKit surface by default with browser fallback and
-explicit best-effort capture-protection status; integrated permission recovery remains open.
+the Mac HUD now opens in a selectable native AppKit/WebKit Window or Glass HUD surface by default
+with browser fallback and explicit best-effort capture-protection status; integrated permission
+recovery remains open.
 
 ## Phase 7 — Privacy, security, and operational hardening
 

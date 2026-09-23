@@ -126,6 +126,51 @@
 .details[hidden] { display: none; }
 .footerbar { position: sticky; bottom: 0; display: flex; justify-content: flex-end;
   padding: 8px 20px; background: var(--panel); border-top: 1px solid var(--border); }
+
+/* Glass HUD mode: the native host makes the window itself transparent; these
+   surfaces provide contrast without turning the entire overlay into a solid
+   rectangle. Strong text shadow and a translucent backdrop keep transcript
+   words readable over video, slides, and light/dark call backgrounds. */
+html.overlay, body.overlay { background: transparent; }
+body.overlay { padding: 8px; gap: 8px; }
+body.overlay header, body.overlay .details, body.overlay .warnbar,
+body.overlay .footerbar {
+  background: rgba(10, 13, 19, .68);
+  border: 1px solid rgba(255, 255, 255, .16);
+  border-radius: 14px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .34), inset 0 1px rgba(255,255,255,.07);
+  -webkit-backdrop-filter: blur(18px) saturate(1.35);
+  backdrop-filter: blur(18px) saturate(1.35);
+}
+body.overlay header { margin: 0; cursor: move; }
+body.overlay .details { margin-top: -1px; }
+body.overlay .warnbar { margin-top: -1px; }
+body.overlay main { gap: 8px; }
+body.overlay section {
+  background: rgba(10, 13, 19, .42);
+  border: 1px solid rgba(255, 255, 255, .15);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 10px 28px rgba(0,0,0,.30), inset 0 1px rgba(255,255,255,.06);
+  -webkit-backdrop-filter: blur(14px) saturate(1.25);
+  backdrop-filter: blur(14px) saturate(1.25);
+}
+body.overlay section + section { border-left: 1px solid rgba(255,255,255,.15); }
+body.overlay .col-head { background: rgba(7, 9, 14, .58); border-bottom-color: rgba(255,255,255,.14); }
+body.overlay .scroll { text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 1px rgba(0,0,0,.9); }
+body.overlay .line { margin-bottom: 10px; }
+body.overlay .line.partial { background: rgba(30, 55, 92, .55); border-radius: 7px; padding-top: 3px; padding-bottom: 3px; }
+body.overlay .card { background: rgba(8, 10, 15, .74); border-color: rgba(255,255,255,.15); box-shadow: 0 5px 16px rgba(0,0,0,.26); }
+body.overlay .askbar { background: rgba(7, 9, 14, .62); border-top-color: rgba(255,255,255,.14); }
+body.overlay .footerbar { margin-top: -1px; }
+body.overlay .empty { text-shadow: 0 1px 3px #000; }
+body.overlay.compact { font-size: 12px; }
+body.overlay.compact header { padding: 7px 10px; }
+body.overlay.compact .scroll { padding: 8px 11px; }
+body.overlay.compact .col-head { padding: 6px 10px; }
+body.overlay.compact .card { padding: 7px 9px; margin-bottom: 8px; }
+body.overlay.compact .point { margin-bottom: 5px; }
+body.overlay.compact .footerbar { padding: 5px 10px; }
 </style>
 </head>
 <body>
@@ -175,6 +220,12 @@
 </div>
 <script>
 (function () {
+  const surfaceParams = new URLSearchParams(location.search);
+  if (surfaceParams.get('surface') === 'glass') {
+    document.documentElement.classList.add('overlay');
+    document.body.classList.add('overlay');
+    if (surfaceParams.get('compact') === '1') document.body.classList.add('compact');
+  }
   const transcriptEl = document.getElementById('transcript');
   const answersEl = document.getElementById('answers');
   const pointsEl = document.getElementById('points');
@@ -442,7 +493,8 @@
     }
     if (meta.hud_surface) {
       const native = meta.hud_surface === 'native';
-      captureSurfaceEl.textContent = native ? 'capture: best effort' : 'capture: visible';
+      const mode = meta.hud_mode === 'glass' ? 'glass HUD' : 'native window';
+      captureSurfaceEl.textContent = native ? mode + ' · best effort' : 'browser · visible';
       captureSurfaceEl.className = 'pill ' + (native ? 'egress' : '');
       captureSurfaceEl.title = native
         ? (meta.hud_capture_protection || 'macOS sharing exclusion requested; verify with your call app')

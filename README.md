@@ -4,7 +4,8 @@ Records Zoom meeting audio (speaker + microphone) with automatic device
 selection, continuous capture verification, dynamic failover, and transcription.
 
 > New here? **QUICKSTART.md** is the no-terminal guide for non-technical users,
-> **INSTALL.md** has the five-minute setup, and **SECURITY.md** documents
+> **INSTALL.md** has the five-minute setup, **RESEARCH-MAC-HUD.md** explains
+> the Glass HUD design, and **SECURITY.md** documents
 > exactly what the tool accesses, writes and (optionally) sends over the
 > network. `./zoom_record.py --doctor` checks the environment and prints fixes.
 
@@ -215,15 +216,20 @@ otherwise. Safe to run at any time, including while it's already up.
 
 ### Live transcript + AI answer HUD (`--live`)
 
-`--live` opens a native Mac HUD by default: **live transcript on the left**, and
-on the right a persistent **talking-points** bullet list above a **Q&A** column.
-The window stays above normal windows and follows Spaces, so it can sit beside
-or over a call. The native surface requests macOS's window capture-exclusion
-setting as a best-effort privacy feature; meeting apps and newer capture paths
-may not honor it, so use window sharing or a second display when privacy is
-critical. If the native surface cannot start, the existing browser HUD opens
-instead. Both are generated from the conversation and, when configured, a
-background database of `.md` files:
+`--live` opens a native Mac surface by default: **live transcript on the left**,
+and on the right a persistent **talking-points** bullet list above a **Q&A**
+column. The default Window mode is a stable decorated panel. Settings also
+offers Glass HUD mode: a translucent, borderless overlay designed to sit over
+a full-screen call, with readable glass cards, persistent placement, adjustable
+opacity, and compact density. Both modes stay above normal windows and follow
+Spaces where macOS allows it.
+
+The native surface requests macOS's window capture-exclusion setting as a
+best-effort privacy feature; meeting apps and newer capture paths may not honor
+it, so use window sharing or a second display when privacy is critical. If the
+native surface cannot start, the existing browser HUD opens instead. Both are
+generated from the conversation and, when configured, a background database of
+`.md` files:
 
 ```bash
 ./zoom_record.py --live                          # Groq STT + Groq answers
@@ -233,10 +239,10 @@ background database of `.md` files:
 ./zoom_record.py --live --answer-backend openrouter   # use OpenRouter instead
 ```
 
-The native/browser choice is available in Settings under **HUD & budget**.
-Turning off **Open live HUD automatically** keeps the local HUD server available
-without opening a surface; turning off **Use native Mac window** selects the
-browser fallback.
+The native/browser choice and Window/Glass HUD mode are available in Settings
+under **HUD & budget**. Turning off **Open live HUD automatically** keeps the
+local HUD server available without opening a surface; turning off **Use native
+Mac window** selects the browser fallback.
 
 The window is served from `127.0.0.1` (a random free port) and closes when the
 recording stops. These files are written under `derived/` (flushed every

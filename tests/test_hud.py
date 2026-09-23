@@ -1599,7 +1599,8 @@ class ConfigTests(unittest.TestCase):
             answers_backend="openrouter", answers_fallback=["groq", "ollama"],
             kb_dirs=["/a", "/b"], kb_top_k=7, kb_scope_tags=["enterprise"],
             budget_tpm=100, budget_tpd=200,
-            port=1234, native_window=False, open_browser=False, answer_interval=20.0,
+            port=1234, native_window=False, hud_mode="glass", hud_opacity=0.72,
+            hud_compact=True, open_browser=False, answer_interval=20.0,
             chat_model="m1", rolling_model="m2", answers_enabled=False,
             context_max_chars=4321, question_lookback_seconds=42.0,
             question_rewrite=False, kb_embed_backend="ollama",
@@ -1618,7 +1619,8 @@ class ConfigTests(unittest.TestCase):
         for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
                      "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
                      "kb_max_chars", "kb_scope_tags",
-                     "native_window", "open_browser", "answer_interval", "chat_model", "rolling_model",
+                     "native_window", "hud_mode", "hud_opacity", "hud_compact", "open_browser",
+                     "answer_interval", "chat_model", "rolling_model",
                      "answers_enabled", "context_max_chars", "question_lookback_seconds",
                      "question_rewrite", "kb_embed_backend", "kb_embed_model",
                      "kb_min_score", "answer_self_questions", "point_dedupe_score",
@@ -2604,17 +2606,23 @@ class SummaryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             session = LiveSession(
-                HudConfig(native_window=True, open_browser=True),
+                HudConfig(native_window=True, open_browser=True, hud_mode="glass",
+                          hud_opacity=0.75, hud_compact=True),
                 Path(tmp), lambda _m: None, "Mic")
             fake_proc = mock.Mock()
             fake_proc.poll.return_value = None
-            with mock.patch("hud.session.subprocess.Popen", return_value=fake_proc), \
+            with mock.patch("hud.session.subprocess.Popen", return_value=fake_proc) as popen, \
                     mock.patch("hud.session.time.sleep"):
                 session._port = 1234
                 session.server = mock.Mock(host="127.0.0.1")
                 session._open_surface()
             self.assertEqual(session._hud_surface, "native")
             self.assertEqual(session.state.meta.get("hud_surface"), "native")
+            self.assertEqual(session.state.meta.get("hud_mode"), "glass")
+            command = popen.call_args.args[0]
+            self.assertIn("--mode", command)
+            self.assertEqual(command[command.index("--mode") + 1], "glass")
+            self.assertIn("--compact", command)
             session._stop_native_window()
             fake_proc.terminate.assert_called_once_with()
             fake_proc.wait.assert_called_once()

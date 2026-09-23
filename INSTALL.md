@@ -82,11 +82,13 @@ Open **Setup** (menu: *Check my audio setup…*) and choose step 4:
 - **Online** — Groq / OpenAI / OpenRouter with an API key for the best
   accuracy and for Suggestions/answers.
 
-On macOS, **Start with live transcript** opens the native HUD by default. It
-stays above normal windows and follows Spaces; Settings can switch back to the
-browser surface. The native window requests best-effort capture exclusion, but
-that is not a guarantee for every meeting application's screen-sharing path.
-Use window sharing or a second display when the HUD must remain private.
+On macOS, **Start with live transcript** opens the native Window mode by
+default. Settings also offers **Glass HUD**: a translucent, borderless overlay
+for full-screen calls with adjustable opacity and compact density. Both modes
+stay above normal windows and follow Spaces where macOS allows it. The native
+surface requests best-effort capture exclusion, but that is not a guarantee for
+every meeting application's screen-sharing path. Use window sharing or a
+second display when the HUD must remain private.
 
 Multi-speaker attribution is a separate, post-call feature. It is enabled by
 default in the Control Center and cannot affect live capture or answer

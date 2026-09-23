@@ -18,6 +18,7 @@ import os
 import signal
 import sys
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from Foundation import NSObject
 
@@ -27,7 +28,7 @@ def _load_frameworks() -> dict[str, Any]:
         raise RuntimeError("native HUD windows are only available on macOS")
     import objc
 
-    from AppKit import NSApplication, NSBackingStoreBuffered, NSWindow
+    from AppKit import NSApplication, NSBackingStoreBuffered, NSPanel, NSWindow
     from Foundation import NSObject, NSURL, NSURLRequest
 
     objc.loadBundle("WebKit", globals(), "/System/Library/Frameworks/WebKit.framework")
@@ -35,6 +36,7 @@ def _load_frameworks() -> dict[str, Any]:
         "NSApplication": NSApplication,
         "NSBackingStoreBuffered": NSBackingStoreBuffered,
         "NSWindow": NSWindow,
+        "NSPanel": NSPanel,
         "NSURL": NSURL,
         "NSURLRequest": NSURLRequest,
         "NSObject": NSObject,
@@ -64,13 +66,26 @@ class _WindowDelegate(NSObject):
         return False
 
 
-def run(url: str, title: str = "Meeting HUD") -> None:
+def _with_surface_query(url: str, mode: str, opacity: float, compact: bool) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update({"surface": mode, "opacity": str(opacity), "compact": "1" if compact else "0"})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(query), parts.fragment))
+
+
+def run(url: str, title: str = "Meeting HUD", mode: str = "window",
+        opacity: float = 0.90, compact: bool = False) -> None:
     fw = _load_frameworks()
     from AppKit import (
+        NSColor,
         NSFloatingWindowLevel,
+        NSWindowCollectionBehaviorCanJoinAllApplications,
         NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
         NSWindowSharingNone,
+        NSWindowStyleMaskBorderless,
+        NSWindowStyleMaskNonactivatingPanel,
         NSWindowStyleMaskClosable,
         NSWindowStyleMaskResizable,
         NSWindowStyleMaskTitled,
@@ -95,16 +110,36 @@ def run(url: str, title: str = "Meeting HUD") -> None:
             height,
         )
 
-    style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
-    window = fw["NSWindow"].alloc().initWithContentRect_styleMask_backing_defer_(
-        rect, style, fw["NSBackingStoreBuffered"], False)
-    window.setTitle_(title)
+    glass = mode == "glass"
+    if glass:
+        style = NSWindowStyleMaskBorderless | NSWindowStyleMaskResizable | NSWindowStyleMaskNonactivatingPanel
+        window = fw["NSPanel"].alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, style, fw["NSBackingStoreBuffered"], False)
+        window.setFloatingPanel_(True)
+        window.setBecomesKeyOnlyIfNeeded_(True)
+        window.setMovableByWindowBackground_(True)
+        window.setHasShadow_(True)
+        window.setHidesOnDeactivate_(False)
+        window.setOpaque_(False)
+        window.setBackgroundColor_(NSColor.clearColor())
+        window.setAlphaValue_(min(1.0, max(0.45, float(opacity))))
+        window.setFrameAutosaveName_("zoom-recorder-glass-hud")
+        if not window.setFrameUsingName_("zoom-recorder-glass-hud"):
+            window.center()
+    else:
+        style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+        window = fw["NSWindow"].alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, style, fw["NSBackingStoreBuffered"], False)
+        window.setTitle_(title)
+        window.setFrameAutosaveName_("zoom-recorder-window-hud")
+        if not window.setFrameUsingName_("zoom-recorder-window-hud"):
+            window.center()
     window.setReleasedWhenClosed_(False)
     window.setLevel_(NSFloatingWindowLevel)
-    window.setCollectionBehavior_(
-        NSWindowCollectionBehaviorCanJoinAllSpaces
-        | NSWindowCollectionBehaviorFullScreenAuxiliary
-    )
+    collection = NSWindowCollectionBehaviorCanJoinAllSpaces
+    collection |= (NSWindowCollectionBehaviorCanJoinAllApplications
+                   if glass else NSWindowCollectionBehaviorFullScreenAuxiliary)
+    window.setCollectionBehavior_(collection)
     # This is a compatibility feature, not a security promise. Apple has
     # deprecated the old sharing enum for some modern capture paths.
     try:
@@ -116,7 +151,13 @@ def run(url: str, title: str = "Meeting HUD") -> None:
     webview = fw["WKWebView"].alloc().initWithFrame_configuration_(
         window.contentView().bounds(), config)
     webview.setAutoresizingMask_(18)  # width + height sizable
-    request = fw["NSURLRequest"].requestWithURL_(fw["NSURL"].URLWithString_(url))
+    if glass:
+        try:
+            webview.setValue_forKey_(False, "drawsBackground")
+        except Exception:  # noqa: BLE001 - WebKit runtime variation
+            pass
+    request = fw["NSURLRequest"].requestWithURL_(
+        fw["NSURL"].URLWithString_(_with_surface_query(url, mode, opacity, compact)))
     webview.loadRequest_(request)
     window.setContentView_(webview)
     window.setDelegate_(_WindowDelegate.alloc().init())
@@ -137,9 +178,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="native zoom-recorder HUD host")
     parser.add_argument("--url", required=True)
     parser.add_argument("--title", default="Meeting HUD")
+    parser.add_argument("--mode", choices=("window", "glass"), default="window")
+    parser.add_argument("--opacity", type=float, default=0.90)
+    parser.add_argument("--compact", action="store_true")
     args = parser.parse_args(argv)
     try:
-        run(args.url, args.title)
+        run(args.url, args.title, args.mode, args.opacity, args.compact)
     except Exception as exc:  # noqa: BLE001 - caller falls back to browser
         print("native HUD unavailable: {}".format(exc), file=sys.stderr)
         return 1

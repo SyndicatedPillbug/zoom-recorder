@@ -322,9 +322,13 @@ class LiveSession:
             try:
                 from .native_window import capture_protection_label
                 host = Path(__file__).with_name("native_window.py")
+                native_cmd = [sys.executable, str(host), "--url", self.url,
+                              "--title", "Meeting HUD", "--mode", self.cfg.hud_mode,
+                              "--opacity", str(self.cfg.hud_opacity)]
+                if self.cfg.hud_compact:
+                    native_cmd.append("--compact")
                 self._native_proc = subprocess.Popen(
-                    [sys.executable, str(host), "--url", self.url,
-                     "--title", "Meeting HUD"],
+                    native_cmd,
                     cwd=str(host.parent.parent),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -337,8 +341,9 @@ class LiveSession:
                     self._hud_surface = "native"
                     self.state.set_meta(
                         hud_surface="native",
+                        hud_mode=self.cfg.hud_mode,
                         hud_capture_protection=capture_protection_label())
-                    self.log("Live HUD: native Mac window active")
+                    self.log("Live HUD: native Mac {} active".format(self.cfg.hud_mode))
                     return
                 self._native_proc = None
             except Exception as exc:  # noqa: BLE001 - browser remains valid

@@ -237,6 +237,9 @@ class HudConfig:
     # HUD server
     port: int = 0
     native_window: bool = True
+    hud_mode: str = "window"       # window | glass
+    hud_opacity: float = 0.90       # glass HUD opacity; window mode remains opaque
+    hud_compact: bool = False       # denser glass layout for full-screen calls
     open_browser: bool = True
     host: str = "127.0.0.1"
     persist_seconds: float = 20.0     # periodic crash-safe flush of derived/
@@ -388,7 +391,8 @@ def _defaults() -> Dict[str, Any]:
             "embed_model": None,
             "min_score": 0.1,
         },
-        "hud": {"port": 0, "native_window": True, "open_browser": True,
+        "hud": {"port": 0, "native_window": True, "mode": "window",
+                "opacity": 0.90, "compact": False, "open_browser": True,
                 "host": "127.0.0.1", "persist_seconds": 20.0},
         "transcript": {"writeback_dir": None},
         "diarization": {"enabled": True, "backend": "auto",
@@ -516,6 +520,11 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         remote_name=str(speakers.get("remote_name") or "Others"),
         port=_as_int(hud.get("port"), 0),
         native_window=bool(hud.get("native_window", True)),
+        hud_mode=(str(hud.get("mode") or "window").strip().lower()
+                  if str(hud.get("mode") or "window").strip().lower() in ("window", "glass")
+                  else "window"),
+        hud_opacity=min(1.0, max(0.45, _as_float(hud.get("opacity"), 0.90))),
+        hud_compact=bool(hud.get("compact", False)),
         open_browser=bool(hud.get("open_browser", True)),
         host=str(hud.get("host") or "127.0.0.1"),
         persist_seconds=_as_float(hud.get("persist_seconds"), 20.0),
@@ -629,6 +638,9 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
     out["hud"].update({
         "port": cfg.port,
         "native_window": cfg.native_window,
+        "mode": cfg.hud_mode,
+        "opacity": cfg.hud_opacity,
+        "compact": cfg.hud_compact,
         "open_browser": cfg.open_browser,
         "host": cfg.host,
         "persist_seconds": cfg.persist_seconds,

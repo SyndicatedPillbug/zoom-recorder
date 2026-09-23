@@ -46,9 +46,10 @@ Click **🎙** → **Check my audio setup…** → step 4:
 
 Then use **🎙** → **Start with live transcript** to see the words as they're
 said, with **Suggestions** and a box to **Ask about the call**. On a Mac this
-opens the native HUD by default; Settings can switch back to a browser window.
-The native window requests best-effort capture exclusion, but it is not a
-guarantee for every screen-sharing path.
+opens the native Window mode by default. Settings also offers the translucent
+Glass HUD for a full-screen call, or a browser window as a fallback. Native
+capture exclusion is best effort, not a guarantee for every screen-sharing
+path.
 
 ## Optional: start at login
 
