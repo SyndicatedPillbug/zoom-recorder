@@ -3,7 +3,7 @@
 Status: active roadmap  
 Updated: 2026-09-22  
 Reference baseline: `v2.7`
-Latest shipped tag: `v2.8.19`
+Latest shipped tag: `v2.8.23`
 
 This project is an app-agnostic meeting recorder and live conversation assistant. It must work
 with Zoom, Meet, Teams, Jitsi, browser calls, phone audio, and locally played recordings without
@@ -24,7 +24,7 @@ The most important foundations are now in place:
 - Stable-partial publication, writeback, Obsidian indexing, structured memory, identity editing,
   non-blocking diarization, Groq fallback behavior, replay, and latency instrumentation are
   implemented and covered by deterministic lifecycle/replay tests.
-- The current release line has a 246-test green regression suite, 100/100 normal lifecycle runs,
+- The current release line has a 259-test green regression suite, 100/100 normal lifecycle runs,
   20/20 injected-failure runs, forced-stop/restart coverage, and a manifest-driven benchmark
   package.
 - Obsidian retrieval is hybrid and bounded: frontmatter/wikilinks are preserved, metadata can

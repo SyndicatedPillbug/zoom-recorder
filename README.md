@@ -345,8 +345,10 @@ gate when they support `verbose_json`. The lightweight interim lane remains
 JSON-only for latency and is never itself authoritative. A second text filter
 drops repetition loops and canned silence phrases. Final chunks also carry the
 VAD's speech-activity ratio; short text from a mostly silent window is rejected
-even if it happens to look plausible. The HUD then runs two independent
-streams:
+even if it happens to look plausible. Borderline short final text is held for
+one neighboring final window and published only when the next hypothesis agrees;
+the hold is bounded and never applies to provisional drafts. The HUD then runs
+two independent streams:
 **questions** are detected across the recent conversation (not just the newest
 chunk), including indirect interview questions without a question mark and
 questions split across adjacent STT chunks. They are answered with the stronger
@@ -522,7 +524,8 @@ to drift minutes behind the call.
                "partial_window_seconds": 4, "partial_interval_seconds": 0.8,
                "glossary": ["Acme", "Q3"],
                "vad_backend": "auto", "vad_margin_db": 6,
-               "speech_activity_min": 0.20, "hallucination_filter": true},
+               "speech_activity_min": 0.20, "hallucination_filter": true,
+               "confirmation_enabled": true},
   "answers": {"backend": "groq", "interval": 35, "rolling_enabled": true,
                "context_minutes": 5, "question_rewrite": true,
                "answer_self_questions": false, "summary_enabled": true,
@@ -694,8 +697,9 @@ python3 -m hud.synthetic_fixtures \
   --output-dir /tmp/zoom-recorder-fixtures
 ```
 
-These fixtures test silence/noise hallucination handling only; they are not
-evidence of speech recognition accuracy.
+This creates silence, seeded noise, sustained hum, harmonic music, and sparse
+click fixtures. They test non-speech rejection and confidence diagnostics only;
+they are not evidence of speech recognition accuracy.
 
 **Privacy.** With `--stt-backend groq/openai` the **audio** leaves the machine;
 with answers enabled the **transcript text** (plus relevant snippets from your

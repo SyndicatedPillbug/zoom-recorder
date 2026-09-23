@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .benchmark_manifest import write_result
 from .evaluation import word_error_stats
-from .stt import LocalWhisperSTT, StablePartialDecoder, looks_hallucinated
+from .stt import (LocalWhisperSTT, StablePartialDecoder, hallucination_reason)
 
 
 def _percentile(values: List[float], percentile: float) -> Optional[float]:
@@ -83,6 +83,10 @@ def run_benchmark(audio: Path, model: Path, reference: Optional[Path] = None,
     inference_seconds: List[float] = []
     observations = 0
     hallucination_filtered = 0
+    rejection_reasons: Dict[str, int] = {}
+    confidence_samples = 0
+    no_speech_values: List[float] = []
+    logprob_values: List[float] = []
     latest_hypothesis = ""
     first_stable_word: Optional[str] = None
     first_stable_window_end: Optional[float] = None
@@ -116,8 +120,19 @@ def run_benchmark(audio: Path, model: Path, reference: Optional[Path] = None,
             inference = published - request_started
             inference_seconds.append(inference)
             text = str(getattr(result, "text", "") or "").strip()
-            if text and looks_hallucinated(text, marginal=True):
+            reason = hallucination_reason(
+                text, marginal=True,
+                avg_logprob=getattr(result, "avg_logprob", None),
+                no_speech_prob=getattr(result, "no_speech_prob", None),
+                compression_ratio=getattr(result, "compression_ratio", None))
+            if getattr(result, "no_speech_prob", None) is not None:
+                confidence_samples += 1
+                no_speech_values.append(float(result.no_speech_prob))
+            if getattr(result, "avg_logprob", None) is not None:
+                logprob_values.append(float(result.avg_logprob))
+            if reason is not None:
                 hallucination_filtered += 1
+                rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
                 text = ""
             if text:
                 observations += 1
@@ -149,6 +164,12 @@ def run_benchmark(audio: Path, model: Path, reference: Optional[Path] = None,
         "paced": pace,
         "observations": observations,
         "hallucination_filtered": hallucination_filtered,
+        "hallucination_rejection_reasons": rejection_reasons,
+        "confidence_samples": confidence_samples,
+        "no_speech_prob_p50": _percentile(no_speech_values, 50),
+        "no_speech_prob_p95": _percentile(no_speech_values, 95),
+        "avg_logprob_p50": _percentile(logprob_values, 50),
+        "avg_logprob_p05": _percentile(logprob_values, 5),
         "committed_words": len(committed_text.split()),
         "first_stable_word": first_stable_word,
         "first_stable_window_end_seconds": first_stable_window_end,

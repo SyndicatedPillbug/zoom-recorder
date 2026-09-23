@@ -156,6 +156,19 @@ Current status: the 3-second candidate was rejected on the AMI control (wrong fi
 34 committed words, 62.67% stable-only WER) versus the 4-second control (correct first word, 44
 committed words, 49.33% stable-only WER). The 4-second default remains in force.
 
+### Step 2.2a — Add evidence-gated final publication — complete
+
+Final local windows now carry VAD speech-activity coverage into the hallucination gate. Borderline
+short hypotheses are held for one neighboring final window; matching text is then published, while
+unsupported one-off hypotheses are discarded. Rejection reasons and confidence samples are being
+added to the redacted live diagnostics and rolling benchmark output. The adversarial fixture
+manifest now covers silence, noise, hum, harmonic music, and sparse clicks; the no-pace local
+benchmark completed 5/5 available non-speech fixtures with zero committed words and zero skipped
+requests, while the AMI control remained at 49.33% stable-only WER with 33 confidence samples.
+
+Exit gate: the full suite remains green, provisional text remains non-authoritative, and the hold
+is bounded to one final window. **Met in v2.8.23.**
+
 ### Step 2.3 — Compare model candidates
 
 Benchmark `base.en`, `small.en` if installed, and Turbo under identical settings. Investigate

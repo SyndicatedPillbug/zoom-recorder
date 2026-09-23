@@ -179,6 +179,8 @@ class HudConfig:
     stt_compression_ratio_max: float = 2.4
     stt_speech_activity_min: float = 0.20
     stt_hallucination_filter: bool = True
+    stt_confirmation_enabled: bool = True
+    stt_confirmation_max_words: int = 8
     stt_context_prompt: bool = True    # seed Whisper with previous transcript
     # Local-only rolling interim recognition. Partial text is UI-only until it
     # survives the stability gate and becomes an authoritative transcript event.
@@ -339,6 +341,8 @@ def _defaults() -> Dict[str, Any]:
             "compression_ratio_max": 2.4,
             "speech_activity_min": 0.20,
             "hallucination_filter": True,
+            "confirmation_enabled": True,
+            "confirmation_max_words": 8,
             "context_prompt": True,
             "partial_enabled": True,
             "partial_model": DEFAULT_PARTIAL_TRANSCRIPTION_MODEL,
@@ -463,6 +467,8 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         stt_compression_ratio_max=_as_float(stt.get("compression_ratio_max"), 2.4),
         stt_speech_activity_min=_as_float(stt.get("speech_activity_min"), 0.20),
         stt_hallucination_filter=bool(stt.get("hallucination_filter", True)),
+        stt_confirmation_enabled=bool(stt.get("confirmation_enabled", True)),
+        stt_confirmation_max_words=_as_int(stt.get("confirmation_max_words"), 8),
         stt_context_prompt=bool(stt.get("context_prompt", True)),
         stt_partial_enabled=bool(stt.get("partial_enabled", True)),
         stt_partial_model=(str(stt.get("partial_model") or
@@ -566,6 +572,8 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "compression_ratio_max": cfg.stt_compression_ratio_max,
         "speech_activity_min": cfg.stt_speech_activity_min,
         "hallucination_filter": cfg.stt_hallucination_filter,
+        "confirmation_enabled": cfg.stt_confirmation_enabled,
+        "confirmation_max_words": cfg.stt_confirmation_max_words,
         "context_prompt": cfg.stt_context_prompt,
         "partial_enabled": cfg.stt_partial_enabled,
         "partial_model": cfg.stt_partial_model,

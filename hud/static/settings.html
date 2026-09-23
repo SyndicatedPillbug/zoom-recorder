@@ -98,6 +98,9 @@
     <div class="row"><label>Minimum speech activity</label><div class="ctl">
       <input type="number" step="0.05" min="0" max="1" id="stt.speech_activity_min" />
       <span class="hint">reject short text from mostly silent windows</span></div></div>
+    <div class="row"><label>Confirm borderline text</label><div class="ctl">
+      <input type="checkbox" id="stt.confirmation_enabled" />
+      <span class="hint">hold uncertain short text for one neighboring window</span></div></div>
     <div class="row"><label>Filter hallucinations</label><div class="ctl">
       <input type="checkbox" id="stt.hallucination_filter" /></div></div>
   </section>
@@ -310,6 +313,7 @@
     setVal('stt.vad_margin_db', c.stt.vad_margin_db);
     setVal('stt.vad_aggressiveness', c.stt.vad_aggressiveness);
     setVal('stt.speech_activity_min', c.stt.speech_activity_min);
+    setVal('stt.confirmation_enabled', c.stt.confirmation_enabled);
     setVal('stt.hallucination_filter', c.stt.hallucination_filter);
     setVal('answers.enabled', c.answers.enabled); setVal('answers.backend', c.answers.backend);
     setVal('answers.fallback', (c.answers.fallback || []).join(', '));
@@ -356,6 +360,7 @@
              vad_margin_db: Number($('stt.vad_margin_db').value || 6),
              vad_aggressiveness: num('stt.vad_aggressiveness'),
              speech_activity_min: Number($('stt.speech_activity_min').value || 0.2),
+             confirmation_enabled: $('stt.confirmation_enabled').checked,
              hallucination_filter: $('stt.hallucination_filter').checked },
       answers: { enabled: $('answers.enabled').checked, backend: $('answers.backend').value,
                  fallback: $('answers.fallback').value.split(',').map(s => s.trim()).filter(Boolean),

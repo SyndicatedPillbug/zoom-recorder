@@ -57,7 +57,7 @@ from hud.state import LiveState, is_duplicate_point  # noqa: E402
 from hud.trace_report import build_report  # noqa: E402
 from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, STTResult, _Source,  # noqa: E402
                      frame_rms_dbfs, StablePartialDecoder, fuzzy_overlap,
-                     looks_hallucinated,
+                     hallucination_reason, looks_hallucinated,
                      overlap_suffix_prefix,
                      pcm_to_wav, split_words)
 from hud.synthetic_fixtures import write_fixture  # noqa: E402
@@ -338,6 +338,32 @@ class SttPipelineTests(unittest.TestCase):
         tr._sources = [src]
         tr._transcribe_chunk(b"audio", src, margin_db=10.0)
         self.assertEqual(tr.state.snapshot()["transcript"], [])
+
+    def test_borderline_final_text_waits_for_neighboring_window(self) -> None:
+        tr = self._transcriber(HudConfig(stt_backend="local"))
+        outputs = iter([
+            STTResult("The rollout starts tomorrow", avg_logprob=-1.3,
+                      no_speech_prob=0.70),
+            STTResult("The rollout starts tomorrow", avg_logprob=-0.4,
+                      no_speech_prob=0.05),
+        ])
+
+        class FakeSTT:
+            def transcribe(self, pcm, prompt=None):
+                return next(outputs)
+
+        tr._stt = FakeSTT()
+        src = _Source("You", [])
+        tr._transcribe_chunk(b"audio", src, margin_db=10.0, speech_activity_ratio=0.25)
+        self.assertEqual(tr.state.snapshot()["transcript"], [])
+        tr._transcribe_chunk(b"audio", src, margin_db=10.0, speech_activity_ratio=0.8)
+        self.assertEqual(len(tr.state.snapshot()["transcript"]), 1)
+
+    def test_rejection_reason_is_specific_and_safe(self) -> None:
+        self.assertEqual(hallucination_reason(
+            "oh oh oh", marginal=True), "repeated_interjection")
+        self.assertEqual(hallucination_reason(
+            "plausible text", no_speech_prob=0.99), "high_no_speech_probability")
 
     def test_local_partial_worker_keeps_draft_out_of_authoritative_text(self) -> None:
         cfg = HudConfig(stt_backend="local", stt_hallucination_filter=False)
@@ -1198,7 +1224,8 @@ class MemoryAndReplayTests(unittest.TestCase):
         manifest = Path(__file__).resolve().parent.parent / "fixtures/manifest.json"
         specs = load_manifest(manifest)
         self.assertEqual([spec.fixture_id for spec in specs], [
-            "ami-es2002a-50-80", "synthetic-silence-10s", "synthetic-noise-10s"])
+            "ami-es2002a-50-80", "synthetic-silence-10s", "synthetic-noise-10s",
+            "synthetic-hum-10s", "synthetic-music-10s", "synthetic-clicks-10s"])
         self.assertFalse(specs[0].audio_exists)
         self.assertTrue(specs[0].reference_exists)
         with self.assertRaises(ManifestError):
@@ -1208,6 +1235,9 @@ class MemoryAndReplayTests(unittest.TestCase):
             audio.write_bytes(b"external fixture")
             (Path(tmp) / "synthetic-silence-10s.wav").write_bytes(b"silence fixture")
             (Path(tmp) / "synthetic-noise-10s.wav").write_bytes(b"noise fixture")
+            (Path(tmp) / "synthetic-hum-10s.wav").write_bytes(b"hum fixture")
+            (Path(tmp) / "synthetic-music-10s.wav").write_bytes(b"music fixture")
+            (Path(tmp) / "synthetic-clicks-10s.wav").write_bytes(b"click fixture")
             ready = load_manifest(manifest, require_files=True, asset_root=Path(tmp))
             self.assertTrue(ready[0].audio_exists)
 
@@ -1371,6 +1401,7 @@ class MemoryAndReplayTests(unittest.TestCase):
                                        pace=False)
             self.assertEqual(result["observations"], 0)
             self.assertEqual(result["hallucination_filtered"], 1)
+            self.assertEqual(result["hallucination_rejection_reasons"], {"canned_silence_phrase": 1})
             self.assertEqual(result["committed_text"], "")
 
     def test_audio_benchmark_percentile_is_deterministic(self) -> None:

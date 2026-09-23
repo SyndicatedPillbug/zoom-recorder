@@ -31,6 +31,36 @@
       "speech_bounds": [],
       "source_url": null,
       "notes": "Generated locally with a fixed seed; used to detect noise hallucinations."
+    },
+    {
+      "id": "synthetic-hum-10s",
+      "audio": "synthetic-hum-10s.wav",
+      "reference": null,
+      "kind": "hum",
+      "duration_seconds": 10.0,
+      "speech_bounds": [],
+      "source_url": null,
+      "notes": "Generated low-frequency sustained tone; tests periodic hum rejection."
+    },
+    {
+      "id": "synthetic-music-10s",
+      "audio": "synthetic-music-10s.wav",
+      "reference": null,
+      "kind": "music",
+      "duration_seconds": 10.0,
+      "speech_bounds": [],
+      "source_url": null,
+      "notes": "Generated harmonic tone mix; tests melodic non-speech rejection."
+    },
+    {
+      "id": "synthetic-clicks-10s",
+      "audio": "synthetic-clicks-10s.wav",
+      "reference": null,
+      "kind": "impulsive-noise",
+      "duration_seconds": 10.0,
+      "speech_bounds": [],
+      "source_url": null,
+      "notes": "Generated transient clicks; tests sparse impulse rejection."
     }
   ]
 }

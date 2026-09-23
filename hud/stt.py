@@ -130,7 +130,7 @@ def _result_from_verbose_payload(payload: dict, fallback_text: str,
     )
 
 
-def looks_hallucinated(text: str, marginal: bool = False,
+def hallucination_reason(text: str, marginal: bool = False,
                        avg_logprob: Optional[float] = None,
                        no_speech_prob: Optional[float] = None,
                        compression_ratio: Optional[float] = None,
@@ -138,8 +138,8 @@ def looks_hallucinated(text: str, marginal: bool = False,
                        no_speech_prob_max: float = 0.75,
                        avg_logprob_min: float = -1.5,
                        compression_ratio_max: float = 2.4,
-                       speech_activity_min: float = 0.20) -> bool:
-    """Heuristic filter for Whisper's non-speech output.
+                       speech_activity_min: float = 0.20) -> Optional[str]:
+    """Return the first evidence reason a transcript should be rejected.
 
     Catches known silence phrases, repetitive loops, and low-confidence
     segments -- especially on chunks whose energy was only marginally above the
@@ -147,22 +147,22 @@ def looks_hallucinated(text: str, marginal: bool = False,
     """
     t = (text or "").strip()
     if not t:
-        return True
+        return "empty"
     if HALLUCINATION_PHRASES.match(t):
-        return True
+        return "canned_silence_phrase"
     if no_speech_prob is not None and no_speech_prob > no_speech_prob_max:
-        return True
+        return "high_no_speech_probability"
     if compression_ratio is not None and compression_ratio > compression_ratio_max:
-        return True
+        return "high_compression_ratio"
 
     words = re.findall(r"[a-z0-9']+", t.lower())
     if (len(words) >= 3 and len(set(words)) == 1
             and words[0] in REPEATED_NON_SPEECH):
-        return True
+        return "repeated_interjection"
     if len(words) >= 6:
         unique_ratio = len(set(words)) / len(words)
         if unique_ratio < 0.45:
-            return True
+            return "low_text_diversity"
     if len(words) >= 9:
         grams = [tuple(words[i:i + 3]) for i in range(len(words) - 2)]
         if grams:
@@ -170,7 +170,7 @@ def looks_hallucinated(text: str, marginal: bool = False,
             # A 3-gram repeated three or more times in one short chunk is a
             # classic Whisper loop, not natural speech.
             if top >= 3:
-                return True
+                return "repeated_ngram"
 
     if marginal:
         # A short result from a mostly non-speech window is not supported by
@@ -181,18 +181,38 @@ def looks_hallucinated(text: str, marginal: bool = False,
         if (speech_activity_ratio is not None
                 and speech_activity_ratio < speech_activity_min
                 and len(words) <= 8):
-            return True
+            return "low_speech_activity"
         # Whisper commonly invents slide-transition narration when a short
         # low-signal chunk gives it no lexical evidence. Keep this narrow and
         # marginal-only so a clearly spoken real sentence is never discarded.
         if re.fullmatch(r"(?:i['’]?m|i am) going to go to the next slide[.!]?",
                         t, re.I):
-            return True
+            return "marginal_slide_loop"
         if avg_logprob is not None and avg_logprob < avg_logprob_min:
-            return True
+            return "low_average_log_probability"
         if len(words) <= 2 and t.lower().strip(".,!? ") in BARE_INTERJECTIONS:
-            return True
-    return False
+            return "bare_interjection"
+    return None
+
+
+def looks_hallucinated(text: str, marginal: bool = False,
+                       avg_logprob: Optional[float] = None,
+                       no_speech_prob: Optional[float] = None,
+                       compression_ratio: Optional[float] = None,
+                       speech_activity_ratio: Optional[float] = None,
+                       no_speech_prob_max: float = 0.75,
+                       avg_logprob_min: float = -1.5,
+                       compression_ratio_max: float = 2.4,
+                       speech_activity_min: float = 0.20) -> bool:
+    """Boolean compatibility wrapper around :func:`hallucination_reason`."""
+    return hallucination_reason(
+        text, marginal=marginal, avg_logprob=avg_logprob,
+        no_speech_prob=no_speech_prob, compression_ratio=compression_ratio,
+        speech_activity_ratio=speech_activity_ratio,
+        no_speech_prob_max=no_speech_prob_max,
+        avg_logprob_min=avg_logprob_min,
+        compression_ratio_max=compression_ratio_max,
+        speech_activity_min=speech_activity_min) is not None
 
 
 
@@ -725,6 +745,7 @@ class _Source:
         self.transcribed = 0
         self.segment_seq = 0
         self.last_segment_id = ""
+        self.pending_confirmation: Optional[str] = None
 
 
 class LiveTranscriber:
@@ -754,6 +775,9 @@ class LiveTranscriber:
         self._partial_suppressed = 0
         self._partial_coalesced = 0
         self._final_inference_count = 0
+        self._stt_hallucination_filtered = 0
+        self._stt_confirmation_held = 0
+        self._stt_confirmation_dropped = 0
         self._active_chunk_seconds = float(cfg.stt_chunk_seconds)
 
     # -- lifecycle ---------------------------------------------------------
@@ -1320,7 +1344,7 @@ class LiveTranscriber:
         text = result.text.strip()
         if not text:
             return
-        if self.cfg.stt_hallucination_filter and looks_hallucinated(
+        reason = hallucination_reason(
                 text, marginal=margin_db < self.cfg.stt_vad_margin_db,
                 avg_logprob=result.avg_logprob, no_speech_prob=result.no_speech_prob,
                 compression_ratio=result.compression_ratio,
@@ -1328,9 +1352,19 @@ class LiveTranscriber:
                 avg_logprob_min=self.cfg.stt_avg_logprob_min,
                 compression_ratio_max=self.cfg.stt_compression_ratio_max,
                 speech_activity_ratio=speech_activity_ratio,
-                speech_activity_min=self.cfg.stt_speech_activity_min):
-            self.log("live STT: dropped likely hallucination ({!r}..., speech {:.0%})".format(
-                text[:40], speech_activity_ratio if speech_activity_ratio is not None else 0.0))
+                speech_activity_min=self.cfg.stt_speech_activity_min)
+        if self.cfg.stt_hallucination_filter and reason is not None:
+            if source.pending_confirmation:
+                source.pending_confirmation = None
+                self._stt_confirmation_dropped += 1
+            self._stt_hallucination_filtered += 1
+            self.state.set_meta(
+                stt_hallucination_filtered=self._stt_hallucination_filtered,
+                stt_last_rejection_reason=reason)
+            self.log("live STT: dropped likely hallucination [{}] ({!r}..., speech {:.0%})".format(
+                reason, text[:40], speech_activity_ratio if speech_activity_ratio is not None else 0.0))
+            return
+        if self._hold_for_confirmation(source, text, result, speech_activity_ratio):
             return
         self._publish_committed(source, text, started, finalized=True,
                                 captured_at=captured_at)
@@ -1359,9 +1393,53 @@ class LiveTranscriber:
             self.state.set_meta(
                 stt_lag_seconds=round(max(0.0, final_published - captured_at), 1),
                 stt_final_inferences=self._final_inference_count,
+                stt_confirmation_held=self._stt_confirmation_held,
+                stt_confirmation_dropped=self._stt_confirmation_dropped,
                 stt_partial_dropped=self._partial_dropped,
                 stt_partial_suppressed=self._partial_suppressed,
                 stt_partial_coalesced=self._partial_coalesced)
+
+    def _hold_for_confirmation(self, source: "_Source", text: str,
+                               result: STTResult,
+                               speech_activity_ratio: Optional[float]) -> bool:
+        """Require one bounded neighboring-window agreement for borderline text."""
+        if not getattr(self.cfg, "stt_hallucination_filter", True):
+            source.pending_confirmation = None
+            return False
+        pending = source.pending_confirmation
+        confirmed = False
+        if pending:
+            similarity = difflib.SequenceMatcher(
+                None, pending.lower(), text.lower()).ratio()
+            source.pending_confirmation = None
+            if similarity < 0.55:
+                self._stt_confirmation_dropped += 1
+            else:
+                confirmed = True
+                self.state.set_meta(stt_confirmation_released=True)
+
+        if not getattr(self.cfg, "stt_confirmation_enabled", True):
+            return False
+        if confirmed:
+            return False
+        if (self.cfg.stt_backend or "").lower() not in LOCAL_STT_BACKENDS:
+            return False
+        words = re.findall(r"[a-z0-9']+", text.lower())
+        if len(words) > int(getattr(self.cfg, "stt_confirmation_max_words", 8)):
+            return False
+        borderline = False
+        if speech_activity_ratio is not None:
+            borderline |= speech_activity_ratio < self.cfg.stt_speech_activity_min + 0.10
+        if result.no_speech_prob is not None:
+            borderline |= result.no_speech_prob > self.cfg.stt_no_speech_prob_max - 0.10
+        if result.avg_logprob is not None:
+            borderline |= result.avg_logprob < self.cfg.stt_avg_logprob_min + 0.30
+        if not borderline:
+            return False
+        source.pending_confirmation = text
+        self._stt_confirmation_held += 1
+        self.state.set_meta(stt_confirmation_held=self._stt_confirmation_held)
+        return True
 
     def _retune_chunker(self, source: "_Source", inference_seconds: float) -> None:
         """Adapt local windows while protecting the live queue from backlog."""
