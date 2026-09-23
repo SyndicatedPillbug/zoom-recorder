@@ -3,7 +3,7 @@
 Status: active roadmap  
 Updated: 2026-09-22  
 Reference baseline: `v2.7`
-Latest shipped tag: `v2.8.17`
+Latest shipped tag: `v2.8.19`
 
 This project is an app-agnostic meeting recorder and live conversation assistant. It must work
 with Zoom, Meet, Teams, Jitsi, browser calls, phone audio, and locally played recordings without
