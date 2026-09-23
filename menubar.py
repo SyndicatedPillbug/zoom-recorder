@@ -151,10 +151,11 @@ class RecorderApp(rumps.App):
         # Volume is deliberately the first top-level item so the current
         # level is visible at all times (its title carries the percentage).
         self.volume_item = rumps.MenuItem("Volume")
+        self.main_app_item = rumps.MenuItem(
+            "Open Main App…", callback=lambda _s: self.open_control("recordings"))
         self.toggle_item = rumps.MenuItem("Start recording", callback=self.toggle)
         self.live_item = rumps.MenuItem("Start with live transcript", callback=self.start_live)
         self.open_hud_item = rumps.MenuItem("Open transcript window", callback=self.open_hud)
-        self.assistant_item = rumps.MenuItem("Live assistant")
         self.pause_answers_item = rumps.MenuItem("Pause answers", callback=self.toggle_answers)
         self.answer_settings_item = rumps.MenuItem(
             "Answer and context settings…",
@@ -181,8 +182,11 @@ class RecorderApp(rumps.App):
         self.kb_item = rumps.MenuItem(
             "Knowledge-base and Obsidian settings…",
             callback=lambda _s: self.open_control("settings"))
-        self.recordings_item = rumps.MenuItem("My recordings…",
+        self.recordings_item = rumps.MenuItem("Meeting workspace…",
                                               callback=lambda _s: self.open_control("recordings"))
+        self.workspace_item = rumps.MenuItem(
+            "Open Meeting Workspace…",
+            callback=lambda _s: self.open_control("recordings"))
         self.setup_item = rumps.MenuItem("Check my audio setup…",
                                          callback=lambda _s: self.open_control("setup"))
         self.settings_item = rumps.MenuItem("Settings…",
@@ -191,7 +195,15 @@ class RecorderApp(rumps.App):
                                         callback=lambda _s: self.open_control("help"))
         self.audio_item = rumps.MenuItem("Play sound through")
         self.quit_item = rumps.MenuItem("Quit zoom-recorder", callback=self.quit_app)
-        self.menu = [self.volume_item, self.toggle_item, self.assistant_item,
+        # Keep the menu shallow and task-oriented. Detailed configuration is
+        # consolidated inside the native Main App; the menu exposes only the
+        # actions a person needs during a call or immediately before one.
+        self.context_item = rumps.MenuItem(
+            "Meeting context for next call…",
+            callback=lambda _s: self.open_control("settings"))
+        self.setup_item.title = "Audio & permissions…"
+        self.menu = [self.volume_item, self.main_app_item, self.toggle_item,
+                     self.live_item, self.open_hud_item, self.pause_answers_item,
                      self.hud_item, self.context_item, None,
                      self.recordings_item, self.setup_item, self.settings_item,
                      self.help_item, None, self.audio_item, None, self.quit_item]
@@ -200,6 +212,7 @@ class RecorderApp(rumps.App):
         self._volume_value = None
         self._volume_muted = None
         self._vol_drag_until = 0.0
+        self._previous_recording = False
         self._sync_ui()
         # Recover from a previous SIGKILL/crash that left the recording audio
         # setup selected: hand the real device back when nothing is recording.
@@ -225,6 +238,8 @@ class RecorderApp(rumps.App):
     def _sync_ui(self) -> None:
         pid = _read_pidfile()
         recording = pid is not None
+        finished_recording = self._previous_recording and not recording
+        self._previous_recording = recording
         stopping = _stop_requested(pid)
         elapsed = 0.0
         if recording:
@@ -261,21 +276,18 @@ class RecorderApp(rumps.App):
                 else "Transcript writeback settings…")
         except Exception:  # noqa: BLE001 - menu must survive malformed config
             pass
-        populate_submenu(self.assistant_item, [
-            self.live_item, self.open_hud_item, None,
-            self.pause_answers_item, self.answer_settings_item,
-            self.speaker_settings_item,
-        ])
         populate_submenu(self.hud_item, [
             self.hud_window_item, self.hud_glass_item, None,
-            self.hud_compact_item, self.hud_settings_item,
-        ])
-        populate_submenu(self.context_item, [
-            self.writeback_item, self.kb_item,
-            self.context_speaker_item,
+            self.hud_compact_item,
         ])
         self._sync_volume_if_changed()
         self._sync_audio_menu()
+        if finished_recording:
+            # The live HUD is intentionally disposable, but the meeting is
+            # not. Open the durable review surface once finalization has
+            # removed the recorder lock/pidfile.
+            threading.Thread(target=self.open_control, args=("recordings",),
+                             name="open-meeting-workspace", daemon=True).start()
 
     def _hud_request(self, path: str, payload=None):
         """Call the active local HUD using its per-run token, if available."""
@@ -356,7 +368,7 @@ class RecorderApp(rumps.App):
                 token = (parse_qs(parts.query).get("token") or [""])[0]
                 target = urlunsplit((parts.scheme, parts.netloc, parts.path,
                                      urlencode({"token": token, "tab": tab}), ""))
-                subprocess.Popen(["open", target])
+                self._open_native_control(target)
                 return
         try:
             subprocess.Popen(
@@ -365,6 +377,22 @@ class RecorderApp(rumps.App):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
             rumps.notification("zoom-recorder", "Could not open the window", str(exc))
+
+    def _open_native_control(self, url: str) -> None:
+        """Open the Control Center inside the native Main App host."""
+        host = SCRIPT_DIR / "hud" / "native_window.py"
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(host), "--url", url,
+                 "--title", "zoom-recorder — Main App", "--mode", "window",
+                 "--exit-on-close"],
+                cwd=str(SCRIPT_DIR), stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True)
+            time.sleep(0.15)
+            if proc.poll() is not None:
+                raise RuntimeError("native Main App host exited during startup")
+        except Exception as exc:  # noqa: BLE001 - compatibility fallback
+            rumps.notification("zoom-recorder", "Main App", str(exc))
 
     def _read_volume(self):
         try:

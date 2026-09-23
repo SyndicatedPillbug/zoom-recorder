@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Post-call speaker attribution.
 
-This module is intentionally an adapter, not part of the live path.  When
-WhisperX and its diarization dependencies are installed, it processes the
-saved remote track after recording. The feature is enabled by default from
-Settings, but remains an optional backend: if the tool, model, token, or
-runtime is unavailable, the original channel-labelled transcript remains the
-source of truth and the call still completes normally.
+The normal path is local.  NeMo-Speech.cpp provides a native Sortformer
+runtime for Apple Metal, Linux Vulkan, and CPU fallback, and its model is
+cached locally after setup.  WhisperX remains a compatibility backend for
+older installations, but it is never selected by ``auto`` and never makes a
+Hugging Face token part of the normal product setup.
 """
 
 from __future__ import annotations
@@ -119,15 +118,113 @@ def _whisperx_binary(backend: str) -> Optional[str]:
     return shutil.which("whisperx")
 
 
-def diarization_readiness() -> Dict[str, Any]:
+def _nemo_binary() -> Optional[str]:
+    """Find the native local diarization runtime.
+
+    LaunchAgents do not necessarily inherit the user's interactive PATH, so
+    the managed install locations are checked explicitly.
+    """
+    configured = os.environ.get("NEMO_SPEECH_BIN")
+    candidates = [
+        configured,
+        str(Path.home() / "Library" / "Application Support" / "NeMoSpeech"
+            / "bin" / "nemo-speech"),
+        str(Path.home() / ".local" / "bin" / "nemo-speech"),
+        shutil.which("nemo-speech"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _nemo_model_path(configured: Optional[str] = None) -> Optional[str]:
+    """Find a downloaded Sortformer model without contacting the network."""
+    candidates: List[Path] = []
+    if configured:
+        candidates.append(Path(os.path.expanduser(configured)))
+    env_model = os.environ.get("NEMO_DIARIZATION_MODEL")
+    if env_model:
+        candidates.append(Path(os.path.expanduser(env_model)))
+    cache_roots = [
+        Path.home() / "Library" / "Caches" / "NeMoSpeech" / "models",
+        Path.home() / ".cache" / "nemo-speech" / "models",
+    ]
+    for root in cache_roots:
+        if root.is_dir():
+            candidates.extend(sorted(root.glob("**/*sortformer*.gguf")))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _hardware_backend() -> str:
+    """Describe the preferred local accelerator without importing ML stacks."""
+    if sys_platform() == "darwin" and os.uname().machine == "arm64":
+        return "metal"
+    if sys_platform() == "linux":
+        return "vulkan-or-cpu"
+    return "cpu"
+
+
+def sys_platform() -> str:
+    # Kept tiny and injectable in tests; importing platform is otherwise
+    # unnecessary work during every menu-bar status poll.
+    import sys
+    return sys.platform
+
+
+def diarization_readiness(backend: str = "auto",
+                          model_path: Optional[str] = None) -> Dict[str, Any]:
     """Return a cheap, secret-free readiness summary for the Control Center."""
-    binary = _whisperx_binary("auto")
+    selected = str(backend or "auto").lower()
+    if selected in ("off", "none", "disabled"):
+        return {"ready": False, "state": "disabled", "label": "Off",
+                "detail": "Speaker diarization is disabled."}
+
+    # ``auto`` is deliberately local-only.  A missing local runtime is a
+    # setup problem, not a reason to prompt for an online credential.
+    if selected in ("auto", "local", "nemo", "sortformer"):
+        binary = _nemo_binary()
+        if not binary:
+            return {
+                "ready": False,
+                "state": "local_runtime_missing",
+                "label": "Local setup needed",
+                "detail": "Install the local NeMo diarization runtime; no online token is required.",
+                "backend": "nemo",
+                "accelerator": _hardware_backend(),
+            }
+        model = _nemo_model_path(model_path)
+        if not model:
+            return {
+                "ready": False,
+                "state": "local_model_missing",
+                "label": "Local model needed",
+                "detail": "Download the local Sortformer model once; calls then run offline.",
+                "backend": "nemo",
+                "accelerator": _hardware_backend(),
+            }
+        return {
+            "ready": True,
+            "state": "local_ready",
+            "label": "Local ready",
+            "detail": "Runs locally after each recording; no Hugging Face token is used.",
+            "backend": "nemo",
+            "accelerator": _hardware_backend(),
+            "model": model,
+        }
+
+    # Explicit WhisperX is retained only to make migration and old sessions
+    # reproducible.  It is never advertised as the default local setup.
+    binary = _whisperx_binary(selected)
     if not binary:
         return {
             "ready": False,
             "state": "not_installed",
             "label": "Setup needed",
-            "detail": "Install the optional speaker-identification component from Settings.",
+            "detail": "The requested diarization backend is not installed.",
         }
     if not _resolve_hf_token():
         return {
@@ -139,8 +236,9 @@ def diarization_readiness() -> Dict[str, Any]:
     return {
         "ready": True,
         "state": "ready",
-        "label": "Ready",
-        "detail": "Runs after each recording and never delays the live transcript.",
+        "label": "Compatibility ready",
+        "detail": "Legacy WhisperX compatibility mode; local NeMo is recommended.",
+        "backend": selected,
     }
 
 
@@ -231,10 +329,11 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
                               started_epoch: Optional[float] = None,
                               mappings: Optional[Dict[str, Dict[str, Any]]] = None
                               ) -> Optional[Dict[str, Any]]:
-    """Run a bounded, optional WhisperX attribution pass.
+    """Run a bounded local attribution pass.
 
     The command is assembled from fixed arguments and never through a shell.
-    No API key is logged.  Output is written only below ``derived/``.
+    The default NeMo command has no credential or network dependency.  Output
+    is written only below ``derived/``.
     """
     processing_started = time.perf_counter()
     if not getattr(cfg, "diarization_enabled", False):
@@ -245,53 +344,86 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
     if not audio_path.is_file():
         log("diarization skipped: remote audio track is unavailable")
         return None
-    binary = _whisperx_binary(backend)
-    if not binary:
-        log("diarization skipped: install WhisperX to enable the optional post-call pass")
-        return None
-    token = _resolve_hf_token()
-    if not token:
-        log("diarization skipped: HF_TOKEN is not set for the diarization model")
-        return None
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="diarization-", dir=str(output_dir)) as tmp:
+    token = None
+    if backend in ("auto", "local", "nemo", "sortformer"):
+        binary = _nemo_binary()
+        model = _nemo_model_path(getattr(cfg, "diarization_model", None))
+        if not binary:
+            log("diarization unavailable: local NeMo runtime is not installed")
+            return None
+        if not model:
+            log("diarization unavailable: local Sortformer model is not installed")
+            return None
+        output_path = output_dir / "nemo_diarization.json"
+        device = str(getattr(cfg, "diarization_device", "auto") or "auto")
+        if device == "rocm":
+            # NeMo-Speech.cpp's native AMD path is Vulkan. Keep old configs
+            # safe and explicit rather than passing an unsupported CLI value.
+            log("diarization: mapping legacy ROCm selection to Vulkan")
+            device = "vulkan"
+        command = [binary, "diarize", str(audio_path), "--model", model,
+                   "--format", "json", "--output", str(output_path),
+                   "--device", device]
+        child_env = os.environ.copy()
+        parser_path = output_path
+    else:
+        binary = _whisperx_binary(backend)
+        if not binary:
+            log("diarization unavailable: requested compatibility backend is not installed")
+            return None
+        token = _resolve_hf_token()
+        if not token:
+            log("diarization unavailable: legacy WhisperX requires its model credential")
+            return None
+        tmp = tempfile.mkdtemp(prefix="diarization-", dir=str(output_dir))
         command = [binary, str(audio_path), "--model", "large-v3-turbo",
                    "--output_dir", tmp, "--output_format", "json", "--diarize",
                    "--device", "cpu", "--compute_type", "int8"]
         if getattr(cfg, "voice_profiles_enabled", True):
             command.append("--speaker_embeddings")
-        # Keep the credential out of the process argument list.  Hugging Face
-        # libraries and WhisperX both honor HF_TOKEN in the child environment.
         child_env = os.environ.copy()
         child_env["HF_TOKEN"] = token
-        try:
-            proc = subprocess.run(
-                command, capture_output=True, text=True,
-                cwd=str(Path(__file__).resolve().parent.parent),
-                env=child_env,
-                timeout=max(30.0, float(getattr(cfg, "diarization_timeout_seconds", 300.0))))
-        except (OSError, subprocess.SubprocessError) as exc:
-            log("diarization skipped after launch failure: {}".format(exc))
-            return None
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "unknown failure").strip().splitlines()
-            log("diarization skipped: {}".format(detail[-1] if detail else "unknown failure"))
-            return None
+        parser_path = None
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=child_env,
+            timeout=max(30.0, float(getattr(cfg, "diarization_timeout_seconds", 300.0))))
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("diarization skipped after launch failure: {}".format(exc))
+        return None
+    finally:
+        if backend not in ("auto", "local", "nemo", "sortformer") and 'tmp' in locals():
+            # The parsed JSON is copied into derived/ below before cleanup.
+            pass
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown failure").strip().splitlines()
+        log("diarization skipped: {}".format(detail[-1] if detail else "unknown failure"))
+        return None
+    if parser_path is None:
         candidates = sorted(Path(tmp).glob("*.json"))
         if not candidates:
             log("diarization skipped: WhisperX produced no JSON output")
+            shutil.rmtree(tmp, ignore_errors=True)
             return None
-        try:
-            segments = _load_segments(candidates[0])
-        except (OSError, ValueError, TypeError) as exc:
-            log("diarization skipped: invalid WhisperX output ({})".format(exc))
-            return None
+        parser_path = candidates[0]
+    try:
+        segments = _load_segments(Path(parser_path))
+    except (OSError, ValueError, TypeError) as exc:
+        log("diarization skipped: invalid local diarization output ({})".format(exc))
+        if 'tmp' in locals():
+            shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    if 'tmp' in locals():
+        shutil.rmtree(tmp, ignore_errors=True)
 
     if not segments:
         log("diarization completed with no speaker segments")
         return None
-    if (getattr(cfg, "voice_profiles_enabled", True)
+    if (backend not in ("auto", "local", "nemo", "sortformer")
+            and getattr(cfg, "voice_profiles_enabled", True)
             and not any(segment.get("_embedding") for segment in segments)):
         _add_optional_embeddings(audio_path, segments, token, log)
     events_list = list(events)
@@ -353,7 +485,7 @@ def run_post_call_diarization(audio_path: Path, events: Iterable[Dict[str, Any]]
                        for segment in segments]
     result = {
         "schema_version": 1,
-        "backend": "whisperx",
+        "backend": "nemo" if backend in ("auto", "local", "nemo", "sortformer") else "whisperx",
         "audio": str(audio_path),
         "segments": public_segments,
         "speaker_count": diar_speaker_count,

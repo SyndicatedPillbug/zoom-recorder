@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable, Iterator, List, Optional
 
 from .config import (DEFAULT_PARTIAL_TRANSCRIPTION_MODEL, HudConfig,
-                     LOCAL_STT_BACKENDS)
+                     LOCAL_STT_BACKENDS, get_provider)
 from .llm import LLMClient, LLMError
 from .state import LiveState
 from .vad import build_vad
@@ -47,6 +47,7 @@ HALLUCINATION_PHRASES = re.compile(
     r"please (?:like|subscribe).*|"
     r"subtitles? by.*|amara\.org.*|transcription by.*|"
     r"\[\s*(?:blank[_ ]?audio|silence|music)\s*\]|"
+    r"\*[^*\r\n]{1,80}\*|"
     r"♪+.*|\.+)\s*$",
     re.I,
 )
@@ -62,6 +63,8 @@ class STTResult:
     avg_logprob: Optional[float] = None
     no_speech_prob: Optional[float] = None
     compression_ratio: Optional[float] = None
+    word_probability: Optional[float] = None
+    language_probability: Optional[float] = None
 
 
 def _number(value) -> Optional[float]:
@@ -98,6 +101,7 @@ def _result_from_verbose_payload(payload: dict, fallback_text: str,
     logprobs: List[float] = []
     no_speech: List[float] = []
     ratios: List[float] = []
+    word_probabilities: List[float] = []
     for seg in segments:
         if not isinstance(seg, dict):
             continue
@@ -120,6 +124,13 @@ def _result_from_verbose_payload(payload: dict, fallback_text: str,
             no_speech.append(segment_no_speech)
         if segment_ratio is not None:
             ratios.append(segment_ratio)
+        for word in seg.get("words") or []:
+            if not isinstance(word, dict):
+                continue
+            word_text = str(word.get("word") or "").strip()
+            probability = _number(word.get("probability"))
+            if probability is not None and re.search(r"[A-Za-z0-9]", word_text):
+                word_probabilities.append(probability)
     return STTResult(
         # Deliberately do not fall back to the provider-level text here. If
         # every segment failed, the text has no surviving audio evidence.
@@ -127,6 +138,9 @@ def _result_from_verbose_payload(payload: dict, fallback_text: str,
         avg_logprob=(sum(logprobs) / len(logprobs)) if logprobs else None,
         no_speech_prob=max(no_speech) if no_speech else None,
         compression_ratio=max(ratios) if ratios else None,
+        word_probability=(sum(word_probabilities) / len(word_probabilities)
+                          if word_probabilities else None),
+        language_probability=_number(payload.get("detected_language_probability")),
     )
 
 
@@ -134,6 +148,8 @@ def hallucination_reason(text: str, marginal: bool = False,
                        avg_logprob: Optional[float] = None,
                        no_speech_prob: Optional[float] = None,
                        compression_ratio: Optional[float] = None,
+                       word_probability: Optional[float] = None,
+                       language_probability: Optional[float] = None,
                        speech_activity_ratio: Optional[float] = None,
                        no_speech_prob_max: float = 0.75,
                        avg_logprob_min: float = -1.5,
@@ -156,6 +172,24 @@ def hallucination_reason(text: str, marginal: bool = False,
         return "high_compression_ratio"
 
     words = re.findall(r"[a-z0-9']+", t.lower())
+    # A chunk with less than the configured amount of detected speech is not
+    # enough acoustic support for a short authoritative sentence. This must
+    # not depend on the energy margin: a whistle can be far above the noise
+    # floor while still being entirely non-speech.
+    if (speech_activity_ratio is not None
+            and speech_activity_ratio < speech_activity_min
+            and len(words) <= 8):
+        return "low_speech_activity"
+    # whisper.cpp's local server exposes token and language confidence even
+    # when its no-speech classifier is overconfident on a whistle. Treat weak
+    # evidence as a second opinion for short candidates, without imposing a
+    # confidence gate on long, clearly spoken turns.
+    if len(words) <= 12:
+        if word_probability is not None and word_probability < 0.35:
+            return "low_token_probability"
+        if (language_probability is not None and language_probability < 0.60
+                and word_probability is not None and word_probability < 0.65):
+            return "low_language_confidence"
     if (len(words) >= 3 and len(set(words)) == 1
             and words[0] in REPEATED_NON_SPEECH):
         return "repeated_interjection"
@@ -199,6 +233,8 @@ def looks_hallucinated(text: str, marginal: bool = False,
                        avg_logprob: Optional[float] = None,
                        no_speech_prob: Optional[float] = None,
                        compression_ratio: Optional[float] = None,
+                       word_probability: Optional[float] = None,
+                       language_probability: Optional[float] = None,
                        speech_activity_ratio: Optional[float] = None,
                        no_speech_prob_max: float = 0.75,
                        avg_logprob_min: float = -1.5,
@@ -208,6 +244,8 @@ def looks_hallucinated(text: str, marginal: bool = False,
     return hallucination_reason(
         text, marginal=marginal, avg_logprob=avg_logprob,
         no_speech_prob=no_speech_prob, compression_ratio=compression_ratio,
+        word_probability=word_probability,
+        language_probability=language_probability,
         speech_activity_ratio=speech_activity_ratio,
         no_speech_prob_max=no_speech_prob_max,
         avg_logprob_min=avg_logprob_min,
@@ -690,7 +728,7 @@ class LocalWhisperSTT:
                 detail = (completed.stderr or "").strip().splitlines()
                 detail = detail[-1] if detail else "exit {}".format(completed.returncode)
                 self.log("local STT: {} failed ({}); trying fallback".format(label, detail))
-        return ""
+        raise RuntimeError("local whisper inference failed after GPU and CPU attempts")
 
     def close(self) -> None:
         if self._server is not None:
@@ -703,6 +741,68 @@ class LocalWhisperSTT:
                 except Exception:  # noqa: BLE001
                     pass
             self._server = None
+
+
+class FailoverSTT:
+    """Keep local Turbo primary while making a configured provider recoverable.
+
+    A silence result is valid and must not trigger a paid request. Failover is
+    therefore limited to construction/runtime errors from the active backend.
+    Once a backend fails, the next backend remains active for the rest of the
+    session so a broken provider cannot cause repeated stalls.
+    """
+
+    def __init__(self, entries, log: Callable[[str], None], on_switch=None) -> None:
+        self.entries = list(entries)
+        self.log = log
+        self.on_switch = on_switch
+        self.index = 0
+
+    @property
+    def active_name(self) -> str:
+        if not self.entries:
+            return ""
+        return str(self.entries[self.index][0])
+
+    @property
+    def active_is_local(self) -> bool:
+        return self.active_name.lower() in LOCAL_STT_BACKENDS
+
+    def transcribe(self, pcm: bytes, prompt: Optional[str] = None) -> STTResult:
+        last_error: Optional[Exception] = None
+        for index in range(self.index, len(self.entries)):
+            name, backend = self.entries[index]
+            try:
+                result = backend.transcribe(pcm, prompt=prompt)
+                self.index = index
+                return result if isinstance(result, STTResult) else STTResult(
+                    text=str(result or ""))
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                self.log("STT backend '{}' failed: {}; trying fallback".format(name, exc))
+                if index + 1 < len(self.entries):
+                    self.index = index + 1
+                    next_name = self.active_name
+                    self.log("live STT: switched to fallback '{}'".format(next_name))
+                    if callable(self.on_switch):
+                        self.on_switch(next_name)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no STT backend configured")
+
+    def close(self) -> None:
+        closed = set()
+        for _name, backend in self.entries:
+            identity = id(backend)
+            if identity in closed:
+                continue
+            closed.add(identity)
+            closer = getattr(backend, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 # --------------------------------------------------------------------------
@@ -730,11 +830,17 @@ class _Source:
         self.thread: Optional[threading.Thread] = None
         self.worker: Optional[threading.Thread] = None
         self.partial_worker: Optional[threading.Thread] = None
+        self.context_worker: Optional[threading.Thread] = None
         self.queue: "queue.Queue" = queue.Queue(maxsize=4)
         self.partial_queue: "queue.Queue" = queue.Queue(maxsize=1)
+        self.context_queue: "queue.Queue" = queue.Queue(maxsize=1)
         self.partial_lock = threading.Lock()
+        self.context_lock = threading.Lock()
         self.partial_buffer = bytearray()
+        self.context_audio = bytearray()
         self.partial_last_submit = 0.0
+        self.context_last_submit = 0.0
+        self.context_last_text = ""
         self.partial_decoder = StablePartialDecoder()
         self.partial_revision = 0
         self.vad = None
@@ -778,6 +884,7 @@ class LiveTranscriber:
         self._stt_hallucination_filtered = 0
         self._stt_confirmation_held = 0
         self._stt_confirmation_dropped = 0
+        self._context_correction_skipped = 0
         self._active_chunk_seconds = float(cfg.stt_chunk_seconds)
 
     # -- lifecycle ---------------------------------------------------------
@@ -824,7 +931,10 @@ class LiveTranscriber:
         label = " + ".join(s.speaker or "mixed" for s in self._sources)
         self._active_chunk_seconds = self._effective_chunk_seconds()
         adaptive = self._adaptive_chunking_enabled()
-        self.log("live STT running ({} backend, {:.1f}s chunks{}, {} queue, sources: {})".format(
+        self.state.set_meta(
+            stt_backend_active=getattr(self._stt, "active_name", self.cfg.stt_backend),
+            stt_failover=False)
+        self.log("live STT running ({} primary, {:.1f}s chunks{}, {} queue, sources: {})".format(
             self.cfg.stt_backend, self._active_chunk_seconds,
             ", adaptive" if adaptive else "",
             getattr(self.cfg, "stt_queue_chunks", 4), label))
@@ -842,6 +952,12 @@ class LiveTranscriber:
                     target=self._partial_worker, args=(source,),
                     name="hud-stt-partial-{}".format(source.speaker or "mix"), daemon=True)
                 source.partial_worker.start()
+            if self._context_correction_enabled():
+                source.context_queue = queue.Queue(maxsize=1)
+                source.context_worker = threading.Thread(
+                    target=self._context_correction_worker, args=(source,),
+                    name="hud-stt-context-{}".format(source.speaker or "mix"), daemon=True)
+                source.context_worker.start()
             source.thread = threading.Thread(
                 target=self._run_source, args=(source,),
                 name="hud-stt-{}".format(source.speaker or "mix"), daemon=True)
@@ -859,7 +975,7 @@ class LiveTranscriber:
 
     def _adaptive_chunking_enabled(self) -> bool:
         return (bool(getattr(self.cfg, "stt_adaptive_chunking", True))
-                and (self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS)
+                and self._active_stt_is_local())
 
     def _chunk_bounds(self) -> tuple[float, float]:
         minimum = max(1.0, float(getattr(self.cfg, "stt_chunk_min_seconds", 2.5)))
@@ -867,9 +983,21 @@ class LiveTranscriber:
         return minimum, maximum
 
     def _partial_enabled(self) -> bool:
-        return ((self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS
+        return (self._active_stt_is_local()
                 and bool(getattr(self.cfg, "stt_partial_enabled", True))
                 and float(getattr(self.cfg, "stt_partial_window_seconds", 4.0)) > 0)
+
+    def _active_stt_is_local(self) -> bool:
+        """Return the active lane, including before the pipeline is started."""
+        active = getattr(self._stt, "active_is_local", None)
+        if active is None:
+            return (self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS
+        return bool(active)
+
+    def _context_correction_enabled(self) -> bool:
+        return (bool(getattr(self.cfg, "stt_context_correction_enabled", True))
+                and self._stt is not None
+                and self._active_stt_is_local())
 
     def _stop_sources(self, sources: List["_Source"]) -> None:
         for source in sources:
@@ -909,11 +1037,24 @@ class LiveTranscriber:
                     source.partial_queue.put_nowait(None)
                 except queue.Full:
                     pass
+            try:
+                source.context_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    source.context_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    source.context_queue.put_nowait(None)
+                except queue.Full:
+                    pass
         for source in sources:
             if source.worker is not None:
                 source.worker.join(timeout=8.0)
             if source.partial_worker is not None:
                 source.partial_worker.join(timeout=8.0)
+            if source.context_worker is not None:
+                source.context_worker.join(timeout=8.0)
 
     def stop(self) -> None:
         self._stop.set()
@@ -933,30 +1074,54 @@ class LiveTranscriber:
 
     # -- setup -------------------------------------------------------------
     def _build_stt(self):
-        if (self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS:
-            if self.model_path is None:
-                raise RuntimeError("local STT needs --model pointing at a ggml model")
+        names = [self.cfg.stt_backend] + list(getattr(self.cfg, "stt_fallbacks", []))
+        entries = []
+        seen = set()
+        for raw_name in names:
+            name = str(raw_name or "").strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            try:
+                entries.append((name, self._build_stt_backend(name)))
+            except Exception as exc:  # noqa: BLE001
+                self.log("STT backend '{}' unavailable: {}".format(name, exc))
+        if not entries:
+            raise RuntimeError("no usable STT backend; install local Turbo or configure a provider")
+        return FailoverSTT(entries, self.log, self._on_stt_switch)
+
+    def _build_stt_backend(self, name: str):
+        if name in LOCAL_STT_BACKENDS:
+            model_path = self.model_path
+            if model_path is None:
+                model_path = Path(str(getattr(self.cfg.recorder, "transcription_model",
+                                             ""))).expanduser()
+            if not str(model_path):
+                raise RuntimeError("local STT has no Turbo model path")
             return LocalWhisperSTT(
-                self.model_path, self.log, self.cfg.stt_whisper_bin,
+                Path(model_path), self.log, self.cfg.stt_whisper_bin,
                 no_speech_threshold=min(0.60, self.cfg.stt_no_speech_prob_max),
                 verbose=self.cfg.stt_verbose_stt)
-        provider = self.cfg.provider_for_stt()
-        if provider is None:
-            raise RuntimeError("unknown STT backend '{}'".format(self.cfg.stt_backend))
+        try:
+            provider = get_provider(name)
+        except KeyError:
+            raise RuntimeError("unknown STT backend '{}'".format(name))
         api_key = self.cfg.api_key_for(provider.name)
         if provider.api_key_env and not api_key:
-            raise RuntimeError(
-                "missing API key for STT provider '{}' (set {})".format(
-                    provider.name, provider.api_key_env))
-        client = LLMClient(provider.base_url, api_key)
-        model = self.cfg.resolve_stt_model()
+            raise RuntimeError("missing API key for STT provider '{}' (set {})".format(
+                provider.name, provider.api_key_env))
+        model = self.cfg.stt_model if name == (self.cfg.stt_backend or '').lower() else provider.stt_model
         if not model:
             raise RuntimeError("STT provider '{}' has no speech endpoint".format(provider.name))
         return RemoteSTT(
-            client, model, self.log, verbose=self.cfg.stt_verbose_stt,
+            LLMClient(provider.base_url, api_key), model, self.log,
+            verbose=self.cfg.stt_verbose_stt,
             no_speech_prob_max=self.cfg.stt_no_speech_prob_max,
             avg_logprob_min=self.cfg.stt_avg_logprob_min,
             compression_ratio_max=self.cfg.stt_compression_ratio_max)
+
+    def _on_stt_switch(self, backend: str) -> None:
+        self.state.set_meta(stt_backend_active=backend, stt_failover=True)
 
     def _build_partial_stt(self):
         """Build an optional fast local lane for provisional words."""
@@ -1042,6 +1207,7 @@ class LiveTranscriber:
         last_publish = 0.0
         try:
             for block in self._iter_blocks(source.proc.stdout):
+                self._retain_context_audio(source, block)
                 self._feed_partial(source, block)
                 for chunk in chunker.feed(block):
                     self._enqueue(source, chunk, chunker.last_margin_db,
@@ -1108,6 +1274,92 @@ class LiveTranscriber:
         if levels:
             meta["stt_vad_level_db"] = round(max(levels), 1)
         self.state.set_meta(**meta)
+
+    def _retain_context_audio(self, source: _Source, block: bytes) -> None:
+        window = max(2.0, float(getattr(
+            self.cfg, "stt_context_correction_window_seconds", 20.0)))
+        max_bytes = int(window * SAMPLE_RATE * SAMPLE_WIDTH)
+        with source.context_lock:
+            source.context_audio.extend(block)
+            if len(source.context_audio) > max_bytes:
+                del source.context_audio[:-max_bytes]
+
+    def _schedule_context_correction(self, source: _Source) -> None:
+        """Queue a best-effort longer local read without competing with finals."""
+        if not self._context_correction_enabled() or self._stop.is_set():
+            return
+        now = time.time()
+        interval = max(2.0, float(getattr(
+            self.cfg, "stt_context_correction_interval_seconds", 8.0)))
+        with source.context_lock:
+            if now - source.context_last_submit < interval:
+                return
+            audio = bytes(source.context_audio)
+            if len(audio) < int(4.0 * SAMPLE_RATE * SAMPLE_WIDTH):
+                return
+            source.context_last_submit = now
+        # Final recognition always wins. A correction request that cannot start
+        # immediately is discarded rather than adding queue latency.
+        if source.queue.qsize() > 0 or self._inference_lock.locked():
+            self._context_correction_skipped += 1
+            self.state.set_meta(stt_context_correction_skipped=self._context_correction_skipped)
+            return
+        try:
+            source.context_queue.put_nowait((now, audio))
+        except queue.Full:
+            self._context_correction_skipped += 1
+            self.state.set_meta(stt_context_correction_skipped=self._context_correction_skipped)
+
+    def _context_correction_worker(self, source: _Source) -> None:
+        while not self._stop.is_set():
+            try:
+                item = source.context_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            captured_at, audio = item
+            started = time.time()
+            # A final chunk may have arrived while the item was queued.
+            if source.queue.qsize() > 0 or not self._inference_lock.acquire(blocking=False):
+                self._context_correction_skipped += 1
+                self.state.set_meta(stt_context_correction_skipped=self._context_correction_skipped)
+                continue
+            try:
+                if not self._active_stt_is_local():
+                    continue
+                out = self._stt.transcribe(audio, prompt=self._prompt_for(source))
+            except Exception as exc:  # noqa: BLE001
+                self.log("local STT contextual pass skipped: {}".format(exc))
+                continue
+            finally:
+                self._inference_lock.release()
+            result = out if isinstance(out, STTResult) else STTResult(text=str(out or ""))
+            text = result.text.strip()
+            if not text or (self.cfg.stt_hallucination_filter
+                            and looks_hallucinated(text, marginal=False)):
+                continue
+            with source.context_lock:
+                if text == source.context_last_text:
+                    continue
+                source.context_last_text = text
+            published_at = time.time()
+            self.state.add(
+                "transcript_context", text=text, source="local_context",
+                source_key=source.speaker_id,
+                speaker=self.state.speaker_label(source.speaker_id, source.speaker),
+                speaker_id=source.speaker_id, provisional=True,
+                authoritative=False, captured_at=captured_at,
+                published_at=published_at,
+                window_seconds=round(len(audio) / (SAMPLE_RATE * SAMPLE_WIDTH), 2),
+                inference_seconds=round(max(0.0, published_at - started), 4),
+                capture_to_publish_seconds=round(max(0.0, published_at - captured_at), 4))
+            self.state.observe_metric("stt_context_correction_seconds",
+                                      max(0.0, published_at - started))
+            self.state.set_meta(
+                stt_context_correction_at=published_at,
+                stt_context_correction_window_seconds=round(
+                    len(audio) / (SAMPLE_RATE * SAMPLE_WIDTH), 2))
 
     def _stt_worker(self, source: _Source) -> None:
         while not self._stop.is_set():
@@ -1302,7 +1554,21 @@ class LiveTranscriber:
                           speech_activity_ratio: Optional[float] = None) -> None:
         if self._stop.is_set():
             return
-        if (self.cfg.stt_backend or "").lower() not in LOCAL_STT_BACKENDS:
+        if (self.cfg.stt_hallucination_filter
+                and speech_activity_ratio is not None
+                and speech_activity_ratio < self.cfg.stt_speech_activity_min):
+            # Do not spend a full Turbo inference on a mostly silent window.
+            # This is deliberately an admission gate, not merely a post-hoc
+            # text filter: prompting Whisper with the prior transcript can make
+            # a whistle or room noise look like a confident continuation.
+            self._stt_hallucination_filtered += 1
+            self.state.set_meta(
+                stt_hallucination_filtered=self._stt_hallucination_filtered,
+                stt_last_rejection_reason="low_speech_activity")
+            self.log("live STT: skipped mostly silent chunk (speech {:.0%})".format(
+                speech_activity_ratio))
+            return
+        if not self._active_stt_is_local():
             with self._provider_backoff_lock:
                 blocked = self._provider_backoff_until - time.time()
             if blocked > 0:
@@ -1335,7 +1601,7 @@ class LiveTranscriber:
         except Exception as exc:  # noqa: BLE001
             self.log("STT failure: {}".format(exc))
             return
-        if (self.cfg.stt_backend or "").lower() not in LOCAL_STT_BACKENDS:
+        if not self._active_stt_is_local():
             with self._provider_backoff_lock:
                 self._provider_backoff_until = 0.0
                 self._provider_backoff_seconds = 4.0
@@ -1348,6 +1614,8 @@ class LiveTranscriber:
                 text, marginal=margin_db < self.cfg.stt_vad_margin_db,
                 avg_logprob=result.avg_logprob, no_speech_prob=result.no_speech_prob,
                 compression_ratio=result.compression_ratio,
+                word_probability=result.word_probability,
+                language_probability=result.language_probability,
                 no_speech_prob_max=self.cfg.stt_no_speech_prob_max,
                 avg_logprob_min=self.cfg.stt_avg_logprob_min,
                 compression_ratio_max=self.cfg.stt_compression_ratio_max,
@@ -1368,6 +1636,7 @@ class LiveTranscriber:
             return
         self._publish_committed(source, text, started, finalized=True,
                                 captured_at=captured_at)
+        self._schedule_context_correction(source)
         if self._partial_enabled():
             speaker = self.state.speaker_label(source.speaker_id, source.speaker)
             self.state.add("transcript_boundary", source_key=source.speaker_id,

@@ -15,9 +15,8 @@ cd ~/zoom-recorder
 # ...or install what is missing (Homebrew ffmpeg + BlackHole, pip rumps):
 ./install.sh --install-deps
 
-# Post-call speaker diarization and reusable voice matching (enabled by default):
+# Local post-call speaker diarization and reusable voice matching (enabled by default):
 ./install.sh --install-diarization
-./.venv-diarization/bin/hf auth login
 ```
 
 `./install.sh --dry-run` prints everything it would do without changing
@@ -68,9 +67,10 @@ that launched it.
   button takes you straight there and tells you when the microphone reads as
   digital silence.
 
-No Screen Recording or System Audio Recording permission is needed for the
-normal (loopback) path. `--system-capture tap` is the only mode that needs
-it, and it is opt-in.
+No Screen Recording permission is needed. The normal `auto` path uses the
+Core Audio tap when the current process has System Audio Recording permission,
+and falls back to BlackHole/Multi-Output otherwise. Explicit `--system-capture
+tap` requires that permission; explicit `loopback` never does.
 
 ## 4. Optional: live transcript + answers
 
@@ -97,13 +97,12 @@ second display when the HUD must remain private.
 
 Multi-speaker attribution is a separate, post-call feature. It is enabled by
 default in the Control Center and cannot affect live capture or answer
-latency. The
-supported setup creates a repo-local `.venv-diarization` environment with
-WhisperX and `pyannote.audio`; the recorder discovers its `whisperx` command
-automatically. Authenticate that environment with `hf auth login` or provide
-the model credential through `HF_TOKEN`, then start a live session with
-`./zoom_record.py --live`. The result is written under `derived/`;
-missing dependencies or a failed pass leave the ordinary transcript intact.
+latency. The supported setup installs the native NeMo-Speech runtime and its
+local Sortformer model. On Apple Silicon it uses Metal; on Linux AMD it uses
+Vulkan where available, or CPU. The model is downloaded once and then
+inference is local. No Hugging Face token is required. The result is written
+under `derived/`; missing local setup or a failed pass leaves the ordinary
+transcript intact and is reported visibly in the Control Center.
 
 During any live session, click a speaker label in the transcript to enter a
 participant name. Names are saved as local session metadata and do not require
@@ -114,14 +113,21 @@ manual labels can also build a local reusable voice profile. Those profiles are
 stored owner-only under the app configuration directory, contain no audio, and
 can be disabled or deleted from Settings.
 
-For reusable voice matching, keep voice profiles enabled so WhisperX emits its
-speaker embeddings during the same post-call pass. The app still works without
-that optional output; it simply keeps generic diarization labels.
+Reusable voice matching is a separate local layer. Explicit manual labels are
+used to enroll profiles; generic diarization output is never silently treated
+as a confirmed identity.
 
 To keep everything on the machine, use **Settings → Offline mode** (blocks
 all internet access). See `SECURITY.md` for exactly what is sent where.
 
 ### Obsidian context and session identity
+
+In the native Main App, **Context for the next meeting** lets you choose a
+meeting-specific set of folders without changing the permanent library. The
+exact selection is saved in `derived/context_sources.json`; the app reports
+whether it is indexed, needs indexing, contains no Markdown, or is unavailable.
+Indexing runs in the background and uses a local semantic backend when one is
+installed, with a deterministic local lexical/hash fallback always available.
 
 In Advanced settings, add the folders that contain your Obsidian Markdown
 notes and past transcripts to the knowledge-base directories. The app builds a

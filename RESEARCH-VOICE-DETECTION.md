@@ -111,3 +111,22 @@ long silence, but produced 159 separate short speech regions around the
 click/noise portion. This is a useful result: quiet speech is no longer being
 silently lost, while the remaining false opens are measurable and justify the
 next neural/frequency-aware VAD experiment.
+
+## Latest false-positive replay and hardening
+
+The 10:28:30 test session
+`2026-09-23/10-28-30_ok-let-s-test-how-this-is-going_638877d8/` reproduced the
+reported failure. The mic track contained the opening sentence and a largely
+accurate Hamlet recitation, but the final lane also published unrelated short
+continuations after the recitation and Whisper sound-effect labels during
+silence/whistling. The system track was silent, so this was isolated to the mic
+STT path rather than a loopback mix-up.
+
+The replay showed that the energy gate was admitting chunks with only 10–11%
+detected speech. Because the previous transcript was supplied as a prompt,
+Turbo could turn those windows into plausible-looking text; Whisper's local
+`no_speech_prob` was not reliable for this non-speech audio. The live pipeline
+now rejects mostly-silent chunks before inference, rejects fully delimited
+sound-effect labels, and retains local token/language confidence when the
+server provides it. The change preserves the Hamlet chunks, which had much
+higher speech activity, while avoiding unnecessary model work on dead air.

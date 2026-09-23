@@ -26,6 +26,7 @@ from .budget import BudgetGovernor
 from .config import HudConfig
 from .identity import build_identity, meaningful_folder_name, write_identity
 from .local_http import url_host
+from .resources import ResourceMonitor
 from .server import HudServer
 from .state import LiveState
 from .stt import LiveTranscriber
@@ -60,6 +61,7 @@ class LiveSession:
         self._stop = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
         self._writeback: Optional[TranscriptWriteback] = None
+        self.resources: Optional[ResourceMonitor] = None
         self._native_proc: Optional[subprocess.Popen] = None
         self._hud_surface = "none"
         self._lifecycle_stages: Dict[str, float] = {}
@@ -95,6 +97,9 @@ class LiveSession:
                               stt_backend=self.cfg.stt_backend)
         self.state.set_budget(self.budget.snapshot())
         self._publish_devices()
+        self._write_context_snapshot()
+        self.resources = ResourceMonitor(self.state, self.log)
+        self.resources.start()
 
         if self.cfg.transcript_writeback_dir:
             self._writeback = TranscriptWriteback(
@@ -140,6 +145,27 @@ class LiveSession:
             self.cfg.answers_backend if self.cfg.answers_enabled else "off"))
         return self._port
 
+    def _write_context_snapshot(self) -> None:
+        """Persist the exact knowledge sources selected for this meeting."""
+        try:
+            from .kb import inspect_sources
+            dirs = list(getattr(self.cfg, "kb_dirs", []) or []) if self.cfg.kb_enabled else []
+            snapshot = {
+                "schema_version": 1,
+                "selected_dirs": dirs,
+                "selected_at": time.time(),
+                "index": inspect_sources(dirs, self.cfg.kb_cache_dir),
+            }
+            target = self.outdir / "derived" / "context_sources.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp = target.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+            os.replace(str(temp), str(target))
+            self.log("meeting context: {} source folder(s), {}".format(
+                len(dirs), snapshot["index"].get("state", "unknown")))
+        except Exception as exc:  # noqa: BLE001 - context must never block capture
+            self.log("meeting context snapshot unavailable ({})".format(exc))
+
     def stop(self) -> None:
         if not self._started:
             return
@@ -175,6 +201,13 @@ class LiveSession:
             except Exception:  # noqa: BLE001
                 pass
             self._record_lifecycle_stage("answer_stop", stage_started)
+        if self.resources is not None:
+            stage_started = time.time()
+            try:
+                self.resources.stop()
+            except Exception:  # noqa: BLE001 - telemetry must not block shutdown
+                pass
+            self._record_lifecycle_stage("resource_stop", stage_started)
         if self._writeback is not None:
             stage_started = time.time()
             try:
@@ -263,6 +296,14 @@ class LiveSession:
         if self.answers is not None:
             self.answers.pause(paused)
         self.state.set_meta(answers_paused=paused)
+
+    def set_system_audio_warning(self, warning: str) -> None:
+        """Publish a recorder-side loopback warning in the live HUD."""
+        self.state.set_meta(system_audio_warning=str(warning or ""))
+
+    def set_audio_route_context(self, context: Optional[Dict[str, Any]]) -> None:
+        """Publish auditable capture-route facts to the live HUD."""
+        self.state.set_meta(audio_route=dict(context or {}))
 
     def _on_speaker_label(self, speaker_id: str, label: str) -> bool:
         """Apply a presentation-only name override from the HUD."""

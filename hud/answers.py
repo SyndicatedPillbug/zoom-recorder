@@ -475,6 +475,10 @@ class AnswerEngine:
         self._words_since_rolling = 0
         self._question_inflight = False
         self._partial_question_draft = ""
+        # Long-window local ASR candidates help answer wording, but are kept
+        # separate from the authoritative transcript so they can never become
+        # quoted evidence or overwrite the saved record.
+        self._context_candidates: Dict[str, Dict[str, Any]] = {}
 
         self._kb: Optional[KBIndex] = None
         self._live_kb: Optional[KBIndex] = None
@@ -541,7 +545,7 @@ class AnswerEngine:
         question = ("Expand on this talking point with concrete detail, an example, "
                     "and why it matters: {}".format(text)) if expand else text
         self._put(0, {"kind": "question", "question": question, "speaker": "You",
-                      "context": "", "window": self._context_text(), "manual": True})
+                      "context": "", "window": self._answer_context_text(), "manual": True})
         return True
 
     # -- setup -------------------------------------------------------------
@@ -678,7 +682,13 @@ class AnswerEngine:
                 self._memory_q.task_done()
 
     def _build_embedder(self):
-        """Pick an embedding backend: local model, Ollama, OpenAI, then hashing."""
+        """Pick an embedding backend without surprising network activity.
+
+        ``auto`` is deliberately local-only: it tries the installed local
+        model and then the zero-dependency embedder. Ollama/OpenAI remain
+        available when explicitly selected, but a missing Ollama server must
+        never become a hidden localhost retry loop during a meeting.
+        """
         from .kb import HashingEmbedder, LocalEmbedder, RemoteEmbedder
 
         backend = (self.cfg.kb_embed_backend or "auto").lower()
@@ -690,7 +700,7 @@ class AnswerEngine:
                 self.log("KB: local embeddings unavailable ({})".format(exc))
                 if backend != "auto":
                     return None
-        if backend in ("ollama", "auto"):
+        if backend == "ollama":
             try:
                 provider = get_provider("ollama")
                 return RemoteEmbedder(
@@ -698,7 +708,7 @@ class AnswerEngine:
                     model or "nomic-embed-text", name="ollama")
             except Exception as exc:  # noqa: BLE001
                 self.log("KB: ollama embeddings unavailable ({})".format(exc))
-        if backend in ("openai", "auto"):
+        if backend == "openai":
             api_key = self.cfg.api_key_for("openai")
             if api_key:
                 provider = get_provider("openai")
@@ -862,7 +872,7 @@ class AnswerEngine:
                 "question": detected["question"],
                 "speaker": detected["speaker"],
                 "context": detected["context"],
-                "window": self._context_text(),
+                "window": self._answer_context_text(),
                 "detected_at": time.time(),
             })
             self._partial_question_draft = ""
@@ -961,6 +971,16 @@ class AnswerEngine:
                 self._update_partial_question_draft(
                     str(event.get("text") or ""), speaker, speaker_id)
                 continue
+            if event.get("type") == "transcript_context":
+                key = str(event.get("source_key") or event.get("speaker_id") or "mixed")
+                text = str(event.get("text") or "").strip()
+                if text:
+                    self._context_candidates[key] = {
+                        "speaker": str(event.get("speaker") or "").strip(),
+                        "text": text[-2400:],
+                        "ts": float(event.get("published_at") or time.time()),
+                    }
+                continue
             if event.get("type") == "transcript_boundary":
                 speaker = event.get("speaker") or ""
                 speaker_id = event.get("speaker_id") or ""
@@ -1020,6 +1040,27 @@ class AnswerEngine:
         if limit and len(text) > limit:
             return text[-limit:]
         return text
+
+    def _answer_context_text(self) -> str:
+        """Authoritative conversation plus clearly labeled ASR candidates."""
+        text = self._context_text()
+        candidates = []
+        now = time.time()
+        for item in self._context_candidates.values():
+            # Do not let an old provisional window pollute a later answer.
+            if now - float(item.get("ts") or now) > max(30.0, self.cfg.context_minutes * 60.0):
+                continue
+            speaker = item.get("speaker") or "speaker"
+            candidates.append("[{}] {}".format(speaker, item.get("text", "")))
+        if not candidates:
+            return text
+        suffix = ("\n\nContextual ASR candidates (provisional; never quote these as "
+                  "evidence and prefer the authoritative transcript):\n" +
+                  "\n".join(candidates))
+        limit = self.cfg.context_max_chars
+        if limit and len(text) + len(suffix) > limit:
+            return (text[-max(0, limit - len(suffix)):] + suffix)
+        return text + suffix
 
     def _flush_buffer(self) -> None:
         self._buffer = []
@@ -1253,7 +1294,7 @@ class AnswerEngine:
                     queued_at=queued_at, started_at=started_at)
         question = job.get("question") or ""
         context = job.get("context") or ""
-        window = job.get("window") or self._context_text()
+        window = job.get("window") or self._answer_context_text()
         if not question and not window:
             return
 

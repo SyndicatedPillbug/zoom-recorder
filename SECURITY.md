@@ -1,4 +1,4 @@
-# Security & privacy notes
+Build a # Security & privacy notes
 
 Written for a security reviewer (and for you, when someone asks "what does
 this thing actually do?"). Everything here is verifiable from the source in

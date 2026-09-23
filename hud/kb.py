@@ -23,6 +23,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -239,6 +240,55 @@ def _file_stats_match(saved: Any, files: List[Path]) -> bool:
     if any(item is None for item in current):
         return False
     return current == saved
+
+
+def inspect_sources(dirs: List[str], cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Report whether a selected source set has a current local index.
+
+    This is intentionally independent of an embedder instance so the UI can
+    answer “does this need indexing?” without loading a model or blocking a
+    recording.  A cache is current only when its exact file-stat snapshot
+    matches the selected folders; changing folders or editing one note makes
+    the meeting visibly ``needs_index``.
+    """
+    selected = [str(Path(os.path.expanduser(path))) for path in (dirs or []) if str(path).strip()]
+    files = list(_iter_markdown_files(selected))
+    result: Dict[str, Any] = {
+        "dirs": selected,
+        "files": len(files),
+        "chunks": 0,
+        "state": "unavailable" if not selected else "needs_index",
+        "needs_index": bool(selected),
+        "embedder": None,
+        "indexed_at": None,
+    }
+    if not selected:
+        result.update({"state": "not_selected", "needs_index": False})
+        return result
+    if not files:
+        result.update({"state": "no_markdown", "needs_index": False})
+        return result
+    root = Path(os.path.expanduser(cache_dir)) if cache_dir else DEFAULT_CACHE
+    meta_file = root / "index.json"
+    vectors_file = root / "vectors.json.gz"
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        vectors_ok = vectors_file.is_file() and vectors_file.stat().st_size > 0
+    except (OSError, ValueError, TypeError):
+        meta = None
+        vectors_ok = False
+    current_stats = [_file_stat_signature(path) for path in sorted(files)]
+    if (isinstance(meta, dict) and vectors_ok
+            and meta.get("file_stats") == current_stats):
+        chunks = meta.get("chunks") or []
+        result.update({
+            "state": "ready",
+            "needs_index": False,
+            "chunks": len(chunks) if isinstance(chunks, list) else 0,
+            "embedder": meta.get("embedder"),
+            "indexed_at": meta.get("indexed_at"),
+        })
+    return result
 
 
 def _norm(vector: List[float]) -> float:
@@ -603,6 +653,7 @@ class KBIndex:
                 Path(temp_name).write_text(
                     json.dumps({"fingerprint": fingerprint,
                                 "embedder": embedder_label,
+                                "indexed_at": time.time(),
                                 "file_stats": [_file_stat_signature(path)
                                                 for path in sorted(files)],
                                 "chunks": chunks}), encoding="utf-8")

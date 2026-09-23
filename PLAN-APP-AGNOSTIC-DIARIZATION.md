@@ -10,14 +10,16 @@ fast, reliable live baseline.
 - Phase 1 is complete: stable source IDs, local speaker-label overrides,
   inline HUD editing, reconnect-safe snapshot state, and `session.json`
   persistence are shipped.
-- Phase 2 has a safe opt-in adapter: `--diarize` invokes WhisperX only after
-  capture and live processing finish, writes derived attribution artifacts,
-  and falls back cleanly when WhisperX or its model credentials are absent.
+- Phase 2 now uses the local NeMo-Speech Sortformer adapter by default. It
+  invokes the native runtime only after capture and live processing finish,
+  writes derived attribution artifacts, and reports missing local setup without
+  requesting a Hugging Face token. WhisperX remains an explicit compatibility
+  backend only.
 - The reusable voice-profile store is now implemented. It enrolls only from
   explicit user labels, stores aggregate embeddings with owner-only permissions,
-  and reports thresholded matches as hints. The current WhisperX JSON adapter
-  does not emit embeddings; the worker now optionally enriches it with the
-  local `pyannote/embedding` model when that dependency is installed.
+  and reports thresholded matches as hints. Speaker diarization and persistent
+  identity matching are separate providers; the latter is the next local
+  runtime task and must not reintroduce a gated model dependency.
 - Phases 3 and 4 remain intentionally opt-in design work; no live diarization
   model is allowed onto the capture or answer critical path yet.
 

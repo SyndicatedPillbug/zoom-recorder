@@ -63,9 +63,12 @@
     <h2>Speech-to-text</h2>
     <div class="row"><label>Backend</label><div class="ctl">
       <select id="stt.backend">
-        <option value="groq">groq</option><option value="openai">openai</option>
         <option value="local">local (whisper.cpp)</option>
+        <option value="groq">groq</option><option value="openai">openai</option>
       </select></div></div>
+    <div class="row"><label>Remote STT fallback</label><div class="ctl">
+      <input type="text" id="stt.fallbacks" placeholder="groq (comma separated)" />
+      <span class="hint">used only if the local lane fails</span></div></div>
     <div class="row"><label>Model</label><div class="ctl">
       <input type="text" id="stt.model" list="models-stt" placeholder="provider default" />
       <button class="mini secondary" data-load-models="stt">Load</button></div></div>
@@ -81,6 +84,13 @@
       <input type="number" step="0.1" min="1.5" max="6" id="stt.partial_window_seconds" /></div></div>
     <div class="row"><label>Draft update seconds</label><div class="ctl">
       <input type="number" step="0.1" min="0.5" max="5" id="stt.partial_interval_seconds" /></div></div>
+    <div class="row"><label>Context correction</label><div class="ctl">
+      <input type="checkbox" id="stt.context_correction_enabled" />
+      <span class="hint">quiet local re-read for answer context; raw transcript stays unchanged</span></div></div>
+    <div class="row"><label>Correction window seconds</label><div class="ctl">
+      <input type="number" step="1" min="5" max="30" id="stt.context_correction_window_seconds" /></div></div>
+    <div class="row"><label>Correction interval seconds</label><div class="ctl">
+      <input type="number" step="1" min="3" max="30" id="stt.context_correction_interval_seconds" /></div></div>
     <div class="row"><label>Glossary</label><div class="ctl">
       <input type="text" id="stt.glossary" placeholder="Acme, Q3, names… (comma separated)" /></div></div>
     <div class="row"><label>Speech detection</label><div class="ctl">
@@ -155,6 +165,15 @@
         <button class="mini secondary" id="addDirManual">Add manually</button>
       </div>
     </div></div>
+    <div class="row"><label>Next meeting folders</label><div class="ctl" style="flex-direction:column;align-items:stretch">
+      <div id="kb.next_dirs" class="dirs"></div>
+      <div style="display:flex;gap:8px">
+        <button class="mini secondary" id="addNextDirBtn">Choose folder…</button>
+        <button class="mini secondary" id="addNextDirManual">Add manually</button>
+        <button class="mini secondary" id="clearNextDirs">Use default folders</button>
+      </div>
+    </div></div>
+    <div class="hint">These folders apply only to the next recording and are saved into that meeting’s metadata. They do not replace the permanent library above. The app will show whether this exact selection needs indexing.</div>
     <div class="row"><label>Snippets (top k)</label><div class="ctl">
       <input type="number" step="1" min="1" id="kb.top_k" /></div></div>
     <div class="row"><label>Prompt cap (chars)</label><div class="ctl">
@@ -176,7 +195,7 @@
       <input type="text" id="kb.embed_model" placeholder="provider default" /></div></div>
     <div class="row"><label>Min score</label><div class="ctl">
       <input type="number" step="0.05" min="0" max="1" id="kb.min_score" /></div></div>
-    <div class="hint">auto uses a local model if installed, else Ollama, else the OpenAI key. Local embeddings stay on this Mac; remote ones send note chunks to that provider.</div>
+    <div class="hint">auto stays local: it uses a local model if installed, otherwise the built-in lexical/hash embedder. Choose Ollama or OpenAI explicitly if you want note chunks sent to that provider.</div>
   </section>
 
   <section>
@@ -191,7 +210,11 @@
     <div class="row"><label>Identify participants after calls</label><div class="ctl">
       <input type="checkbox" id="diarization.enabled" /></div></div>
     <div class="row"><label>Diarization backend</label><div class="ctl">
-      <select id="diarization.backend"><option value="auto">auto</option><option value="whisperx">WhisperX</option><option value="off">off</option></select></div></div>
+      <select id="diarization.backend"><option value="auto">Local (recommended)</option><option value="nemo">NeMo local</option><option value="whisperx">WhisperX compatibility</option><option value="off">off</option></select></div></div>
+    <div class="row"><label>Local model path</label><div class="ctl">
+      <input type="text" id="diarization.model" placeholder="auto-detect downloaded Sortformer model" /></div></div>
+    <div class="row"><label>Acceleration</label><div class="ctl">
+      <select id="diarization.device"><option value="auto">auto (Metal / Vulkan / CPU)</option><option value="metal">Apple Metal</option><option value="vulkan">Linux Vulkan / AMD</option><option value="cpu">CPU</option></select></div></div>
     <div class="row"><label>Diarization timeout</label><div class="ctl">
       <input type="number" step="30" min="30" id="diarization.timeout_seconds" /><span class="hint">seconds</span></div></div>
     <div class="row"><label>Reuse confirmed voices</label><div class="ctl">
@@ -200,7 +223,7 @@
       <input type="number" step="0.01" min="0.5" max="0.99" id="diarization.voice_profiles.threshold" /></div></div>
     <div class="row"><label>Voice profile file</label><div class="ctl">
       <input type="text" id="diarization.voice_profiles.path" placeholder="default: app config folder" /></div></div>
-    <div class="hint">Enabled by default and never part of the live path. It requires the optional WhisperX setup and writes only derived/ files after recording.</div>
+    <div class="hint">Enabled by default and runs after capture, locally. The normal path uses the downloaded Sortformer model through Metal, Vulkan, ROCm, or CPU; it does not require a Hugging Face token. WhisperX is retained only for older sessions.</div>
   </section>
 
   <section>
@@ -217,7 +240,7 @@
       <input type="number" step="0.05" min="0.60" max="1" id="hud.opacity" /><span class="hint">glass mode; minimum keeps text visible</span></div></div>
     <div class="row"><label>Compact HUD layout</label><div class="ctl">
       <input type="checkbox" id="hud.compact" /></div></div>
-    <div class="hint">Window mode is the stable full-panel view. Glass HUD is borderless, translucent, and designed to sit over a full-screen call. Its blank areas pass clicks through, while controls and the question field remain interactive. Use Arrange in the HUD to move the transcript, suggestions, and answers independently. Both request best-effort macOS capture exclusion.</div>
+    <div class="hint">Window mode is the stable full-panel view. Glass HUD is borderless, translucent, and designed to sit over a full-screen call. Its blank areas pass clicks through, while controls and the question field remain interactive. Use Arrange in the HUD to move the transcript, suggestions, and answers independently; use the top-left grip to move the whole HUD and its corner grips to resize it for the current display. Both request best-effort macOS capture exclusion.</div>
     <div class="row"><label>Flush seconds</label><div class="ctl">
       <input type="number" step="5" min="0" id="hud.persist_seconds" />
       <span class="hint">crash-safe derived/</span></div></div>
@@ -264,6 +287,7 @@
   const status = $('saveStatus');
   let cfg = {};
   let kbDirs = [];
+  let kbNextDirs = [];
 
   function toast(msg, cls) {
     const t = $('toast');
@@ -309,14 +333,33 @@
     });
   }
 
+  function renderNextDirs() {
+    const box = $('kb.next_dirs');
+    box.innerHTML = '';
+    kbNextDirs.forEach((d, i) => {
+      const row = document.createElement('div');
+      row.className = 'dir';
+      row.innerHTML = '<code>' + d.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</code>';
+      const rm = document.createElement('button');
+      rm.className = 'mini secondary'; rm.textContent = 'Remove';
+      rm.onclick = () => { kbNextDirs.splice(i, 1); renderNextDirs(); };
+      row.appendChild(rm);
+      box.appendChild(row);
+    });
+  }
+
   function apply(c) {
     cfg = c;
     setVal('stt.backend', c.stt.backend); setVal('stt.model', c.stt.model);
+    setVal('stt.fallbacks', (c.stt.fallbacks || []).join(', '));
     setVal('stt.chunk_seconds', c.stt.chunk_seconds);
     setVal('stt.partial_enabled', c.stt.partial_enabled);
     setVal('stt.partial_model', c.stt.partial_model);
     setVal('stt.partial_window_seconds', c.stt.partial_window_seconds);
     setVal('stt.partial_interval_seconds', c.stt.partial_interval_seconds);
+    setVal('stt.context_correction_enabled', c.stt.context_correction_enabled !== false);
+    setVal('stt.context_correction_window_seconds', c.stt.context_correction_window_seconds || 20);
+    setVal('stt.context_correction_interval_seconds', c.stt.context_correction_interval_seconds || 8);
     setVal('stt.glossary', (c.stt.glossary || []).join(', '));
     setVal('stt.vad_backend', c.stt.vad_backend);
     setVal('stt.vad_margin_db', c.stt.vad_margin_db);
@@ -340,10 +383,13 @@
     setVal('kb.embed_backend', c.kb.embed_backend); setVal('kb.embed_model', c.kb.embed_model);
     setVal('kb.min_score', c.kb.min_score);
     kbDirs = (c.kb.dirs || []).slice(); renderDirs();
+    kbNextDirs = (c.kb.next_dirs || []).slice(); renderNextDirs();
     setVal('speakers.enabled', c.speakers.enabled); setVal('speakers.self_name', c.speakers.self_name);
     setVal('speakers.remote_name', c.speakers.remote_name);
     setVal('diarization.enabled', c.diarization && c.diarization.enabled);
     setVal('diarization.backend', (c.diarization && c.diarization.backend) || 'auto');
+    setVal('diarization.model', (c.diarization && c.diarization.model) || '');
+    setVal('diarization.device', (c.diarization && c.diarization.device) || 'auto');
     setVal('diarization.timeout_seconds', (c.diarization && c.diarization.timeout_seconds) || 300);
     const vp = (c.diarization && c.diarization.voice_profiles) || {};
     setVal('diarization.voice_profiles.enabled', vp.enabled !== false);
@@ -362,11 +408,15 @@
     const num = id => Number($(id).value || 0);
     return {
       stt: { backend: $('stt.backend').value, model: $('stt.model').value || null,
+             fallbacks: $('stt.fallbacks').value.split(',').map(s => s.trim()).filter(Boolean),
              chunk_seconds: num('stt.chunk_seconds'),
              partial_enabled: $('stt.partial_enabled').checked,
              partial_model: $('stt.partial_model').value || null,
              partial_window_seconds: num('stt.partial_window_seconds'),
              partial_interval_seconds: num('stt.partial_interval_seconds'),
+             context_correction_enabled: $('stt.context_correction_enabled').checked,
+             context_correction_window_seconds: num('stt.context_correction_window_seconds'),
+             context_correction_interval_seconds: num('stt.context_correction_interval_seconds'),
              glossary: $('stt.glossary').value.split(',').map(s => s.trim()).filter(Boolean),
              vad_backend: $('stt.vad_backend').value,
              vad_margin_db: Number($('stt.vad_margin_db').value || 6),
@@ -387,7 +437,7 @@
                  talking_points_grounded: $('answers.talking_points_grounded').checked,
                  talking_points_max: num('answers.talking_points_max'),
                  talking_points_min_new_words: num('answers.talking_points_min_new_words') },
-      kb: { enabled: $('kb.enabled').checked, dirs: kbDirs.slice(),
+      kb: { enabled: $('kb.enabled').checked, dirs: kbDirs.slice(), next_dirs: kbNextDirs.slice(),
             top_k: num('kb.top_k'), max_chars: num('kb.max_chars'),
             scope_tags: $('kb.scope_tags').value.split(',').map(s => s.trim()).filter(Boolean),
             model: $('kb.model').value,
@@ -399,6 +449,8 @@
                   remote_name: $('speakers.remote_name').value },
       diarization: { enabled: $('diarization.enabled').checked,
                      backend: $('diarization.backend').value,
+                     model: $('diarization.model').value.trim() || null,
+                     device: $('diarization.device').value,
                      timeout_seconds: num('diarization.timeout_seconds'),
                      voice_profiles: {
                        enabled: $('diarization.voice_profiles.enabled').checked,
@@ -485,6 +537,16 @@
     const p = prompt('Folder path for notes (.md files):');
     if (p) { kbDirs.push(p); renderDirs(); }
   };
+  $('addNextDirBtn').onclick = async () => {
+    const res = await api('/api/pick-dir', { kind: 'kb' });
+    if (res.ok && res.path) { kbNextDirs.push(res.path); renderNextDirs(); }
+    else if (res.error && res.error !== 'cancelled') toast(res.error, 'err');
+  };
+  $('addNextDirManual').onclick = () => {
+    const p = prompt('Folder path for this meeting\'s notes (.md files):');
+    if (p) { kbNextDirs.push(p); renderNextDirs(); }
+  };
+  $('clearNextDirs').onclick = () => { kbNextDirs = []; renderNextDirs(); };
   window.addEventListener('beforeunload', () => { api('/api/quit', {}); });
 
   load();

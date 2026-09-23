@@ -1,7 +1,7 @@
 # Meeting Intelligence Roadmap
 
-Status: active roadmap  
-Updated: 2026-09-22  
+Status: active roadmap
+Updated: 2026-09-23
 Reference baseline: `v2.7`
 Latest shipped tag: `v2.8.23`
 
@@ -22,9 +22,9 @@ The most important foundations are now in place:
 - Revision-safe evidence boundaries prevent provisional text from contaminating saved transcripts,
   retrieval, memory extraction, or answers.
 - Stable-partial publication, writeback, Obsidian indexing, structured memory, identity editing,
-  non-blocking diarization, Groq fallback behavior, replay, and latency instrumentation are
+  non-blocking local diarization, Groq fallback behavior, replay, and latency instrumentation are
   implemented and covered by deterministic lifecycle/replay tests.
-- The current release line has a 264-test green regression suite, 100/100 normal lifecycle runs,
+- The current release line has a 297-test green regression suite, 100/100 normal lifecycle runs,
   20/20 injected-failure runs, forced-stop/restart coverage, and a manifest-driven benchmark
   package.
 - Obsidian retrieval is hybrid and bounded: frontmatter/wikilinks are preserved, metadata can
@@ -43,7 +43,7 @@ The largest remaining risks are not simply model speed:
 3. Long-replay answer aggregation is now measurable with `hud.trace_report`; active-question
    reconstruction quality and stable prompt-prefix caching still need optimization.
 4. Participant quality still needs labeled two-speaker fixtures and speaker-error measurements;
-   attribution remains optional and off the critical transcription path.
+   local attribution is enabled by default but remains off the critical transcription path.
 5. Permission recovery, redacted one-click diagnostics, adverse-environment recovery, and local
    privacy/deletion verification need a final operational pass.
 
@@ -193,9 +193,11 @@ Exit criteria:
 - Offline recording and final transcription still work with retrieval disabled.
 
 Current status: bounded hybrid retrieval, optional tag scoping, provenance-preserving snippets,
-file-stat cache validation, and resumable per-file embedding checkpoints are shipped. The
-synthetic 6,000-chunk benchmark records 116.7 ms p50 / 210.3 ms p95 unscoped and 30.2 ms p50 /
-48.0 ms p95 with `enterprise` tag scope on the benchmark host. Target-machine measurements and
+file-stat cache validation, resumable per-file embedding checkpoints, and meeting-scoped source
+snapshots are shipped. The main app can select next-meeting folders and reports `ready`,
+`needs_index`, `no_markdown`, or `unavailable` before a call. The synthetic 6,000-chunk benchmark
+records 116.7 ms p50 / 210.3 ms p95 unscoped and 30.2 ms p50 / 48.0 ms p95 with `enterprise` tag
+scope on the benchmark host. Target-machine measurements, richer local semantic models, and
 permission recovery remain open.
 
 ## Phase 5 — Participant attribution and diarization
@@ -229,13 +231,15 @@ Exit criteria:
 - Diarization can be disabled per run.
 - The transcript clearly distinguishes inferred, manually confirmed, and unknown speakers.
 
-Current status: the attribution worker is post-call and failure-safe; manual labels persist
-through session artifacts, replay, and writeback; reusable voice profiles are opt-in and
-owner-only. Derived diarization output includes unknown/generic/manual/profile rates and
-processing real-time factor. Labeled speaker-error fixtures remain open.
+Current status: the attribution worker is post-call and failure-safe; local NeMo-Speech Sortformer
+is now the default backend with Metal/Vulkan/ROCm/CPU device selection; manual labels persist
+through session artifacts, replay, and writeback; reusable voice profiles are owner-only. Derived
+diarization output includes unknown/generic/manual/profile rates and processing real-time factor.
+The local persistent voice-embedding provider, labeled speaker-error fixtures, and Linux AMD
+acceptance run remain open.
 
-Do not put WhisperX-style or other heavy diarization in the live hot path until it has passed the
-same lifecycle and latency gates as transcription.
+Do not put NeMo, WhisperX, or other heavy neural diarization in the live hot path until it has
+passed the same lifecycle and latency gates as transcription.
 
 ## Phase 6 — UX and operator control
 
@@ -268,6 +272,48 @@ speaker labels, and technical latency details. Setup now exports one-click redac
 the Mac HUD now opens in a selectable native AppKit/WebKit Window or Glass HUD surface by default
 with browser fallback and explicit best-effort capture-protection status; integrated permission
 recovery remains open.
+
+## Phase 6A — Persistent Meeting Workspace
+
+Current status: Phase A implemented and green-tested; real-device acceptance remains, with the
+remaining Phases B–E execution plan in [PLAN-WORKSPACE-PHASES-B-E.md](PLAN-WORKSPACE-PHASES-B-E.md).
+
+Goal: turn the post-call experience into a durable control, display, access, playback, and editing
+space without putting it on the live capture path.
+
+Work:
+
+- Keep a persistent session library after recording stops; the HUD ends, but the workspace remains
+  available from the menu bar.
+- Show integrity-aware session badges and make missing/silent system audio impossible to mistake
+  for a complete recording.
+- Add waveform-linked playback for mixed, microphone, and system tracks, with solo/mute, speed,
+  looping, and click-to-seek transcript rows.
+- Add a revisioned transcript editor with inline text edits, undo/redo, segment split/merge, and
+  direct speaker-label editing.
+- Allow creation, rename, merge, split, and `unknown` speaker assignments without rewriting raw
+  audio or original transcript events.
+- Re-run transcription, diarization, alignment, or summaries against selected time ranges as
+  cancellable background jobs.
+- Mark derived answers, summaries, embeddings, and writebacks stale when their source revision
+  changes.
+- Add library search by text, participant, title, date, health, folder, and review state.
+- Export corrected Markdown, TXT, SRT/VTT, JSON, and transcript writeback from the selected
+  revision.
+- Keep raw audio immutable and preserve a complete edit/provenance history.
+
+Reference plan: [PLAN-PERSISTENT-MEETING-WORKSPACE.md](PLAN-PERSISTENT-MEETING-WORKSPACE.md). The
+open-source landscape and licensing findings are recorded in
+[RESEARCH-OPEN-SOURCE-MEETING-WORKSPACES.md](RESEARCH-OPEN-SOURCE-MEETING-WORKSPACES.md).
+
+Exit criteria:
+
+- 100/100 stopped sessions remain openable after the live HUD closes.
+- Speaker edits persist across reload, export, writeback, and reprocessing.
+- Clicking a transcript row seeks to its audio within 100 ms on fixtures.
+- No editor or derived job can modify an immutable original.
+- A one-hour session remains usable without loading all PCM into UI memory.
+- Missing/silent source health remains visible on every session page.
 
 ## Phase 7 — Privacy, security, and operational hardening
 

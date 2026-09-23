@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Control Center: the non-technical user's window into zoom-recorder.
 
-A local, loopback-only web app (same security model as hud/settings.py: random
-per-run token, host check, idle shutdown, no API keys ever sent to the
-browser). Four tabs:
+A local, loopback-only UI rendered primarily inside the native macOS Main App
+surface (same security model as hud/settings.py: random per-run token, host
+check, idle shutdown, no API keys ever sent to the browser). Four tabs:
 
   Setup      -- guided first-run check with one-click fixes
   Recordings -- what has been recorded, with transcript/summary links
@@ -30,7 +30,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunsplit
 
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
@@ -45,6 +45,8 @@ from hud.llm import LLMClient, LLMError  # noqa: E402
 from hud.local_http import bind_local_server, host_from_header, url_host  # noqa: E402
 from hud.recordings import list_recordings, move_to_trash  # noqa: E402
 from hud.diagnostics import build_report as build_diagnostics_report, default_path, write_report  # noqa: E402
+from hud.workspace import (export_workspace, load_session, resolve_session,
+                           restore_workspace_revision, save_workspace)  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -59,7 +61,7 @@ MIC_SETTINGS_URL = ("x-apple.systempreferences:com.apple.preference.security"
 TERMINAL_COMMANDS = {
     "install-blackhole": "brew install blackhole-2ch",
     "install-whisper": "brew install whisper.cpp",
-    "setup-diarization": "cd {} && ./install.sh --install-diarization && ./.venv-diarization/bin/hf auth login".format(
+    "setup-diarization": "cd {} && ./install.sh --install-diarization".format(
         shlex.quote(str(REPO))),
 }
 
@@ -173,10 +175,30 @@ class ControlApp:
             url_host(self.host), self.port, self.token, self.initial_tab)
 
     def open(self) -> None:
+        self.open_native(self.initial_tab)
+
+    def open_native(self, tab: str) -> None:
+        parts = urlsplit(self.url)
+        token = (parse_qs(parts.query).get("token") or [""])[0]
+        target = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                             urlencode({"token": token, "tab": tab}), ""))
         try:
-            webbrowser.open(self.url)
-        except Exception:  # noqa: BLE001
-            pass
+            host = _repo("hud", "native_window.py")
+            proc = subprocess.Popen(
+                [sys.executable, str(host), "--url", target,
+                 "--title", "zoom-recorder — Main App", "--mode", "window",
+                 "--exit-on-close"],
+                cwd=str(REPO), stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True)
+            time.sleep(0.15)
+            if proc.poll() is not None:
+                raise RuntimeError("native Main App host exited during startup")
+        except Exception as exc:  # noqa: BLE001 - browser is compatibility fallback
+            self.log("native Main App unavailable ({}); using browser fallback".format(exc))
+            try:
+                webbrowser.open(target)
+            except Exception:  # noqa: BLE001
+                pass
 
     def touch(self) -> None:
         self._last_request = time.time()
@@ -369,6 +391,67 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_media(self, path: Path) -> None:
+        """Serve a local audio artifact with HTTP range support.
+
+        The browser can seek through a long WAV without loading the complete
+        meeting into memory. The caller has already validated that the path is
+        inside the configured recordings folder.
+        """
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self.send_error(404, "not found")
+            return
+        if size <= 0:
+            self.send_error(404, "empty media")
+            return
+        start, end = 0, size - 1
+        requested = self.headers.get("Range") or ""
+        if requested.startswith("bytes="):
+            try:
+                value = requested[6:].split(",", 1)[0]
+                left, right = value.split("-", 1)
+                if left:
+                    start = int(left)
+                if right:
+                    end = int(right)
+                elif left:
+                    end = min(size - 1, start + 1024 * 1024 - 1)
+                if start < 0 or start >= size or end < start:
+                    raise ValueError
+                end = min(end, size - 1)
+            except ValueError:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */{}".format(size))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                return
+        length = end - start + 1
+        partial = requested.startswith("bytes=")
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", "bytes {}-{}/{}".format(start, end, size))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            with path.open("rb") as stream:
+                stream.seek(start)
+                remaining = length
+                while remaining:
+                    block = stream.read(min(1024 * 1024, remaining))
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    remaining -= len(block)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def _read_body(self) -> Dict[str, Any]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -402,6 +485,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._checks()
         elif parsed.path == "/api/recordings":
             self._recordings()
+        elif parsed.path == "/api/session":
+            self._session(parsed)
+        elif parsed.path == "/api/media":
+            self._media(parsed)
         elif parsed.path == "/api/devices":
             self._devices()
         elif parsed.path == "/api/config":
@@ -437,6 +524,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(play_file(str(body.get("path") or "")))
             elif parsed.path == "/api/recordings/trash":
                 self._trash_recording(body)
+            elif parsed.path == "/api/session/save":
+                self._save_session(body)
+            elif parsed.path == "/api/session/restore":
+                self._restore_session(body)
+            elif parsed.path == "/api/session/export":
+                self._export_session(body)
             elif parsed.path == "/api/test-provider":
                 self._test_provider(body)
             elif parsed.path == "/api/diagnostics":
@@ -463,6 +556,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _status(self) -> None:
         from hud import routing_fix
         from hud.diarization import diarization_readiness
+        from hud.kb import inspect_sources
         cfg = load_config(self.app.config_path)
         recording = recording_active()
         # "Start at login" is the LaunchAgent plist existing/enabled; both the
@@ -471,7 +565,8 @@ class _Handler(BaseHTTPRequestHandler):
         keys_set = {name: bool(cfg.api_key_for(name))
                     for name in PROVIDERS if get_provider(name).api_key_env}
         try:
-            diarization_status = diarization_readiness()
+            diarization_status = diarization_readiness(
+                cfg.diarization_backend, cfg.diarization_model)
         except Exception as exc:  # noqa: BLE001
             diarization_status = {
                 "ready": False,
@@ -479,6 +574,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "label": "Check setup",
                 "detail": str(exc),
             }
+        try:
+            next_context = inspect_sources(cfg.kb_next_dirs, cfg.kb_cache_dir)
+        except Exception as exc:  # noqa: BLE001 - status must remain available
+            next_context = {"state": "error", "needs_index": True, "detail": str(exc)}
         self._send_json({
             "ok": True,
             "recording": recording,
@@ -496,6 +595,11 @@ class _Handler(BaseHTTPRequestHandler):
             "diarization": {
                 "enabled": cfg.diarization_enabled,
                 **diarization_status,
+            },
+            "context": {
+                "default_dirs": list(cfg.kb_dirs),
+                "next_dirs": list(cfg.kb_next_dirs),
+                "index": next_context,
             },
             "api_keys_set": keys_set,
             "config_path": str(self.app.config_path),
@@ -523,7 +627,8 @@ class _Handler(BaseHTTPRequestHandler):
             checks = [{"name": "checks", "ok": False, "detail": str(exc),
                        "fix": "Retry the check from Setup", "critical": True}]
         try:
-            diarization = diarization_readiness()
+            diarization = diarization_readiness(
+                cfg.diarization_backend, cfg.diarization_model)
         except Exception as exc:  # noqa: BLE001
             diarization = {"ready": False, "state": "error", "detail": str(exc)}
         status = {
@@ -553,6 +658,70 @@ class _Handler(BaseHTTPRequestHandler):
         cfg = load_config(self.app.config_path)
         items = [r.as_dict() for r in list_recordings(cfg.recorder.basedir)]
         self._send_json({"ok": True, "basedir": cfg.recorder.basedir, "items": items})
+
+    def _session(self, parsed: Any) -> None:
+        cfg = load_config(self.app.config_path)
+        raw = parse_qs(parsed.query).get("path", [""])[0]
+        session = resolve_session(raw, cfg.recorder.basedir)
+        if session is None:
+            self._send_json({"ok": False, "error": "recording session not found"}, status=404)
+            return
+        self._send_json(load_session(session))
+
+    def _media(self, parsed: Any) -> None:
+        cfg = load_config(self.app.config_path)
+        raw = parse_qs(parsed.query).get("path", [""])[0]
+        candidate = Path(raw).expanduser().resolve()
+        session = None
+        for parent in (candidate, *candidate.parents):
+            session = resolve_session(str(parent), cfg.recorder.basedir)
+            if session is not None:
+                break
+        if session is None:
+            self._send_json({"ok": False, "error": "media path not allowed"}, status=403)
+            return
+        try:
+            candidate.relative_to(session)
+        except ValueError:
+            self._send_json({"ok": False, "error": "media path not allowed"}, status=403)
+            return
+        if candidate.suffix.lower() not in {".wav", ".mp3", ".m4a", ".flac", ".ogg"}:
+            self._send_json({"ok": False, "error": "media type not allowed"}, status=403)
+            return
+        if not candidate.is_file():
+            self._send_json({"ok": False, "error": "media not found"}, status=404)
+            return
+        self._send_media(candidate)
+
+    def _save_session(self, body: Dict[str, Any]) -> None:
+        cfg = load_config(self.app.config_path)
+        session = resolve_session(str(body.get("path") or ""), cfg.recorder.basedir)
+        if session is None:
+            self._send_json({"ok": False, "error": "recording session not found"}, status=404)
+            return
+        self._send_json(save_workspace(session, body))
+
+    def _restore_session(self, body: Dict[str, Any]) -> None:
+        cfg = load_config(self.app.config_path)
+        session = resolve_session(str(body.get("path") or ""), cfg.recorder.basedir)
+        if session is None:
+            self._send_json({"ok": False, "error": "recording session not found"}, status=404)
+            return
+        try:
+            target = int(body.get("target_revision"))
+        except (TypeError, ValueError):
+            self._send_json({"ok": False, "error": "target revision is required"})
+            return
+        self._send_json(restore_workspace_revision(
+            session, target, body.get("expected_revision")))
+
+    def _export_session(self, body: Dict[str, Any]) -> None:
+        cfg = load_config(self.app.config_path)
+        session = resolve_session(str(body.get("path") or ""), cfg.recorder.basedir)
+        if session is None:
+            self._send_json({"ok": False, "error": "recording session not found"}, status=404)
+            return
+        self._send_json(export_workspace(session, str(body.get("format") or "markdown")))
 
     def _trash_recording(self, body: Dict[str, Any]) -> None:
         cfg = load_config(self.app.config_path)
@@ -656,8 +825,7 @@ class _Handler(BaseHTTPRequestHandler):
                                  model, size)})
             return
         elif action == "open-advanced":
-            subprocess.Popen([sys.executable, str(_repo("settings.py"))],
-                             cwd=str(REPO))
+            self.app.open_native("settings")
             self._send_json({"ok": True})
             return
         elif action == "open-terminal":

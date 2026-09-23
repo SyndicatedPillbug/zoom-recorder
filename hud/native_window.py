@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native macOS host for the live HUD.
+"""Native macOS host for the live HUD and Main App.
 
 The HUD content remains the existing local web UI. This small process gives it
 an AppKit window instead of asking the user to manage a browser tab. Keeping
@@ -60,7 +60,21 @@ def capture_protection_label() -> str:
 
 
 class _WindowDelegate(NSObject):
+    def initWithExitOnClose_(self, exit_on_close: bool) -> Any:  # noqa: N802
+        import objc
+        self = objc.super(_WindowDelegate, self).init()
+        if self is not None:
+            self.exit_on_close = bool(exit_on_close)
+        return self
+
     def windowShouldClose_(self, window: Any) -> bool:  # noqa: N802
+        if getattr(self, "exit_on_close", False):
+            try:
+                from AppKit import NSApplication
+                NSApplication.sharedApplication().terminate_(None)
+            except Exception:  # noqa: BLE001 - returning True still closes the window
+                pass
+            return True
         # Closing the HUD should hide it, not accidentally stop the recording.
         window.orderOut_(None)
         return False
@@ -89,6 +103,9 @@ class _GlassRegionBridge(NSObject):
             self.webview = None
             self.regions = []
             self._ignores = False
+            self._interaction_enabled = False
+            self._window_gesture = None
+            self._window_gesture_frame = None
         return self
 
     def setWebView_(self, webview: Any) -> None:  # noqa: N802
@@ -97,6 +114,19 @@ class _GlassRegionBridge(NSObject):
     def userContentController_didReceiveScriptMessage_(  # noqa: N802
             self, _controller: Any, message: Any) -> None:
         body = message.body()
+        if hasattr(body, "get") and body.get("action"):
+            if str(body.get("action") or "") == "interaction":
+                self._interaction_enabled = bool(body.get("enabled"))
+                self.window.setIgnoresMouseEvents_(not self._interaction_enabled)
+                self._ignores = not self._interaction_enabled
+                if self._interaction_enabled:
+                    try:
+                        self.window.makeKeyAndOrderFront_(None)
+                    except Exception:  # noqa: BLE001 - AppKit variation
+                        pass
+                return
+            self._handle_window_gesture(body)
+            return
         try:
             values = body.get("regions", []) if hasattr(body, "get") else []
             self.regions = [
@@ -108,14 +138,75 @@ class _GlassRegionBridge(NSObject):
             self.regions = []
         self.sync_mouse_transparency()
 
+    def _handle_window_gesture(self, body: Any) -> None:
+        """Move or resize the borderless glass panel from explicit page grips."""
+        action = str(body.get("action") or "")
+        if action == "start":
+            gesture = str(body.get("gesture") or "")
+            if gesture not in ("move", "ne", "nw", "se", "sw"):
+                return
+            self._window_gesture = gesture
+            self._window_gesture_frame = self.window.frame()
+            self.window.setIgnoresMouseEvents_(False)
+            self._ignores = False
+            return
+        if action == "end":
+            self._window_gesture = None
+            self._window_gesture_frame = None
+            try:
+                self.window.saveFrameUsingName_("zoom-recorder-glass-hud")
+            except Exception:  # noqa: BLE001 - frame persistence is best effort
+                pass
+            self.sync_mouse_transparency()
+            return
+        if action != "update" or not self._window_gesture or self._window_gesture_frame is None:
+            return
+        try:
+            dx = float(body.get("dx", 0))
+            dy = float(body.get("dy", 0))
+        except (TypeError, ValueError):
+            return
+        frame = self._window_gesture_frame
+        x, y = frame.origin.x, frame.origin.y
+        width, height = frame.size.width, frame.size.height
+        gesture = self._window_gesture
+        if gesture == "move":
+            # Browser y grows down; AppKit screen y grows up.
+            x += dx
+            y -= dy
+        else:
+            if "e" in gesture:
+                width = max(520.0, width + dx)
+            if "w" in gesture:
+                new_width = max(520.0, width - dx)
+                x += width - new_width
+                width = new_width
+            if "n" in gesture:
+                height = max(360.0, height - dy)
+            if "s" in gesture:
+                new_height = max(360.0, height + dy)
+                y -= new_height - height
+                height = new_height
+        self.window.setFrame_display_(NSMakeRect(x, y, width, height), True)
+
     def sync_mouse_transparency(self) -> None:
         if self.window is None or self.webview is None or not self.regions:
+            return
+        if self._interaction_enabled:
+            if self._ignores:
+                self.window.setIgnoresMouseEvents_(False)
+                self._ignores = False
             return
         try:
             content = self.window.contentView()
             screen_rects = []
+            # DOMClientRect uses a top-left origin; AppKit view bounds use a
+            # bottom-left origin. Flip the y coordinate or the header targets
+            # land at the bottom and the ask field lands at the top.
+            bounds = self.webview.bounds()
             for x, y, width, height in self.regions:
-                local = NSMakeRect(x, y, width, height)
+                local_y = bounds.size.height - y - height
+                local = NSMakeRect(x, local_y, width, height)
                 in_content = self.webview.convertRect_toView_(local, content)
                 screen_rects.append(self.window.convertRectToScreen_(in_content))
             point = __import__("AppKit").NSEvent.mouseLocation()
@@ -144,7 +235,8 @@ def _with_surface_query(url: str, mode: str, opacity: float, compact: bool) -> s
 
 
 def run(url: str, title: str = "Meeting HUD", mode: str = "window",
-        opacity: float = 0.90, compact: bool = False) -> None:
+        opacity: float = 0.90, compact: bool = False,
+        exit_on_close: bool = False) -> None:
     fw = _load_frameworks()
     from AppKit import (
         NSColor,
@@ -250,7 +342,7 @@ def run(url: str, title: str = "Meeting HUD", mode: str = "window",
         from AppKit import NSTimer
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.08, bridge, "poll:", None, True)
-    window.setDelegate_(_WindowDelegate.alloc().init())
+    window.setDelegate_(_WindowDelegate.alloc().initWithExitOnClose_(exit_on_close))
     window.makeKeyAndOrderFront_(None)
     app.activateIgnoringOtherApps_(True)
 
@@ -271,9 +363,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--mode", choices=("window", "glass"), default="window")
     parser.add_argument("--opacity", type=float, default=0.90)
     parser.add_argument("--compact", action="store_true")
+    parser.add_argument("--exit-on-close", action="store_true",
+                        help="Exit the native host when its window is closed")
     args = parser.parse_args(argv)
     try:
-        run(args.url, args.title, args.mode, args.opacity, args.compact)
+        run(args.url, args.title, args.mode, args.opacity, args.compact,
+            args.exit_on_close)
     except Exception as exc:  # noqa: BLE001 - caller falls back to browser
         print("native HUD unavailable: {}".format(exc), file=sys.stderr)
         return 1

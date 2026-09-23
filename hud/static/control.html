@@ -34,6 +34,8 @@
   input[type=text], input[type=password], input[type=number], select {
     background:var(--bg); color:var(--text); border:1px solid var(--border);
     border-radius:7px; padding:7px 9px; font:inherit; min-width:180px; }
+  textarea { background:var(--bg); color:var(--text); border:1px solid var(--border);
+    border-radius:7px; padding:7px 9px; font:inherit; width:100%; min-height:72px; resize:vertical; }
   input[type=checkbox]{ width:auto; }
   button { background:var(--accent); color:#06121f; border:0; border-radius:8px;
     padding:8px 15px; font-weight:650; cursor:pointer; }
@@ -64,6 +66,31 @@
   a { color:var(--accent); }
   .note { font-size:12px; color:var(--muted); }
   code { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:1px 6px; }
+  .workspace-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .workspace-head h2 { flex:1; min-width:220px; }
+  .health { font-size:12px; border-radius:999px; padding:3px 10px; border:1px solid var(--border); }
+  .health.healthy { color:var(--ok); border-color:var(--ok); }
+  .health.partial, .health.degraded, .health.unknown { color:var(--warn); border-color:var(--warn); }
+  .health.capture_failed { color:var(--danger); border-color:var(--danger); }
+  .workspace-grid { display:grid; grid-template-columns:minmax(220px, .8fr) minmax(320px, 1.2fr); gap:14px; }
+  .workspace-card { background:var(--bg); border:1px solid var(--border); border-radius:10px; padding:12px; }
+  .workspace-card h3 { margin:0 0 8px; font-size:14px; }
+  .media-item { border-top:1px solid var(--border); padding:9px 0; }
+  .media-item:first-child { border-top:0; }
+  audio { width:100%; height:34px; }
+  .segment { border-top:1px solid var(--border); padding:10px 0; }
+  .segment:first-child { border-top:0; }
+  .segment-meta { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+  .segment-time { color:var(--muted); font-size:12px; min-width:52px; cursor:pointer; }
+  .segment select { min-width:120px; flex:1; padding:4px 7px; }
+  .segment textarea { width:100%; min-height:48px; resize:vertical; background:var(--panel); color:var(--text);
+    border:1px solid var(--border); border-radius:7px; padding:7px 9px; font:inherit; }
+  .speaker-list { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  .speaker-chip { display:inline-flex; align-items:center; gap:4px; border:1px solid var(--border);
+    border-radius:999px; padding:3px 8px; color:var(--text); background:var(--panel); }
+  .speaker-chip button { padding:0 4px; background:transparent; color:var(--muted); }
+  .empty-workspace { color:var(--muted); padding:14px 0; }
+  @media (max-width: 760px) { .workspace-grid { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -217,9 +244,43 @@
     <section>
       <h2>My recordings</h2>
       <p class="sub" id="recordingsPath"></p>
-      <div class="row"><button id="refreshRecordings" class="secondary mini">Refresh</button>
+      <div class="row"><input type="text" id="recordingSearch" placeholder="Search meetings, people, or transcript text" />
+        <button id="refreshRecordings" class="secondary mini">Refresh</button>
         <button id="openFolder" class="secondary mini">Open recordings folder</button></div>
       <div id="recordings"></div>
+    </section>
+    <section id="workspacePanel" class="hidden">
+      <div class="workspace-head">
+        <button id="closeWorkspace" class="secondary mini">← All recordings</button>
+        <h2 id="workspaceTitle">Meeting workspace</h2>
+        <span id="workspaceHealth" class="health unknown">Review capture</span>
+      </div>
+      <p class="sub" id="workspaceMeta"></p>
+      <div id="workspaceWarning" class="card hidden"></div>
+      <div class="workspace-grid">
+        <div>
+          <div class="workspace-card">
+            <h3>Playback</h3>
+            <p class="note">Audio stays separate and read-only. Use the transcript rows to jump to the conversation.</p>
+            <div id="workspaceMedia"></div>
+          </div>
+          <div class="workspace-card" style="margin-top:14px">
+            <h3>Participants</h3>
+            <div id="workspaceSpeakers" class="speaker-list"></div>
+            <button id="addSpeaker" class="secondary mini">Add participant</button>
+          </div>
+        </div>
+        <div class="workspace-card">
+          <div class="workspace-head"><h3>Transcript</h3>
+            <button id="undoWorkspace" class="secondary mini">Undo</button>
+            <button id="saveWorkspace" class="mini">Save edits</button>
+            <button id="exportWorkspace" class="secondary mini">Export</button>
+          </div>
+          <p class="note" id="workspaceRevision"></p>
+          <div id="workspaceTranscript"></div>
+          <p class="status" id="workspaceStatus"></p>
+        </div>
+      </div>
     </section>
   </div>
 
@@ -246,6 +307,19 @@
       <div class="row"><label>Offline mode</label>
         <div class="ctl"><input type="checkbox" id="offline" />
           <span class="note">Blocks all internet access (local transcript only)</span></div></div>
+      <div class="card">
+        <div class="top"><span class="when">Context for the next meeting</span>
+          <span class="badge" id="contextStatus">Not selected</span></div>
+        <p class="note">Choose only the folders relevant to the next call. The permanent
+          knowledge library is unchanged. Each meeting saves this exact selection and
+          reports whether it needs indexing.</p>
+        <textarea id="nextContextDirs" placeholder="One folder per line, for example:&#10;/Users/me/Obsidian/Clients/Acme"></textarea>
+        <div class="actions">
+          <button class="secondary mini" id="pickContextDir">Add folder…</button>
+          <button class="secondary mini" id="clearContextDirs">Use default library</button>
+          <span class="note" id="contextDetail"></span>
+        </div>
+      </div>
       <div class="card" id="diarizationCard">
         <div class="top"><span class="when">Identify participants</span>
           <span class="badge" id="diarizationStatus">Checking…</span></div>
@@ -329,7 +403,8 @@
         signal: controller.signal };
       if (body) { opts.headers['Content-Type'] = 'application/json';
         opts.body = JSON.stringify(body); }
-      const resp = await fetch(path + '?token=' + encodeURIComponent(TOKEN), opts);
+      const joiner = path.includes('?') ? '&' : '?';
+      const resp = await fetch(path + joiner + 'token=' + encodeURIComponent(TOKEN), opts);
       return await resp.json().catch(() => ({ ok:false, error:'bad response' }));
     } catch (e) {
       connectionLost();
@@ -380,6 +455,7 @@
     }
     stateCache = s;
     renderDiarizationStatus(s.diarization);
+    renderContextStatus(s.context);
     setStatus($('statePill'),
       (s.recording ? 'recording' : 'ready') + (s.offline ? ' · offline' : ''), 'muted');
     // Both "Start at login" checkboxes mirror the real LaunchAgent state.
@@ -401,6 +477,24 @@
     detail.textContent = value.detail || '';
     const setup = $('setupDiarization');
     if (setup) setup.classList.toggle('hidden', !!value.ready);
+  }
+
+  function renderContextStatus(info) {
+    const badge = $('contextStatus');
+    const detail = $('contextDetail');
+    if (!badge || !detail) return;
+    const index = (info && info.index) || {};
+    const selected = (info && info.next_dirs) || [];
+    const labels = {
+      ready: 'Indexed', needs_index: 'Needs indexing', indexing: 'Indexing…',
+      not_selected: 'Default library', no_markdown: 'No Markdown found',
+      unavailable: 'Unavailable', error: 'Check folders'
+    };
+    badge.textContent = labels[index.state] || 'Not checked';
+    badge.className = 'badge ' + (index.state === 'ready' || index.state === 'not_selected' ? 'ok' : 'warn');
+    detail.textContent = selected.length
+      ? ((index.files || 0) + ' Markdown file(s)' + (index.needs_index ? ' — will index before answers use them' : ''))
+      : 'The permanent library will be used.';
   }
 
   $('setupDiarization').onclick = async () => {
@@ -685,16 +779,14 @@
   };
 
   // ---- recordings ------------------------------------------------------
-  async function loadRecordings() {
-    const r = await api('/api/recordings');
-    if (!r.ok) return;
-    $('recordingsPath').textContent = 'Saved in ' + r.basedir;
+  let recordingsCache = [];
+  function renderRecordings(items) {
     const box = $('recordings');
-    if (!r.items.length) {
-      box.innerHTML = '<p class="muted">No recordings yet. Use the 🎙 menu to record one.</p>';
+    if (!items.length) {
+      box.innerHTML = '<p class="muted">No matching recordings.</p>';
       return;
     }
-    box.innerHTML = r.items.map((it, i) => {
+    box.innerHTML = items.map((it, i) => {
       const badges = [];
       if (it.has_mic) badges.push('microphone');
       if (it.has_system) badges.push('other person');
@@ -705,14 +797,16 @@
         '<div class="folder">' + esc(it.name) + (people ? ' · ' + esc(people) : '') +
         '</div><div class="top"><span class="when">' + esc(it.started) +
         '</span><span class="badge">' + esc(it.duration) + '</span>' +
+        '<span class="health ' + esc(it.health_state || 'unknown') + '">' + esc(it.health_label || 'Review capture') + '</span>' +
         badges.map(b => '<span class="badge">' + esc(b) + '</span>').join('') +
         '</div><div class="actions" data-item="' + i + '"></div></div>';
     }).join('');
-    r.items.forEach((it, i) => {
+    items.forEach((it, i) => {
       const slot = box.querySelector('[data-item="' + i + '"]');
       const add = (label, fn) => { const b = document.createElement('button');
         b.className = 'secondary mini'; b.textContent = label; b.onclick = fn;
         slot.appendChild(b); };
+      add('Open workspace', () => openWorkspace(it.path));
       if (it.transcript) add('Open transcript', () => openPath(it.transcript));
       if (it.summary) add('Open summary', () => openPath(it.summary));
       if (it.mixed) add('Play', () => api('/api/play','POST',{ path: it.mixed }));
@@ -725,6 +819,225 @@
       });
     });
   }
+  async function loadRecordings() {
+    $('workspacePanel').classList.add('hidden');
+    const r = await api('/api/recordings');
+    if (!r.ok) return;
+    recordingsCache = r.items || [];
+    $('recordingsPath').textContent = 'Saved in ' + r.basedir;
+    renderRecordings(recordingsCache);
+  }
+  $('recordingSearch').oninput = () => {
+    const query = $('recordingSearch').value.trim().toLowerCase();
+    if (!query) { renderRecordings(recordingsCache); return; }
+    renderRecordings(recordingsCache.filter(item =>
+      [item.title, item.name, item.started, ...(item.participants || [])]
+        .join(' ').toLowerCase().includes(query)));
+  };
+
+  // ---- persistent meeting workspace -----------------------------------
+  let workspaceSession = null;
+  let workspaceState = null;
+  let workspaceUndoStack = [];
+  function rememberWorkspace() {
+    if (workspaceState) workspaceUndoStack.push(JSON.parse(JSON.stringify(workspaceState)));
+    if (workspaceUndoStack.length > 20) workspaceUndoStack.shift();
+  }
+  function mediaUrl(path) {
+    return '/api/media?path=' + encodeURIComponent(path) + '&token=' + encodeURIComponent(TOKEN);
+  }
+  function formatSeconds(seconds) {
+    const value = Math.max(0, Number(seconds) || 0);
+    return Math.floor(value / 60).toString().padStart(2, '0') + ':' +
+      Math.floor(value % 60).toString().padStart(2, '0');
+  }
+  function speakerOptions(selected) {
+    return (workspaceState.speakers || []).map(s =>
+      '<option value="' + esc(s.speaker_id) + '" ' +
+      (s.speaker_id === selected ? 'selected' : '') + '>' + esc(s.label) + '</option>').join('');
+  }
+  function renderWorkspace() {
+    if (!workspaceSession || !workspaceState) return;
+    const identity = workspaceSession.identity || {};
+    $('workspaceTitle').textContent = identity.title || workspaceSession.name || 'Meeting workspace';
+    const health = workspaceSession.health || {};
+    const healthEl = $('workspaceHealth');
+    healthEl.textContent = health.label || 'Review capture';
+    healthEl.className = 'health ' + (health.state || 'unknown');
+    const started = identity.started_at || '';
+    const count = (workspaceState.segments || []).length;
+    $('workspaceMeta').textContent = started + ' · ' + count + ' transcript rows · ' + workspaceSession.path;
+    const warning = $('workspaceWarning');
+    const detail = health.detail || '';
+    warning.textContent = detail;
+    warning.classList.toggle('hidden', !detail || health.state === 'healthy');
+    $('workspaceRevision').textContent = 'Interpretation revision ' + (workspaceState.revision || 0) +
+      '. Original audio and live transcript remain unchanged.';
+    $('workspaceMedia').innerHTML = (workspaceSession.media || []).map(m =>
+      '<div class="media-item"><div class="note">' + esc(m.kind) + '</div>' +
+      '<audio controls preload="metadata" src="' + mediaUrl(m.path) + '"></audio></div>').join('') ||
+      '<p class="empty-workspace">No playable audio artifact was found. The transcript may still be reviewable.</p>';
+    $('workspaceSpeakers').innerHTML = (workspaceState.speakers || []).map(s =>
+      '<span class="speaker-chip">' + esc(s.label) +
+      '<button type="button" title="Rename participant" data-rename-speaker="' + esc(s.speaker_id) + '">✎</button></span>').join('');
+    $('workspaceSpeakers').querySelectorAll('[data-rename-speaker]').forEach(button => {
+      button.onclick = () => renameSpeaker(button.dataset.renameSpeaker);
+    });
+    const rows = workspaceState.segments || [];
+    $('workspaceTranscript').innerHTML = rows.length ? rows.map((segment, index) =>
+      '<div class="segment" data-segment="' + esc(segment.segment_id) + '">' +
+      '<div class="segment-meta"><span class="segment-time" data-seek="' +
+      Number(segment.start_s || 0) + '">' + formatSeconds(segment.start_s) + '</span>' +
+      '<select data-speaker-index="' + index + '">' + speakerOptions(segment.speaker_id) + '</select>' +
+      '<button class="secondary mini" data-split-index="' + index + '">Split</button>' +
+      '<button class="secondary mini" data-merge-index="' + index + '">Merge next</button></div>' +
+      '<textarea data-text-index="' + index + '" aria-label="Transcript text">' +
+      esc(segment.text || '') + '</textarea></div>').join('') :
+      '<p class="empty-workspace">No transcript rows yet.</p>';
+    $('workspaceTranscript').querySelectorAll('[data-speaker-index]').forEach(select => {
+      select.onchange = () => {
+        const segment = workspaceState.segments[Number(select.dataset.speakerIndex)];
+        const speaker = workspaceState.speakers.find(s => s.speaker_id === select.value);
+        if (segment && speaker) {
+          segment.speaker_id = speaker.speaker_id;
+          segment.speaker_label = speaker.label;
+          segment.speaker_source = 'user';
+        }
+      };
+    });
+    $('workspaceTranscript').querySelectorAll('[data-text-index]').forEach(textarea => {
+      textarea.oninput = () => {
+        const segment = workspaceState.segments[Number(textarea.dataset.textIndex)];
+        if (segment) { segment.text = textarea.value; segment.text_source = 'user'; }
+      };
+    });
+    $('workspaceTranscript').querySelectorAll('[data-split-index]').forEach(button => {
+      button.onclick = () => splitSegment(Number(button.dataset.splitIndex));
+    });
+    $('workspaceTranscript').querySelectorAll('[data-merge-index]').forEach(button => {
+      button.onclick = () => mergeSegment(Number(button.dataset.mergeIndex));
+    });
+    $('workspaceTranscript').querySelectorAll('[data-seek]').forEach(time => {
+      time.onclick = () => {
+        const audio = $('workspaceMedia').querySelector('audio');
+        if (audio) { audio.currentTime = Number(time.dataset.seek || 0); audio.play().catch(() => {}); }
+      };
+    });
+  }
+  async function openWorkspace(path) {
+    const panel = $('workspacePanel');
+    panel.classList.remove('hidden');
+    setStatus($('workspaceStatus'), 'Loading meeting…');
+    const r = await api('/api/session?path=' + encodeURIComponent(path));
+    if (!r || r.ok === false) {
+      setStatus($('workspaceStatus'), (r && r.error) || 'Could not open meeting', 'bad');
+      return;
+    }
+    workspaceSession = r;
+    workspaceState = r.workspace || { revision: 0, speakers: [], segments: [] };
+    workspaceUndoStack = [];
+    renderWorkspace();
+    setStatus($('workspaceStatus'), 'Ready to review.', 'ok');
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  function renameSpeaker(id) {
+    const speaker = (workspaceState.speakers || []).find(s => s.speaker_id === id);
+    if (!speaker) return;
+    const label = prompt('Participant name', speaker.label);
+    if (!label || !label.trim()) return;
+    rememberWorkspace();
+    speaker.label = label.trim();
+    workspaceState.segments.forEach(segment => {
+      if (segment.speaker_id === id) { segment.speaker_label = speaker.label; segment.speaker_source = 'user'; }
+    });
+    renderWorkspace();
+    setStatus($('workspaceStatus'), 'Name changed locally. Save edits to keep it.', 'warn');
+  }
+  $('addSpeaker').onclick = () => {
+    const label = prompt('Participant name');
+    if (!label || !label.trim()) return;
+    const id = label.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'speaker';
+    if ((workspaceState.speakers || []).some(s => s.speaker_id === id)) {
+      setStatus($('workspaceStatus'), 'That participant already exists.', 'warn');
+      return;
+    }
+    rememberWorkspace();
+    workspaceState.speakers.push({ speaker_id: id, label: label.trim(), source: 'user' });
+    renderWorkspace();
+  };
+  function splitSegment(index) {
+    const segment = workspaceState && workspaceState.segments[index];
+    if (!segment) return;
+    const words = String(segment.text || '').trim().split(/\s+/).filter(Boolean);
+    if (words.length < 2) { setStatus($('workspaceStatus'), 'There are not enough words to split.', 'warn'); return; }
+    const requested = prompt('Split after how many words?', String(Math.max(1, Math.floor(words.length / 2))));
+    const cut = Number(requested);
+    if (!Number.isInteger(cut) || cut < 1 || cut >= words.length) return;
+    rememberWorkspace();
+    const midpoint = Number(segment.start_s || 0) +
+      (Number(segment.end_s || segment.start_s || 0) - Number(segment.start_s || 0)) * cut / words.length;
+    const first = Object.assign({}, segment, { text: words.slice(0, cut).join(' '), end_s: midpoint,
+      text_source: 'user', revision: Number(segment.revision || 0) + 1 });
+    const second = Object.assign({}, segment, { segment_id: segment.segment_id + '-b', text: words.slice(cut).join(' '),
+      start_s: midpoint, text_source: 'user', revision: Number(segment.revision || 0) + 1 });
+    workspaceState.segments.splice(index, 1, first, second);
+    renderWorkspace();
+    setStatus($('workspaceStatus'), 'Split locally. Save edits to keep it.', 'warn');
+  }
+  function mergeSegment(index) {
+    const first = workspaceState && workspaceState.segments[index];
+    const second = workspaceState && workspaceState.segments[index + 1];
+    if (!first || !second) { setStatus($('workspaceStatus'), 'There is no next row to merge.', 'warn'); return; }
+    rememberWorkspace();
+    first.text = (String(first.text || '') + ' ' + String(second.text || '')).trim();
+    first.end_s = second.end_s;
+    first.text_source = 'user';
+    first.revision = Math.max(Number(first.revision || 0), Number(second.revision || 0)) + 1;
+    workspaceState.segments.splice(index + 1, 1);
+    renderWorkspace();
+    setStatus($('workspaceStatus'), 'Merged locally. Save edits to keep it.', 'warn');
+  }
+  $('undoWorkspace').onclick = async () => {
+    if (!workspaceSession || !workspaceState) return;
+    if (workspaceUndoStack.length) {
+      workspaceState = workspaceUndoStack.pop();
+      renderWorkspace();
+      setStatus($('workspaceStatus'), 'Undid the last local edit. Save edits to keep it.', 'warn');
+      return;
+    }
+    if (Number(workspaceState.revision || 0) < 1) {
+      setStatus($('workspaceStatus'), 'There is no saved edit to undo.', 'warn');
+      return;
+    }
+    const r = await guarded($('workspaceStatus'), 'Undoing last saved revision…', () => api('/api/session/restore', 'POST', {
+      path: workspaceSession.path, expected_revision: workspaceState.revision,
+      target_revision: Number(workspaceState.revision) - 1,
+    }));
+    if (r && r.ok) { workspaceState = r.workspace; renderWorkspace(); setStatus($('workspaceStatus'), 'Restored revision ' + r.revision + '.', 'ok'); }
+  };
+  $('saveWorkspace').onclick = async () => {
+    if (!workspaceSession || !workspaceState) return;
+    const r = await guarded($('workspaceStatus'), 'Saving edits…', () => api('/api/session/save', 'POST', {
+      path: workspaceSession.path, expected_revision: workspaceState.revision,
+      speakers: workspaceState.speakers, segments: workspaceState.segments,
+    }));
+    if (r && r.ok) {
+      workspaceState = r.workspace;
+      renderWorkspace();
+      setStatus($('workspaceStatus'), 'Saved revision ' + r.revision + '.', 'ok');
+    }
+  };
+  $('exportWorkspace').onclick = async () => {
+    if (!workspaceSession) return;
+    const r = await guarded($('workspaceStatus'), 'Exporting…', () => api('/api/session/export', 'POST', {
+      path: workspaceSession.path, format: 'markdown'
+    }));
+    if (r && r.ok) setStatus($('workspaceStatus'), 'Exported edited transcript to ' + r.path, 'ok');
+  };
+  $('closeWorkspace').onclick = () => {
+    $('workspacePanel').classList.add('hidden');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
   async function openPath(path) {
     const r = await api('/api/open', 'POST', { path: path });
     if (r && r.ok === false) setStatus($('recordingsPath'), r.error || 'Could not open it', 'bad');
@@ -746,6 +1059,7 @@
     $('modeSelect').value = rec.mode || 'both';
     $('notifications').checked = !(c.privacy && c.privacy.notifications === false);
     $('offline').checked = !!(c.privacy && c.privacy.offline);
+    $('nextContextDirs').value = ((c.kb && c.kb.next_dirs) || []).join('\n');
     const diar = c.diarization || {};
     $('diarizationEnabled').checked = diar.enabled !== false;
     $('voiceProfilesEnabled').checked = !((diar.voice_profiles || {}).enabled === false);
@@ -757,7 +1071,7 @@
   }
   // Keep edits across tab switches instead of silently reloading over them.
   ['basedir', 'micSelect', 'modeSelect', 'modelPath', 'notifications', 'offline',
-   'diarizationEnabled', 'voiceProfilesEnabled']
+   'diarizationEnabled', 'voiceProfilesEnabled', 'nextContextDirs']
     .forEach(id => { const el = $(id); if (el) el.addEventListener('change', () => {
       settingsDirty = true;
       setStatus($('settingsStatus'), 'Unsaved changes — press Save', 'warn');
@@ -766,6 +1080,21 @@
     const r = await guarded($('settingsStatus'), 'Waiting for the folder…',
       () => api('/api/pick-dir', 'POST', {}));
     if (r && r.ok) { $('basedir').value = r.path; setStatus($('settingsStatus'), ''); }
+  };
+  $('pickContextDir').onclick = async () => {
+    const r = await guarded($('settingsStatus'), 'Waiting for the folder…',
+      () => api('/api/pick-dir', 'POST', { kind: 'kb' }));
+    if (r && r.ok) {
+      const current = $('nextContextDirs').value.trim();
+      $('nextContextDirs').value = current ? current + '\n' + r.path : r.path;
+      settingsDirty = true;
+      setStatus($('settingsStatus'), 'Unsaved changes — press Save', 'warn');
+    }
+  };
+  $('clearContextDirs').onclick = () => {
+    $('nextContextDirs').value = '';
+    settingsDirty = true;
+    setStatus($('settingsStatus'), 'Unsaved changes — press Save', 'warn');
   };
   $('saveSettings').onclick = async () => {
     const cfg = {
@@ -778,6 +1107,9 @@
       privacy: {
         notifications: $('notifications').checked,
         offline: $('offline').checked,
+      },
+      kb: {
+        next_dirs: $('nextContextDirs').value.split(/\n|,/).map(s => s.trim()).filter(Boolean),
       },
       diarization: {
         enabled: $('diarizationEnabled').checked,

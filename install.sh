@@ -7,7 +7,7 @@
 # Usage:
 #   ./install.sh                  # check deps, report, run doctor
 #   ./install.sh --install-deps   # also brew/pip install what is missing
-#   ./install.sh --install-diarization # install isolated WhisperX + pyannote
+#   ./install.sh --install-diarization # install local NeMo + Sortformer
 #   ./install.sh --autostart      # also enable login autostart (opt-in)
 #   ./install.sh --dry-run        # print what would happen, change nothing
 set -uo pipefail
@@ -57,29 +57,36 @@ if [[ -z "$PYTHON3" ]]; then
 fi
 say "python3: $PYTHON3 ($("$PYTHON3" -c 'import sys; print(sys.version.split()[0])'))"
 
-# --- optional WhisperX + pyannote environment -----------------------------
+# --- local diarization runtime ---------------------------------------------
 if [[ "$INSTALL_DIARIZATION" == "1" ]]; then
-  DIAR_PYTHON="$(command -v python3.12 || true)"
-  if [[ -z "$DIAR_PYTHON" ]]; then
-    say "Python 3.12: MISSING (needed for the isolated diarization environment)"
-    run brew install python@3.12
-    DIAR_PYTHON="$(command -v python3.12 || true)"
-    if [[ -z "$DIAR_PYTHON" && -x "/opt/homebrew/bin/python3.12" ]]; then
-      DIAR_PYTHON="/opt/homebrew/bin/python3.12"
-    fi
-    if [[ -z "$DIAR_PYTHON" && -x "/usr/local/bin/python3.12" ]]; then
-      DIAR_PYTHON="/usr/local/bin/python3.12"
+  say "Local diarization: NeMo-Speech.cpp + Sortformer"
+  if command -v nemo-speech >/dev/null 2>&1; then
+    say "nemo-speech: $(command -v nemo-speech)"
+  elif [[ "$DRY_RUN" == "1" ]]; then
+    say "  [dry-run] download and install the native NeMo-Speech runtime"
+  else
+    NEMO_INSTALLER="$(mktemp -t zoom-recorder-nemo.XXXXXX)"
+    if curl -fsSL -o "$NEMO_INSTALLER" \
+        https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh; then
+      sh "$NEMO_INSTALLER" --no-modify-path
+      rm -f "$NEMO_INSTALLER"
+    else
+      rm -f "$NEMO_INSTALLER"
+      say "ERROR: could not download the local NeMo runtime installer" >&2
     fi
   fi
-  DIAR_VENV="$SCRIPT_DIR/.venv-diarization"
-  if [[ -n "$DIAR_PYTHON" ]]; then
-    say "Diarization environment: $DIAR_VENV"
-    run "$DIAR_PYTHON" -m venv "$DIAR_VENV"
-    run "$DIAR_VENV/bin/python" -m pip install --upgrade pip setuptools wheel
-    run "$DIAR_VENV/bin/python" -m pip install whisperx pyannote.audio
-    say "Authenticate it before the next recording: $DIAR_VENV/bin/hf auth login"
+  NEMO_BIN="$(command -v nemo-speech || true)"
+  if [[ -z "$NEMO_BIN" && -x "$HOME/Library/Application Support/NeMoSpeech/bin/nemo-speech" ]]; then
+    NEMO_BIN="$HOME/Library/Application Support/NeMoSpeech/bin/nemo-speech"
+  fi
+  if [[ -z "$NEMO_BIN" && -x "$HOME/.local/bin/nemo-speech" ]]; then
+    NEMO_BIN="$HOME/.local/bin/nemo-speech"
+  fi
+  if [[ -n "$NEMO_BIN" ]]; then
+    run "$NEMO_BIN" pull sortformer
+    say "Local diarization model ready; no Hugging Face token is required."
   else
-    say "ERROR: Python 3.12 could not be located after installation" >&2
+    say "Install completed without a discoverable nemo-speech binary; open Settings to retry."
   fi
 fi
 

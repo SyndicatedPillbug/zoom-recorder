@@ -156,8 +156,11 @@ class HudConfig:
     enabled: bool = False
 
     # Speech-to-text
-    stt_backend: str = "groq"          # groq | openai | local
+    # Local Turbo is the normal path. Remote providers are an explicit
+    # recovery lane for machines where the model/runtime is unavailable.
+    stt_backend: str = "local"         # local | groq | openai | whisper
     stt_model: Optional[str] = None    # None => provider default
+    stt_fallbacks: List[str] = field(default_factory=lambda: ["groq"])
     stt_chunk_seconds: float = 5.0     # initial live chunk target
     stt_adaptive_chunking: bool = True # local STT retunes around speech/queue pressure
     stt_chunk_min_seconds: float = 2.5
@@ -188,6 +191,11 @@ class HudConfig:
     stt_partial_model: Optional[str] = DEFAULT_PARTIAL_TRANSCRIPTION_MODEL
     stt_partial_window_seconds: float = 4.0
     stt_partial_interval_seconds: float = 0.8
+    # A longer local re-read is used only as a provisional answer-context
+    # candidate. It never replaces the raw transcript or blocks final STT.
+    stt_context_correction_enabled: bool = True
+    stt_context_correction_window_seconds: float = 20.0
+    stt_context_correction_interval_seconds: float = 8.0
 
     # Answers
     answers_enabled: bool = True
@@ -219,13 +227,17 @@ class HudConfig:
     # Knowledge base
     kb_enabled: bool = True
     kb_dirs: List[str] = field(default_factory=list)
+    # A meeting-scoped override. The permanent library remains in kb_dirs;
+    # this selection is copied into a session snapshot when the next call
+    # starts and can be changed from Settings without moving the library.
+    kb_next_dirs: List[str] = field(default_factory=list)
     kb_model: str = "all-MiniLM-L6-v2"
     kb_top_k: int = 5
     kb_max_chars: int = 6000
     kb_scope_tags: List[str] = field(default_factory=list)
     kb_reindex: bool = False
     kb_cache_dir: Optional[str] = None
-    kb_embed_backend: str = "auto"      # auto | sentence-transformers | ollama | openai
+    kb_embed_backend: str = "auto"      # auto | sentence-transformers | ollama | openai | hashing
     kb_embed_model: Optional[str] = None
     kb_min_score: float = 0.1
 
@@ -251,7 +263,9 @@ class HudConfig:
     # Post-call attribution is enabled by default. It is isolated from live
     # capture, STT, and answers, so it never adds latency to the meeting.
     diarization_enabled: bool = True
-    diarization_backend: str = "auto"       # auto | whisperx | off
+    diarization_backend: str = "auto"       # auto | nemo | whisperx | off
+    diarization_model: Optional[str] = None  # local Sortformer GGUF path
+    diarization_device: str = "auto"        # auto | metal | vulkan | cpu
     diarization_timeout_seconds: float = 300.0
     voice_profiles_enabled: bool = True
     voice_profiles_path: Optional[str] = None
@@ -323,8 +337,9 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 def _defaults() -> Dict[str, Any]:
     return {
         "stt": {
-            "backend": "groq",
+            "backend": "local",
             "model": None,
+            "fallbacks": ["groq"],
             "chunk_seconds": 5.0,
             "adaptive_chunking": True,
             "chunk_min_seconds": 2.5,
@@ -352,6 +367,9 @@ def _defaults() -> Dict[str, Any]:
             "partial_model": DEFAULT_PARTIAL_TRANSCRIPTION_MODEL,
             "partial_window_seconds": 4.0,
             "partial_interval_seconds": 0.8,
+            "context_correction_enabled": True,
+            "context_correction_window_seconds": 20.0,
+            "context_correction_interval_seconds": 8.0,
         },
         "answers": {
             "enabled": True,
@@ -381,6 +399,7 @@ def _defaults() -> Dict[str, Any]:
         "kb": {
             "enabled": True,
             "dirs": [],
+            "next_dirs": [],
             "model": "all-MiniLM-L6-v2",
             "top_k": 5,
             "max_chars": 6000,
@@ -396,6 +415,7 @@ def _defaults() -> Dict[str, Any]:
                 "host": "127.0.0.1", "persist_seconds": 20.0},
         "transcript": {"writeback_dir": None},
         "diarization": {"enabled": True, "backend": "auto",
+                         "model": None, "device": "auto",
                          "timeout_seconds": 300.0,
                          "voice_profiles": {"enabled": True, "path": None,
                                             "threshold": 0.78}},
@@ -450,8 +470,10 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
     diarization = data.get("diarization") or {}
 
     return HudConfig(
-        stt_backend=str(stt.get("backend") or "groq"),
+        stt_backend=str(stt.get("backend") or "local"),
         stt_model=stt.get("model") or None,
+        stt_fallbacks=(_as_str_list(stt.get("fallbacks"))
+                       if "fallbacks" in stt else ["groq"]),
         stt_chunk_seconds=_as_float(stt.get("chunk_seconds"), 5.0),
         stt_adaptive_chunking=bool(stt.get("adaptive_chunking", True)),
         stt_chunk_min_seconds=_as_float(stt.get("chunk_min_seconds"), 2.5),
@@ -481,6 +503,12 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
                                DEFAULT_PARTIAL_TRANSCRIPTION_MODEL)),
         stt_partial_window_seconds=_as_float(stt.get("partial_window_seconds"), 4.0),
         stt_partial_interval_seconds=_as_float(stt.get("partial_interval_seconds"), 0.8),
+        stt_context_correction_enabled=bool(
+            stt.get("context_correction_enabled", True)),
+        stt_context_correction_window_seconds=_as_float(
+            stt.get("context_correction_window_seconds"), 20.0),
+        stt_context_correction_interval_seconds=_as_float(
+            stt.get("context_correction_interval_seconds"), 8.0),
         answers_enabled=bool(answers.get("enabled", True)),
         answers_backend=str(answers.get("backend") or "groq"),
         answers_fallback=_as_str_list(answers.get("fallback")),
@@ -506,6 +534,7 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         talking_points_quote_overlap=_as_float(answers.get("talking_points_quote_overlap"), 0.5),
         kb_enabled=bool(kb.get("enabled", True)),
         kb_dirs=_as_str_list(kb.get("dirs")),
+        kb_next_dirs=_as_str_list(kb.get("next_dirs")),
         kb_model=str(kb.get("model") or "all-MiniLM-L6-v2"),
         kb_top_k=_as_int(kb.get("top_k"), 5),
         kb_max_chars=_as_int(kb.get("max_chars"), 6000),
@@ -532,6 +561,8 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         transcript_writeback_dir=transcript.get("writeback_dir") or None,
         diarization_enabled=bool(diarization.get("enabled", True)),
         diarization_backend=str(diarization.get("backend") or "auto"),
+        diarization_model=diarization.get("model") or None,
+        diarization_device=str(diarization.get("device") or "auto"),
         diarization_timeout_seconds=_as_float(
             diarization.get("timeout_seconds"), 300.0),
         voice_profiles_enabled=bool((diarization.get("voice_profiles") or {}).get(
@@ -555,6 +586,8 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
     out["diarization"].update({
         "enabled": cfg.diarization_enabled,
         "backend": cfg.diarization_backend,
+        "model": cfg.diarization_model,
+        "device": cfg.diarization_device,
         "timeout_seconds": cfg.diarization_timeout_seconds,
         "voice_profiles": {
             "enabled": cfg.voice_profiles_enabled,
@@ -565,6 +598,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
     out["stt"].update({
         "backend": cfg.stt_backend,
         "model": cfg.stt_model,
+        "fallbacks": list(cfg.stt_fallbacks),
         "chunk_seconds": cfg.stt_chunk_seconds,
         "adaptive_chunking": cfg.stt_adaptive_chunking,
         "chunk_min_seconds": cfg.stt_chunk_min_seconds,
@@ -592,6 +626,9 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
         "partial_model": cfg.stt_partial_model,
         "partial_window_seconds": cfg.stt_partial_window_seconds,
         "partial_interval_seconds": cfg.stt_partial_interval_seconds,
+        "context_correction_enabled": cfg.stt_context_correction_enabled,
+        "context_correction_window_seconds": cfg.stt_context_correction_window_seconds,
+        "context_correction_interval_seconds": cfg.stt_context_correction_interval_seconds,
     })
     out["answers"].update({
         "enabled": cfg.answers_enabled,
@@ -621,6 +658,7 @@ def config_to_dict(cfg: HudConfig, include_keys: bool = True) -> Dict[str, Any]:
     out["kb"].update({
         "enabled": cfg.kb_enabled,
         "dirs": list(cfg.kb_dirs),
+        "next_dirs": list(cfg.kb_next_dirs),
         "model": cfg.kb_model,
         "top_k": cfg.kb_top_k,
         "max_chars": cfg.kb_max_chars,

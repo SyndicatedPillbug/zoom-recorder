@@ -7,7 +7,13 @@ selection, continuous capture verification, dynamic failover, and transcription.
 > **INSTALL.md** has the five-minute setup, **RESEARCH-MAC-HUD.md** explains
 > the Glass HUD design, and **SECURITY.md** documents
 > exactly what the tool accesses, writes and (optionally) sends over the
-> network. `./zoom_record.py --doctor` checks the environment and prints fixes.
+> network. **PLAN-AUDIO-CAPTURE-INTEGRITY.md** is the active plan for making
+> capture failures explicit, recoverable, and impossible to misreport as success.
+> **PLAN-PERSISTENT-MEETING-WORKSPACE.md** covers the durable post-call library,
+> playback, transcript editing, and speaker-correction workspace. **PLAN-WORKSPACE-PHASES-B-E.md**
+> covers the remaining execution plan; the related
+> open-source research is in **RESEARCH-OPEN-SOURCE-MEETING-WORKSPACES.md**.
+> `./zoom_record.py --doctor` checks the environment and prints fixes.
 
 ## Requirements
 
@@ -23,9 +29,8 @@ selection, continuous capture verification, dynamic failover, and transcription.
 git clone <this repo> ~/zoom-recorder
 cd ~/zoom-recorder
 ./install.sh --install-deps   # checks/installs ffmpeg, BlackHole, rumps
-# Post-call speaker attribution and reusable voice profiles (enabled by default):
+# Local post-call speaker attribution and reusable voice profiles (enabled by default):
 ./install.sh --install-diarization
-./.venv-diarization/bin/hf auth login
 ./run-menubar.command         # start the menu bar
 ```
 
@@ -78,6 +83,7 @@ Without any backend the HUD still runs, just with no knowledge-base grounding.
 ./zoom_record.py --list          # list audio devices + defaults + routing advice
 ./zoom_record.py --self-test     # play a tone and verify the capture path
 ./zoom_record.py --check-routing # verify system audio reaches a loopback
+./zoom_record.py --recover /path/to/stopped-session
 ./menubar.py                     # menu-bar toggle: click to start/stop
 ./settings.py                    # open the settings GUI (providers, KB, speakers, keys)
 ```
@@ -91,6 +97,7 @@ recordings on the same day never collide or overwrite each other:
 ~/ZoomRecordings/<YYYY-MM-DD>/<HH-MM-SS>_<uid>/
   recording_mic.wav       read-only original, mic track
   recording_sys.wav       read-only original, system/loopback track (if used)
+  recording_integrity.json per-source capture state and verification evidence
   .segments/              raw crash-safe segments, archived not deleted
   derived/
     recording_mixed.wav   mixed copy for transcription only -- not an original
@@ -141,6 +148,20 @@ Right after merging and before anything is archived or locked, the recorder:
 - If coverage is below 50%, it's flagged loudly (terminal bell + macOS
   notification) instead of being something you discover during transcription
   weeks later.
+- Writes `recording_integrity.json` with an honest per-source state: captured,
+  silent, degraded, truncated, unavailable, or failed. A valid-duration WAV
+  containing silence is not treated as a successful source.
+- Updates that report during the call when a source changes between
+  `awaiting_signal`, `captured`, `silent`, `unavailable`, or `failed`; the HUD
+  warning and final report therefore share the same source-health evidence.
+
+### Recovering a stopped or interrupted session
+
+If the recorder, HUD, or Mac is interrupted before normal finalization completes, run
+`./zoom_record.py --recover /path/to/session`. Recovery scans both `.work/` and `.segments/`
+on disk, rebuilds only missing originals, archives any remaining work sessions, writes a new
+integrity report, and appends manifest checksums. It is safe to run again: existing audio
+artifacts are not overwritten.
 
 Mic and system audio are **never pre-mixed** during capture — they're kept as
 separate mono originals so a later enhancement/leveling pass can be applied
@@ -232,8 +253,11 @@ and on the right a persistent **talking-points** bullet list above a **Q&A**
 column. The default Window mode is a stable decorated panel. Settings also
 offers Glass HUD mode: a translucent, borderless overlay designed to sit over
 a full-screen call, with readable glass cards, persistent placement, adjustable
-opacity, and compact density. Both modes stay above normal windows and follow
-Spaces where macOS allows it.
+opacity, and compact density. In Glass HUD mode, use the top-left grip to move
+the whole overlay between displays and the four corner grips to resize it for
+the active display; Arrange still moves the transcript, suggestions, and answers
+independently. Both modes stay above normal windows and follow Spaces where
+macOS allows it.
 
 The native surface requests macOS's window capture-exclusion setting as a
 best-effort privacy feature; meeting apps and newer capture paths may not honor
@@ -243,7 +267,7 @@ generated from the conversation and, when configured, a background database of
 `.md` files:
 
 ```bash
-./zoom_record.py --live                          # Groq STT + Groq answers
+./zoom_record.py --live                          # local Turbo STT + Groq answers
 ./zoom_record.py --live --kb-dir ~/notes         # ground answers in your notes
 ./zoom_record.py --live --live-no-answers        # offline transcript only
 ./zoom_record.py --live --transcript-dir ~/Obsidian/LiveTranscripts
@@ -321,22 +345,22 @@ views without rewriting raw audio or transcript events. The mapping is saved in
 `session.json`.
 
 **Post-call diarization.** For calls with several people sharing one
-remote/system channel, the app runs a background pass after capture by default.
-It never delays live STT, question detection, or answer TTFT. The
-supported setup installs WhisperX and its diarization dependencies in the
-repo-local `.venv-diarization` environment; the app finds that environment
-automatically. Authenticate with `hf auth login` or set `HF_TOKEN`, then run:
+remote/system channel, the app runs a local background pass after capture by
+default. It never delays live STT, question detection, or answer TTFT. The
+supported setup installs the native NeMo-Speech runtime and downloads the
+local Sortformer model once, then runs inference locally:
 
 ```bash
 ./zoom_record.py --live --self-name "Dana"
 ```
 
 The pass processes only the saved remote track when one exists, uses fixed
-non-shell arguments, keeps the credential out of the child process arguments,
-has a timeout, and writes only derived files. If WhisperX, the model, or the
-token is missing, the call completes with the normal channel-labelled
-transcript. Speaker IDs remain generic (`Remote 1`, `Remote 2`) until the user
-renames them; acoustic attribution never silently claims a real person's
+non-shell arguments, runs locally through Metal on Apple Silicon or Vulkan or
+CPU on Linux, has a timeout, and writes only derived files. If the
+local runtime or model is not installed, the Control Center reports that setup
+is needed; it never asks for a Hugging Face token or silently switches to a
+cloud diarizer. Speaker IDs remain generic (`Remote 1`, `Remote 2`) until the
+user renames them; acoustic attribution never silently claims a real person's
 identity. The derived `diarization.json` also records quality diagnostics
 (unknown/generic/manual/profile segment rates, audio duration, processing time,
 and real-time factor); these are measurements, not a replacement for manual
@@ -350,9 +374,9 @@ match is still marked `voice_profile` and remains generic below the configured
 threshold. The store contains aggregate embeddings and metadata, not audio;
 it is created with owner-only permissions. Disable **Reuse confirmed voices**
 in Settings to stop matching, and delete the profile file to erase stored
-matches. When enabled, WhisperX emits the speaker embeddings during the same
-post-call pass; otherwise it safely falls back because WhisperX's session-local
-speaker IDs are not reusable identities by themselves.
+matches. Persistent identity matching is deliberately a separate local
+provider from turn diarization, so a session-local speaker ID is never treated
+as a confirmed identity by itself.
 
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
@@ -371,9 +395,10 @@ published segment to carry passing `no_speech_prob` / `avg_logprob` /
 text is discarded rather than trusted. Remote providers use the same segment
 gate when they support `verbose_json`. The lightweight interim lane remains
 JSON-only for latency and is never itself authoritative. A second text filter
-drops repetition loops and canned silence phrases. Final chunks also carry the
-VAD's speech-activity ratio; short text from a mostly silent window is rejected
-even if it happens to look plausible. Borderline short final text is held for
+drops repetition loops, canned silence phrases, and Whisper sound-effect labels
+such as `*crickets*`. Final chunks also carry the VAD's speech-activity ratio;
+mostly silent windows are rejected before Turbo inference, even if a context
+prompt could make their output look plausible. Borderline short final text is held for
 one neighboring final window and published only when the next hypothesis agrees;
 the hold is bounded and never applies to provisional drafts. The HUD then runs
 two independent streams:
@@ -423,6 +448,13 @@ temperature fallback, reducing invented text when the microphone receives
 humming, music, or other non-speech audio. Repeated non-speech interjections
 such as “oh, oh, oh, oh” are discarded; low-signal slide-transition loops are
 discarded only when the audio is marginal.
+
+After a final local chunk, an opportunistic 20-second Turbo re-read can be
+queued for answer context. It is deliberately non-authoritative: it is labeled
+as a provisional ASR candidate, is never written over the raw transcript, and
+is skipped whenever final recognition is busy. This helps the answer model
+resolve near-miss wording such as names or canonical phrases without turning a
+second inference pass into a latency requirement.
 
 Local mode also enables near-real-time interim words by default. It re-decodes
 an overlapping four-second window about every 0.8 seconds. The HUD shows the
@@ -494,13 +526,26 @@ system audio out of the box; the recorder has two capture paths:
    Muting silences your speakers/headphones only — the recording keeps
    capturing system audio. `--restore-routing` (also in the `Audio Out ▸`
    menu) removes the routing entirely when you are done with loopback mode.
-2. **Core Audio process tap (`--system-capture tap`, opt-in).** Where the
+2. **Core Audio process tap (`--system-capture tap`).** Where the
    calling app context holds the **System Audio Recording** permission (e.g.
    Apple Terminal), `hud/system_tap.py` creates a *private, observe-only* tap
    that mirrors every playing process. Output routing is completely untouched
    and the recording level is independent of the volume slider. It is never
-   chosen automatically — the audio-capture permission path stays opt-in — and
-   `python3 -m hud.system_tap` self-tests it.
+   chosen automatically in an unapproved background context; `auto` selects it
+   when permission is available and otherwise falls back to the loopback route.
+`python3 -m hud.system_tap` self-tests it.
+
+The tap monitor allows a 30-second startup grace period while Core Audio attaches
+to the current output graph. During that interval the HUD reports **awaiting
+signal** rather than a failure. After startup, 10 seconds of confirmed silence
+triggers the normal system-audio warning and integrity downgrade.
+
+Routing is session-owned: when tap mode starts, any leftover tool-owned
+Multi-Output default is restored to the currently safe physical output before
+capture begins. Loopback mode activates the Multi-Output only for the recording
+window. Both modes restore a physical output at normal stop and leave a small
+crash-recovery marker so the next launch can repair a route left behind by a
+force-quit or interrupted shutdown.
 
 `./zoom_record.py --list` prints every device with its transport, the current
 defaults, the capture mode, and exactly what to fix; `--self-test` plays a
@@ -516,11 +561,11 @@ them. Set `answers.backend` / `stt.backend` or use the `--answer-backend` /
 
 | Provider | STT | Answers | Notes |
 | --- | --- | --- | --- |
-| `groq` (default) | ✅ `whisper-large-v3-turbo` | ✅ `gpt-oss-120b` / `gpt-oss-20b` | Fastest/cheapest; token- and audio-second-limited, not context-limited |
+| `groq` | ✅ `whisper-large-v3-turbo` | ✅ `gpt-oss-120b` / `gpt-oss-20b` | Online fallback/answer provider; token- and audio-second-limited |
 | `openrouter` | — | ✅ | Use GPT-4o/Claude/Gemini; LLM routing only, no STT |
 | `openai` | ✅ `whisper-1` | ✅ | One key for both |
 | `ollama` | — | ✅ | Fully local; pair with `--stt-backend local` |
-| `local` | ✅ whisper.cpp (`large-v3-turbo-q5_0`) | — | Private; the turbo model is the baseline and needs a one-time download |
+| `local` (default STT) | ✅ whisper.cpp (`large-v3-turbo-q5_0`) | — | Private baseline; needs a one-time model download |
 
 Talking points use the lighter model (`openai/gpt-oss-20b` on Groq) while
 detected questions use the stronger one (`openai/gpt-oss-120b`). By default only
@@ -539,18 +584,25 @@ in the config to impose limits below the provider's.
 When Groq returns a transient rate limit, the answer worker tries the next
 configured provider before pausing the answer queue. STT uses a short provider
 backoff and drops stale queued audio rather than allowing the live transcript
-to drift minutes behind the call.
+to drift minutes behind the call. The default STT chain is now local Turbo →
+Groq: local inference is attempted first, and a runtime failure switches to the
+configured remote fallback once for the rest of that session. A valid local
+silence result never triggers a remote request.
 
 **Configuration.** Defaults can be set in `~/.config/zoom-recorder/config.json`
 (keep it `chmod 600`); environment variables always win:
 
 ```json
 {
-  "stt":     {"backend": "groq", "chunk_seconds": 5, "adaptive_chunking": true,
+  "stt":     {"backend": "local", "fallbacks": ["groq"], "chunk_seconds": 5,
+               "adaptive_chunking": true,
                "chunk_min_seconds": 2.5, "chunk_max_seconds": 7,
                "chunk_overlap_seconds": 0.5, "partial_enabled": true,
                "partial_model": "~/.cache/whisper-cpp/ggml-base.en.bin",
                "partial_window_seconds": 4, "partial_interval_seconds": 0.8,
+               "context_correction_enabled": true,
+               "context_correction_window_seconds": 20,
+               "context_correction_interval_seconds": 8,
                "glossary": ["Acme", "Q3"],
                "vad_backend": "auto", "vad_margin_db": 6,
                "speech_activity_min": 0.20, "hallucination_filter": true,
@@ -770,7 +822,7 @@ to the **next** recording, since the HUD reads config at session start.
 | `--self-test` | off | Play a tone and verify the output→loopback capture path |
 | `--check-routing` | off | Verify system audio reaches a loopback, then exit |
 | `--fix-routing` | off | Loopback mode only: create/rebuild the Multi-Output Device and select it as default output, then exit |
-| `--system-capture MODE` | loopback | `loopback` (BlackHole/Multi-Output, default) or `tap` (Core Audio process tap; opt-in, needs the System Audio Recording permission) |
+| `--system-capture MODE` | auto | `auto` (use the authorized Core Audio tap, otherwise loopback), `loopback` (BlackHole/Multi-Output), or `tap` (require the tap) |
 | `--restore-routing` | off | Undo everything: real default output/input, remove the Multi-Output Device, then exit |
 | `--doctor` | off | Check tools, BlackHole, routing, output volume and the microphone (with fixes), then exit |
 | `--offline` | off | Privacy: block every non-loopback network call (live STT/answers/KB) and turn notifications off |
@@ -794,7 +846,7 @@ to the **next** recording, since the HUD reads config at session start.
 | `--hud-port N` | random | Port for the local HUD |
 | `--transcript-dir PATH` | config | Additional folder for a live Markdown transcript mirror |
 | `--no-hud-browser` | off | Do not auto-open the HUD in a browser |
-| `--stt-backend X` | groq | Live STT backend: `groq` \| `openai` \| `local` |
+| `--stt-backend X` | local | Live STT backend: `local` \| `groq` \| `openai` (Groq is the configured fallback) |
 | `--stt-chunk-seconds N` | 5 (7 with two Groq streams) | Live STT chunk length; the provider guard may raise it for two remote streams |
 | `--glossary-term WORD` | none | Name/acronym to bias live transcription (repeatable) |
 | `--answer-backend X` | groq | Answer provider: `groq` \| `openrouter` \| `openai` \| `ollama` |
@@ -831,12 +883,20 @@ to the **next** recording, since the HUD reads config at session start.
   as **two separate mono tracks** (crash-safe segments), so a later
   enhancement/leveling pass can be applied per-source. The only mixdown is a
   disposable `derived/recording_mixed.wav` for transcription.
-- **Every `--chunk-seconds` the active mic is tested.** A dead capture reads about
-  `-91 dB`, so `--silence-db` cleanly separates a dead input from a live one.
-- After `--fail-threshold` consecutive silent checks, the recorder **cycles
-  through every other candidate**, probes them, and switches to the best one
-  that produces signal. The current capture keeps running throughout, so
-  natural meeting silence never drops audio.
+- **The active capture is never opened a second time for health polling.** A
+  competing avfoundation reader can wedge the real microphone stream on macOS,
+  so startup signal evidence and recorder-process liveness protect the active
+  source; inactive candidates may still be probed safely.
+- At startup, the selected loopback is checked after capture opens. If the mic
+  is active but the system track is silent, routing is repaired once and the
+  available loopback candidates are retried. If no live signal can be confirmed,
+  the HUD shows a critical warning and macOS displays an alert instead of
+  silently trusting a one-sided recording.
+- On a clean stop, the recorder merges the crash-safe segments into
+  `recording_mic.wav` and `recording_sys.wav` **before** archiving them. If the
+  HUD has renamed the session folder, the recorder rebases its segment paths;
+  if no finalized audio artifact exists, it returns an error and preserves the
+  raw segments for recovery.
 - When the **default input/output changes mid-call** (headphones, Bluetooth),
   the recorder re-reads the topology and re-resolves the affected source; the
   live HUD follows the switch and restarts only that STT source.
@@ -847,8 +907,16 @@ to the **next** recording, since the HUD reads config at session start.
 ## Troubleshooting
 
 - **Recording is silent** — the recorder now detects this itself and will fail
-  over to another input. Check `capture.log` to see which devices were probed
-  and why a switch did or did not happen.
+  over to another input when a safe candidate is available. Check
+  `capture.log` for the startup self-check and any critical alert. The live HUD
+  also shows when the microphone is active but the other-party track has not
+  been confirmed.
+- **No WAV appeared after stopping** — do not delete the session folder. A
+  clean stop should leave `recording_mic.wav` and, when selected,
+  `recording_sys.wav`; a failed merge leaves `.work/session_*/` segments in
+  place and returns a failure so the problem cannot look like a successful
+  recording. The recorder also rebases paths when the HUD adds a readable
+  folder name.
 - **The other party isn't in the transcript, or YouTube was labelled as you** —
   macOS system audio needs a loopback in the output path. Run
   `./zoom_record.py --list` (prints the default output and the exact fix) and
@@ -862,6 +930,17 @@ to the **next** recording, since the HUD reads config at session start.
 - **Is the capture path actually working?** — run `./zoom_record.py --self-test`
   (or `--check-routing`); it plays a short tone and checks whether a loopback
   input records it.
+
+### Local Turbo and Mac memory
+
+Local Whisper Turbo remains the default transcription backend because it keeps
+audio on the Mac and avoids provider latency and token usage. During a live
+session the HUD reports macOS free-memory percentage, swap usage, the recorder
+process footprint, and the Whisper child-process footprint. When macOS reports
+sustained pressure or heavy swap use, the HUD raises an actionable warning and
+records the same evidence in `derived/live_diagnostics.json`; it does not
+silently downgrade or disable Turbo. Close unused browsers or other heavy
+applications before restarting a call if the warning appears.
 
 ### Menu-bar icon hidden by the notch
 
@@ -913,7 +992,7 @@ Annotated tags mark each milestone (`git tag -n` for the full messages):
 | `v1.6-routing-fix` | One-command automated routing fix (`--fix-routing`, menu-bar item), bare-BlackHole misroute advice, click-by-click fallback; `Audio Out` menu-bar dropdown to switch the passthrough output mid-call, stored pairing preference (`~/.zoom_recorder_routing.json`), stale-device rebuilds |
 | `v1.7-system-tap` | Core Audio process-tap capture (`--system-capture auto|tap|loopback`): system audio recorded directly where permitted (Terminal context), loopback+volume-slider mode for the menu bar, `--restore-routing`, one-time System Audio Recording permission, wedge recovery, preserved failure diagnostics |
 | `v1.8-volume` | First-class top-level **Volume** menu (live level in the title, slider, ±5%, mute, presets), CLI volume/mute actions, Karabiner key mapping for loopback mode, mute leaves the recording intact, default output auto-restored when a recording stops (native keys return between calls) |
-| `v1.9-hardening` | Shareable/EDR-friendly install: unsigned `.app` wrapper removed, login autostart opt-in, tap capture opt-in (loopback default), `--doctor`, `--offline` hard network kill-switch, notification toggle, `install.sh`/`uninstall.sh`, `SECURITY.md`/`INSTALL.md` |
+| `v1.9-hardening` | Shareable/EDR-friendly install: unsigned `.app` wrapper removed, login autostart opt-in, permission-aware tap capture with loopback fallback, `--doctor`, `--offline` hard network kill-switch, notification toggle, `install.sh`/`uninstall.sh`, `SECURITY.md`/`INSTALL.md` |
 | `v2.0-ui` | Non-technical UI pass: Control Center (Setup wizard with one-click fixes, Recordings list, Basics/Advanced settings, Help), menu bar rewritten in plain language with a recording timer, Stop button and Details toggle in the transcript window, recording modes (`both`/`mic`/`system`), recorder settings in the config file, local *and* online transcription setup in the wizard, `QUICKSTART.md` |
 
 Running the tests: `python3 -m unittest discover -s tests`.

@@ -53,13 +53,14 @@
     flex: 1 1 auto;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
     min-height: 0;
   }
   section { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  .module-transcript { grid-column: 1; grid-row: 1 / span 2; border-right: 1px solid var(--border); }
+  .module-transcript { grid-column: 1; grid-row: 1 / span 3; border-right: 1px solid var(--border); }
   .module-suggestions { grid-column: 2; grid-row: 1; border-bottom: 1px solid var(--border); }
   .module-answers { grid-column: 2; grid-row: 2; }
+  .module-ask { grid-column: 2; grid-row: 3; min-height: 0; }
   .module-handle { user-select: none; }
   .arrange-hint { display: none; margin-left: auto; font-size: 10px; color: var(--accent); text-transform: none; letter-spacing: 0; }
   body.arrange-mode .arrange-hint { display: inline; }
@@ -108,6 +109,7 @@
     padding: 8px 16px; background: #241f10; color: var(--warn);
     border-bottom: 1px solid #4a3d1f; font-size: 12px; flex: 0 0 auto;
   }
+  .warnbar.critical { background: #3a1517; color: #ff9b9b; border-bottom-color: #7a2e34; font-weight: 700; }
   button.mini {
     font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text); cursor: pointer;
@@ -166,6 +168,7 @@ body.overlay section {
 }
 body.overlay .module-transcript { border-right-color: rgba(255,255,255,.15); }
 body.overlay .module-suggestions { border-bottom-color: rgba(255,255,255,.15); }
+body.overlay .module-ask { border-top-color: rgba(255,255,255,.15); }
 body.overlay .col-head { background: rgba(7, 9, 14, .58); border-bottom-color: rgba(255,255,255,.14); }
 body.overlay .scroll { text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 1px rgba(0,0,0,.9); }
 body.overlay .line { margin-bottom: 10px; }
@@ -185,7 +188,7 @@ body.overlay.compact .footerbar { padding: 5px 10px; }
 body.arrange-mode main {
   display: block;
   position: relative;
-  overflow: hidden;
+  overflow: visible;
 }
 body.arrange-mode .hud-module {
   position: absolute;
@@ -202,9 +205,41 @@ body.arrange-mode .hud-module {
 body.arrange-mode .module-transcript { left: 0; top: 0; width: calc(50% - 6px); height: 100%; border-right: 1px solid rgba(255,255,255,.24); }
 body.arrange-mode .module-suggestions { left: 50%; top: 0; }
 body.arrange-mode .module-answers { left: 50%; top: 50%; }
+body.arrange-mode .module-ask { left: 50%; top: calc(100% - 120px); height: 110px; }
 body.arrange-mode .module-handle { cursor: grab; }
 body.arrange-mode .module-handle:active { cursor: grabbing; }
 body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
+
+/* The native glass panel has no visible title bar or resize border. These
+   small, always-available grips provide the expected outer-window controls
+   without making the rest of the overlay capture mouse clicks. */
+.window-gesture { display: none; position: fixed; z-index: 50; }
+body.overlay .window-gesture { display: block; }
+body.overlay .window-drag-handle {
+  left: 50px; top: 4px; width: 28px; height: 22px;
+  border: 1px solid rgba(255,255,255,.28); border-radius: 6px;
+  background: rgba(7,9,14,.72); color: var(--muted);
+  cursor: move; text-align: center; line-height: 19px;
+  font-size: 16px; text-shadow: 0 1px 3px #000;
+}
+body.overlay .window-drag-handle:hover,
+body.overlay .window-resize-handle:hover { border-color: var(--accent); background: rgba(20,35,58,.9); }
+body.overlay .window-resize-handle {
+  width: 18px; height: 18px; border: 1px solid rgba(255,255,255,.3);
+  border-radius: 5px; background: rgba(7,9,14,.72);
+}
+body.overlay .window-resize-handle::after {
+  content: ""; position: absolute; width: 8px; height: 8px;
+  border: solid rgba(255,255,255,.72); border-width: 0 1px 1px 0;
+}
+body.overlay .window-resize-handle.se { right: 3px; bottom: 3px; cursor: nwse-resize; }
+body.overlay .window-resize-handle.se::after { right: 3px; bottom: 3px; }
+body.overlay .window-resize-handle.sw { left: 3px; bottom: 3px; cursor: nesw-resize; }
+body.overlay .window-resize-handle.sw::after { left: 3px; bottom: 3px; transform: rotate(90deg); }
+body.overlay .window-resize-handle.ne { right: 3px; top: 3px; cursor: nesw-resize; }
+body.overlay .window-resize-handle.ne::after { right: 3px; top: 3px; transform: rotate(270deg); }
+body.overlay .window-resize-handle.nw { left: 3px; top: 3px; cursor: nwse-resize; }
+body.overlay .window-resize-handle.nw::after { left: 3px; top: 3px; transform: rotate(180deg); }
 </style>
 </head>
 <body>
@@ -214,6 +249,7 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
   <span class="pill" id="status">connecting…</span>
   <div class="spacer"></div>
   <button class="mini hud-interactive" id="arrangeBtn" title="Move transcript, suggestions, and answers independently">Arrange</button>
+  <button class="mini secondary hud-interactive" id="interactionBtn" title="Temporarily enable clicks and typing throughout the glass HUD">Interact</button>
   <button class="mini secondary hud-interactive" id="detailsBtn" title="Show technical details">Details</button>
   <button class="mini hud-interactive" id="stopBtn">Stop recording</button>
 </header>
@@ -225,6 +261,7 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
   <span class="pill" id="answerMetrics" title="Latest answer queue, prompt, and provider timing">answer —</span>
   <span class="pill" id="level" title="Current input level vs the speech threshold (dBFS)">lvl —</span>
   <span class="pill" id="devices" title="Microphone / system audio source">mic — · sys —</span>
+  <span class="pill" id="resources" title="Host memory and local Whisper footprint">memory —</span>
   <button class="mini hud-interactive" id="pauseBtn" title="Pause AI answers (transcript keeps running)">Pause answers</button>
   <span class="pill" id="budgetLabel">budget —</span>
   <div class="budget" title="Daily token budget used"><span id="budgetBar"></span></div>
@@ -242,6 +279,9 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
   <section class="hud-module module-answers" data-module="answers">
     <div class="col-head module-handle hud-interactive" data-drag-handle="answers">Ask about the call <span class="arrange-hint">drag to move</span></div>
     <div class="scroll" id="answers"><p class="empty">Answers will appear here.</p></div>
+  </section>
+  <section class="hud-module module-ask" data-module="ask">
+    <div class="col-head module-handle hud-interactive" data-drag-handle="ask">Question <span class="arrange-hint">drag to move</span></div>
     <form class="askbar hud-interactive" id="askForm">
       <input id="askInput" class="hud-interactive" type="text" placeholder="Ask a question…" autocomplete="off" />
       <button class="mini hud-interactive" type="submit">Ask</button>
@@ -251,6 +291,11 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
 <div class="footerbar">
   <button class="mini secondary hud-interactive" id="openRecordings">Open recordings folder</button>
 </div>
+<div class="window-gesture window-drag-handle hud-interactive" id="windowDragHandle" title="Move the whole HUD">⠿</div>
+<div class="window-gesture window-resize-handle nw hud-interactive" data-window-gesture="nw" title="Resize HUD"></div>
+<div class="window-gesture window-resize-handle ne hud-interactive" data-window-gesture="ne" title="Resize HUD"></div>
+<div class="window-gesture window-resize-handle sw hud-interactive" data-window-gesture="sw" title="Resize HUD"></div>
+<div class="window-gesture window-resize-handle se hud-interactive" data-window-gesture="se" title="Resize HUD"></div>
 <script>
 (function () {
   const surfaceParams = new URLSearchParams(location.search);
@@ -270,6 +315,7 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
   const answerMetricsEl = document.getElementById('answerMetrics');
   const levelEl = document.getElementById('level');
   const devicesEl = document.getElementById('devices');
+  const resourcesEl = document.getElementById('resources');
   const warnbarEl = document.getElementById('warnbar');
   const dotEl = document.getElementById('dot');
   const budgetBar = document.getElementById('budgetBar');
@@ -281,6 +327,7 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
   const stopBtn = document.getElementById('stopBtn');
   const openRecordingsBtn = document.getElementById('openRecordings');
   const arrangeBtn = document.getElementById('arrangeBtn');
+  const interactionBtn = document.getElementById('interactionBtn');
   const hudMain = document.getElementById('hudMain');
   const modules = [...document.querySelectorAll('.hud-module[data-module]')];
   if (detailsBtn) detailsBtn.onclick = () => {
@@ -296,6 +343,7 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
   if (openRecordingsBtn) openRecordingsBtn.onclick = () => api('/open-recordings', 'POST', {});
   const LAYOUT_KEY = 'hud.module-layout.v1';
   let arranging = false;
+  let interactionEnabled = false;
   function sendInteractiveRegions() {
     const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hudRegions;
     if (!handler) return;
@@ -339,6 +387,50 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
     setTimeout(sendInteractiveRegions, 0);
   }
   if (arrangeBtn) arrangeBtn.onclick = () => setArrangeMode(!arranging);
+
+  function sendWindowGesture(action, gesture, dx, dy) {
+    const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hudRegions;
+    if (!handler) return;
+    try { handler.postMessage({ action: action, gesture: gesture, dx: dx || 0, dy: dy || 0 }); } catch (e) {}
+  }
+  function setInteractionMode(enabled) {
+    interactionEnabled = !!enabled;
+    document.body.classList.toggle('interaction-mode', interactionEnabled);
+    if (interactionBtn) {
+      interactionBtn.textContent = interactionEnabled ? 'Clicks on' : 'Interact';
+      interactionBtn.classList.toggle('on', interactionEnabled);
+    }
+    const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hudRegions;
+    if (handler) {
+      try { handler.postMessage({ action: 'interaction', enabled: interactionEnabled }); } catch (e) {}
+    }
+    setTimeout(sendInteractiveRegions, 0);
+  }
+  if (interactionBtn) interactionBtn.onclick = () => setInteractionMode(!interactionEnabled);
+  function bindWindowGesture(node, gesture) {
+    if (!node) return;
+    node.addEventListener('pointerdown', e => {
+      e.preventDefault(); e.stopPropagation(); node.setPointerCapture?.(e.pointerId);
+      const startX = e.clientX, startY = e.clientY;
+      sendWindowGesture('start', gesture);
+      const move = event => sendWindowGesture('update', gesture, event.clientX - startX, event.clientY - startY);
+      const end = () => {
+        node.releasePointerCapture?.(e.pointerId);
+        node.removeEventListener('pointermove', move);
+        node.removeEventListener('pointerup', end);
+        node.removeEventListener('pointercancel', end);
+        sendWindowGesture('end', gesture);
+      };
+      node.addEventListener('pointermove', move);
+      node.addEventListener('pointerup', end);
+      node.addEventListener('pointercancel', end);
+    });
+  }
+  bindWindowGesture(document.getElementById('windowDragHandle'), 'move');
+  document.querySelectorAll('[data-window-gesture]').forEach(node => {
+    bindWindowGesture(node, node.dataset.windowGesture);
+  });
+  window.addEventListener('blur', () => sendWindowGesture('end', 'move'));
   modules.forEach(module => {
     const handle = module.querySelector('[data-drag-handle]');
     if (!handle) return;
@@ -350,10 +442,11 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
       const offsetX = e.clientX - rect.left, offsetY = e.clientY - rect.top;
       module.dataset.dragging = '1';
       const move = event => {
-        const maxX = Math.max(0, mainRect.width - module.offsetWidth);
-        const maxY = Math.max(0, mainRect.height - module.offsetHeight);
-        module.style.left = Math.max(0, Math.min(maxX, event.clientX - mainRect.left - offsetX)) + 'px';
-        module.style.top = Math.max(0, Math.min(maxY, event.clientY - mainRect.top - offsetY)) + 'px';
+        // Freeform HUD placement: the native window is the movable canvas.
+        // Do not trap a module inside the original two-column grid; users
+        // often need to put the transcript or question surface at an edge.
+        module.style.left = Math.round(event.clientX - mainRect.left - offsetX) + 'px';
+        module.style.top = Math.round(event.clientY - mainRect.top - offsetY) + 'px';
         sendInteractiveRegions();
       };
       const end = () => {
@@ -373,6 +466,7 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
   let transcriptCount = 0, answerCount = 0, lastId = 0, paused = false;
   const partialNodes = new Map();
   const speakerLabels = Object.create(null);
+  let systemWarning = '', resourceWarning = '';
   let pointItems = [];
   let pins = new Set();
   try { pins = new Set(JSON.parse(localStorage.getItem(PINS_KEY) || '[]')); } catch (e) {}
@@ -621,16 +715,41 @@ body.arrange-mode .hud-module[data-dragging="1"] { opacity: .78; }
     }
     if (meta.mic_device !== undefined || meta.system_device !== undefined) {
       devicesEl.textContent = 'mic: ' + (meta.mic_device || '?') + ' · sys: ' + (meta.system_device || 'none');
-      devicesEl.style.color = meta.system_audio_warning ? 'var(--warn)' : 'var(--muted)';
+      devicesEl.style.color = (meta.system_audio_warning || systemWarning) ? 'var(--warn)' : 'var(--muted)';
+    }
+    if (meta.audio_route) {
+      const route = meta.audio_route || {};
+      const backend = route.capture_backend || 'unknown backend';
+      const output = route.physical_output || route.paired_output || 'unknown output';
+      const verified = route.application_route_verified === true;
+      const loopback = route.loopback_name || route.system_device || 'none';
+      devicesEl.textContent = 'mic: ' + (meta.mic_device || '?') +
+        ' · call: ' + loopback + (verified ? ' ✓' : ' ⚠') +
+        ' · out: ' + output + ' · ' + backend;
+      devicesEl.style.color = verified && !meta.system_audio_warning
+        ? 'var(--accent-2)' : 'var(--warn)';
+      devicesEl.title = verified
+        ? 'Call audio signal verified through the selected capture route.'
+        : 'Call application output has not been verified as reaching the capture route.';
     }
     if (meta.system_audio_warning !== undefined) {
-      if (meta.system_audio_warning) {
-        warnbarEl.hidden = false;
-        warnbarEl.textContent = meta.system_audio_warning;
-      } else {
-        warnbarEl.hidden = true;
-        warnbarEl.textContent = '';
-      }
+      systemWarning = String(meta.system_audio_warning || '');
+    }
+    if (meta.resource_warning !== undefined) {
+      resourceWarning = String(meta.resource_warning || '');
+    }
+    if (resourcesEl && (meta.resource_memory_free_percent !== undefined || meta.resource_process_rss_mb !== undefined)) {
+      const free = meta.resource_memory_free_percent == null ? '—' : Number(meta.resource_memory_free_percent).toFixed(0) + '% free';
+      const app = meta.resource_process_rss_mb == null ? '—' : Number(meta.resource_process_rss_mb).toFixed(0) + ' MB app';
+      const swap = meta.resource_swap_used_mb == null ? '' : ' · ' + (Number(meta.resource_swap_used_mb) / 1024).toFixed(1) + ' GB swap';
+      resourcesEl.textContent = 'memory ' + free + ' · ' + app + swap;
+      resourcesEl.style.color = resourceWarning ? 'var(--warn)' : 'var(--muted)';
+    }
+    const warnings = [systemWarning, resourceWarning].filter(Boolean);
+    warnbarEl.hidden = warnings.length === 0;
+    warnbarEl.textContent = warnings.join('  •  ');
+    if (warnings.length) {
+      warnbarEl.classList.toggle('critical', warnings.some(w => w.indexOf('CRITICAL:') === 0));
     }
     if (meta.answers_paused !== undefined) setPaused(meta.answers_paused);
     const b = ev.budget || {};

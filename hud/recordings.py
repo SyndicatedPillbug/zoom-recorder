@@ -33,6 +33,8 @@ class Recording:
     mixed: Optional[str] = None
     title: Optional[str] = None
     participants: List[str] = field(default_factory=list)
+    health_state: str = "unknown"
+    health_label: str = "Review capture"
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -49,6 +51,8 @@ class Recording:
             "mixed": self.mixed,
             "title": self.title,
             "participants": list(self.participants),
+            "health_state": self.health_state,
+            "health_label": self.health_label,
         }
 
 
@@ -144,6 +148,20 @@ def list_recordings(basedir: str, limit: int = 200,
             rec.mixed = str(mixed) if mixed.is_file() else None
             rec.transcript = str(transcript) if transcript.is_file() else None
             rec.summary = str(summary) if summary.is_file() else None
+            integrity_path = session / "recording_integrity.json"
+            try:
+                integrity = json.loads(integrity_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                integrity = {}
+            state = str(integrity.get("state") or "unknown").lower()
+            if isinstance(integrity.get("summary"), dict):
+                state = str(integrity["summary"].get("state") or state).lower()
+            rec.health_state = state
+            rec.health_label = {
+                "healthy": "Healthy", "partial": "Partial", "degraded": "Degraded",
+                "recovered": "Recovered", "capture_failed": "Capture failed",
+                "failed": "Capture failed", "unknown": "Review capture",
+            }.get(state, "Review capture")
             source = mixed if mixed.is_file() else (mic if mic.is_file() else syswav)
             if probe and source.is_file():
                 try:

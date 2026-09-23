@@ -44,7 +44,9 @@ from hud.evaluation import (first_stable_publication_stats, normalize_words,  # 
                             stable_prefix_stats, word_error_stats)
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
-from hud.kb import KBIndex, KBSnippet, _lexical_score, chunk_markdown  # noqa: E402
+from hud.integrity import source_record, write_report  # noqa: E402
+from hud.kb import (KBIndex, KBSnippet, _lexical_score, chunk_markdown,
+                    inspect_sources)  # noqa: E402
 from hud.kb_benchmark import run_benchmark as run_kb_benchmark  # noqa: E402
 from hud.lifecycle import run_fixture  # noqa: E402
 from hud.local_http import host_from_header, url_host  # noqa: E402
@@ -52,10 +54,13 @@ from hud.llm import LLMError, LLMResult  # noqa: E402
 from hud.memory import extract_memory, format_memory  # noqa: E402
 from hud.menu_state import describe  # noqa: E402
 from hud.replay import benchmark, replay, write_jsonl  # noqa: E402
+from hud.resources import (ResourceMonitor, ResourceSnapshot, parse_free_percent,
+                           parse_process_rows, parse_swap_used_mb, process_tree_memory,
+                           warning_for)  # noqa: E402
 from hud.server import HudServer  # noqa: E402
 from hud.state import LiveState, is_duplicate_point  # noqa: E402
 from hud.trace_report import build_report  # noqa: E402
-from hud.stt import (Chunker, LiveTranscriber, LocalWhisperSTT, STTResult, _Source,  # noqa: E402
+from hud.stt import (Chunker, FailoverSTT, LiveTranscriber, LocalWhisperSTT, STTResult, _Source,  # noqa: E402
                      frame_rms_dbfs, StablePartialDecoder, fuzzy_overlap,
                      hallucination_reason, looks_hallucinated,
                      overlap_suffix_prefix,
@@ -190,6 +195,22 @@ class SttPipelineTests(unittest.TestCase):
         self.assertTrue(any("GPU failed" in item for item in logs))
         self.assertIn("-nf", commands[0])
         self.assertIn("-nth", commands[0])
+
+    def test_local_failover_switches_once_and_stays_on_fallback(self) -> None:
+        logs = []
+        primary = mock.Mock()
+        primary.transcribe.side_effect = RuntimeError("local runtime stopped")
+        fallback = mock.Mock()
+        fallback.transcribe.side_effect = [STTResult("first remote"), STTResult("second remote")]
+        switched = []
+        lane = FailoverSTT([("local", primary), ("groq", fallback)], logs.append,
+                           switched.append)
+        self.assertEqual(lane.transcribe(b"audio").text, "first remote")
+        self.assertEqual(lane.transcribe(b"audio").text, "second remote")
+        self.assertEqual(primary.transcribe.call_count, 1)
+        self.assertEqual(fallback.transcribe.call_count, 2)
+        self.assertEqual(switched, ["groq"])
+        self.assertFalse(lane.active_is_local)
 
     def test_local_server_warmup_is_best_effort(self) -> None:
         logs = []
@@ -340,6 +361,16 @@ class SttPipelineTests(unittest.TestCase):
         tr._transcribe_chunk(b"audio", src, margin_db=10.0)
         self.assertEqual(tr.state.snapshot()["transcript"], [])
 
+    def test_mostly_silent_chunk_is_rejected_before_model_publication(self) -> None:
+        tr = self._transcriber(HudConfig(stt_hallucination_filter=True))
+        tr._stt = mock.Mock()
+        tr._stt.transcribe.return_value = STTResult(text="I'm going to the hospital.")
+        src = _Source("You", [])
+        tr._transcribe_chunk(b"audio", src, margin_db=20.0,
+                             speech_activity_ratio=0.10)
+        tr._stt.transcribe.assert_not_called()
+        self.assertEqual(tr.state.snapshot()["transcript"], [])
+
     def test_borderline_final_text_waits_for_neighboring_window(self) -> None:
         tr = self._transcriber(HudConfig(stt_backend="local"))
         outputs = iter([
@@ -365,6 +396,10 @@ class SttPipelineTests(unittest.TestCase):
             "oh oh oh", marginal=True), "repeated_interjection")
         self.assertEqual(hallucination_reason(
             "plausible text", no_speech_prob=0.99), "high_no_speech_probability")
+
+    def test_sound_effect_labels_are_rejected(self) -> None:
+        self.assertTrue(looks_hallucinated("*sad sound*"))
+        self.assertTrue(looks_hallucinated("*crickets*"))
 
     def test_local_partial_worker_keeps_draft_out_of_authoritative_text(self) -> None:
         cfg = HudConfig(stt_backend="local", stt_hallucination_filter=False)
@@ -607,6 +642,8 @@ class HallucinationTests(unittest.TestCase):
         self.assertTrue(looks_hallucinated(
             "I'm going to go to the next slide.", marginal=True,
             speech_activity_ratio=0.08))
+        self.assertTrue(looks_hallucinated(
+            "What is the case?", marginal=False, speech_activity_ratio=0.10))
         self.assertFalse(looks_hallucinated(
             "The rollout starts tomorrow morning for everyone on Monday.", marginal=True,
             speech_activity_ratio=0.08))
@@ -652,6 +689,25 @@ class HallucinationTests(unittest.TestCase):
             ],
         }, "real speech invented speech")
         self.assertEqual(out.text, "The rollout starts tomorrow.")
+
+    def test_local_verbose_payload_keeps_token_and_language_evidence(self) -> None:
+        from hud.stt import _result_from_verbose_payload
+
+        out = _result_from_verbose_payload({
+            "detected_language_probability": 0.91,
+            "segments": [{
+                "text": "The rollout starts tomorrow.",
+                "no_speech_prob": 0.02,
+                "avg_logprob": -0.18,
+                "words": [
+                    {"word": " The", "probability": 0.8},
+                    {"word": " rollout", "probability": 0.9},
+                    {"word": ".", "probability": 0.1},
+                ],
+            }],
+        }, "The rollout starts tomorrow.")
+        self.assertAlmostEqual(out.word_probability or 0, 0.85)
+        self.assertAlmostEqual(out.language_probability or 0, 0.91)
 
     def test_local_verbose_payload_normal_sentence_survives_confidence_gate(self) -> None:
         from hud.stt import _result_from_verbose_payload
@@ -790,6 +846,25 @@ class KBTests(unittest.TestCase):
             hits = index.query("beta", top_k=1)
             self.assertTrue(hits)
             self.assertEqual(hits[0].source, "b.md")
+
+    def test_inspect_sources_reports_exact_selection_freshness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            note = root / "a.md"
+            note.write_text("# Alpha\n\nalpha content\n")
+            cache = Path(tmp) / "cache"
+            before = inspect_sources([str(root)], str(cache))
+            self.assertEqual(before["state"], "needs_index")
+            self.assertTrue(before["needs_index"])
+            self.assertTrue(KBIndex([str(root)], self.KeywordEmbedder(),
+                                    cache_dir=str(cache), log=lambda _m: None).build())
+            ready = inspect_sources([str(root)], str(cache))
+            self.assertEqual(ready["state"], "ready")
+            self.assertFalse(ready["needs_index"])
+            note.write_text("# Alpha\n\nchanged content\n")
+            changed = inspect_sources([str(root)], str(cache))
+            self.assertEqual(changed["state"], "needs_index")
 
     def test_index_uses_cache_on_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1043,17 +1118,45 @@ class IdentityTests(unittest.TestCase):
                 lambda _m: None))
 
     def test_diarization_readiness_is_secret_free_and_reflects_setup(self) -> None:
-        with mock.patch("hud.diarization._whisperx_binary", return_value="/tmp/whisperx"), \
-                mock.patch("hud.diarization._resolve_hf_token", return_value="hf_secret"):
+        with mock.patch("hud.diarization._nemo_binary", return_value="/tmp/nemo"), \
+                mock.patch("hud.diarization._nemo_model_path", return_value="/tmp/model"):
             status = diarization_readiness()
         self.assertTrue(status["ready"])
-        self.assertEqual(status["state"], "ready")
-        self.assertNotIn("hf_secret", json.dumps(status))
+        self.assertEqual(status["state"], "local_ready")
+        self.assertNotIn("hf_secret", json.dumps(status).lower())
 
-        with mock.patch("hud.diarization._whisperx_binary", return_value=None):
+        with mock.patch("hud.diarization._nemo_binary", return_value=None):
             status = diarization_readiness()
         self.assertFalse(status["ready"])
-        self.assertEqual(status["state"], "not_installed")
+        self.assertEqual(status["state"], "local_runtime_missing")
+
+    def test_local_nemo_diarization_does_not_use_hugging_face_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "remote.wav"
+            audio.write_bytes(b"audio")
+            cfg = HudConfig(diarization_enabled=True, diarization_backend="auto")
+            launched = {}
+
+            def fake_run(command, **kwargs):
+                launched["command"] = command
+                launched["env"] = kwargs.get("env", {})
+                out = Path(command[command.index("--output") + 1])
+                out.write_text(json.dumps({
+                    "segments": [{"start": 1.0, "end": 3.0, "speaker": 1}]
+                }), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("hud.diarization._nemo_binary", return_value="/tmp/nemo"), \
+                    mock.patch("hud.diarization._nemo_model_path", return_value="/tmp/model"), \
+                    mock.patch("hud.diarization.subprocess.run", side_effect=fake_run):
+                result = run_post_call_diarization(
+                    audio, [], root / "derived", cfg, lambda _m: None)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["backend"], "nemo")
+            self.assertIn("diarize", launched["command"])
+            self.assertNotIn("HF_TOKEN", launched["env"])
+            self.assertTrue((root / "derived" / "diarization.json").is_file())
 
     def test_post_call_diarization_writes_derived_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1158,6 +1261,384 @@ class IdentityTests(unittest.TestCase):
 
 
 class MemoryAndReplayTests(unittest.TestCase):
+    def test_recorder_rebinds_segments_after_hud_renames_session(self) -> None:
+        from zoom_record import Recorder
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = root / "10-59-57_ab12cd34"
+            new = root / "10-59-57_readable-title_ab12cd34"
+            session_dir = old / ".work" / "session_0001"
+            session_dir.mkdir(parents=True)
+            segment = session_dir / "seg_00000_mic.wav"
+            segment.write_bytes(b"segment")
+            cfg = mock.Mock(outdir=old, workdir=old / ".work")
+            recorder = Recorder(cfg, mock.Mock())
+            recorder.sessions = [session_dir]
+            old.rename(new)
+
+            recorder.rebind_outdir(old, new)
+
+            self.assertEqual(recorder.segments_mic(), [new / ".work" / "session_0001" /
+                                                       "seg_00000_mic.wav"])
+            self.assertEqual(recorder.cfg.workdir, new / ".work")
+
+    def test_recorder_reconciles_segments_from_disk_after_state_loss(self) -> None:
+        from zoom_record import Recorder
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_dir = root / ".work" / "session_0007"
+            session_dir.mkdir(parents=True)
+            segment = session_dir / "seg_00000_mic.wav"
+            segment.write_bytes(b"segment")
+            cfg = mock.Mock(outdir=root, workdir=root / ".work")
+            recorder = Recorder(cfg, mock.Mock())
+            recorder.sessions = []
+
+            recorder.reconcile_sessions(root)
+
+            self.assertEqual(recorder.segments_mic(), [segment])
+
+    def test_recorder_source_state_callback_records_transitions(self) -> None:
+        from zoom_record import Recorder
+
+        recorder = Recorder(mock.Mock(), mock.Mock())
+        updates = []
+        recorder.on_integrity_update = lambda *args: updates.append(args)
+        recorder.set_source_state("system", "awaiting_signal", "waiting", "BlackHole 2ch")
+        recorder.set_source_state("system", "awaiting_signal", "waiting", "BlackHole 2ch")
+        recorder.set_source_state("system", "silent", "no signal", "BlackHole 2ch")
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(updates[-1][0:2], ("system", "silent"))
+
+    def test_monitor_alerts_when_live_loopback_goes_silent(self) -> None:
+        from zoom_record import Candidate, Config, Device, Probe, monitor
+
+        mic_device = Device(0, "Built-in Microphone", "input")
+        system_device = Device(1, "BlackHole 2ch", "input")
+
+        class FakeStop:
+            def __init__(self, loops):
+                self.calls = 0
+                self.loops = loops
+
+            def wait(self, _seconds):
+                self.calls += 1
+                return self.calls > self.loops
+
+        class FakeRecorder:
+            def __init__(self):
+                self.mic = Candidate(mic_device, 50)
+                self.system = Candidate(system_device, 100)
+                self.pcm_source = None
+                self.states = []
+                self.warnings = []
+
+            def is_alive(self):
+                return True
+
+            def set_source_state(self, *args):
+                self.states.append(args)
+
+            def set_system_warning(self, message):
+                self.warnings.append(message)
+
+            def start(self, mic, system, pcm_source=None):
+                self.mic = Candidate(mic, 50) if mic else None
+                self.system = Candidate(system, 100) if system else None
+                self.pcm_source = pcm_source
+
+        cfg = Config(60, 0.0, 2, 999.0, 0.01, -60.0, None, None,
+                     True, False, Path("model"), Path("base"), Path("out"),
+                     Path("work"), "loopback", True)
+        recorder = FakeRecorder()
+        silent = Probe(True, -91.0, -91.0)
+        with mock.patch("zoom_record.load_topology", None), \
+                mock.patch("zoom_record.probe_level", return_value=silent), \
+                mock.patch("zoom_record.critical_alert") as critical:
+            monitor(cfg, recorder, [mic_device, system_device],
+                    [Candidate(mic_device, 50)], [Candidate(system_device, 100)],
+                    FakeStop(2), mock.Mock())
+        self.assertIn(("system", "silent", mock.ANY, "BlackHole 2ch"), recorder.states)
+        self.assertTrue(any("Other-party audio" in message for message in recorder.warnings))
+        critical.assert_called_once()
+
+    def test_monitor_marks_system_unavailable_after_open_failure(self) -> None:
+        from zoom_record import Candidate, Config, Device, Probe, monitor
+
+        mic_device = Device(0, "Built-in Microphone", "input")
+        system_device = Device(1, "BlackHole 2ch", "input")
+
+        class FakeStop:
+            def __init__(self):
+                self.calls = 0
+
+            def wait(self, _seconds):
+                self.calls += 1
+                return self.calls > 1
+
+        class FakeRecorder:
+            def __init__(self):
+                self.mic = Candidate(mic_device, 50)
+                self.system = Candidate(system_device, 100)
+                self.pcm_source = None
+                self.states = []
+
+            def is_alive(self):
+                return True
+
+            def set_source_state(self, *args):
+                self.states.append(args)
+
+            def set_system_warning(self, _message):
+                pass
+
+            def start(self, mic, system, pcm_source=None):
+                self.mic = Candidate(mic, 50) if mic else None
+                self.system = Candidate(system, 100) if system else None
+                self.pcm_source = pcm_source
+
+        cfg = Config(60, 0.0, 2, 999.0, 0.01, -60.0, None, None,
+                     True, False, Path("model"), Path("base"), Path("out"),
+                     Path("work"), "loopback", True)
+        recorder = FakeRecorder()
+        failed = Probe(False, None, None, "open failed")
+        with mock.patch("zoom_record.load_topology", None), \
+                mock.patch("zoom_record.probe_level", return_value=failed):
+            monitor(cfg, recorder, [mic_device, system_device],
+                    [Candidate(mic_device, 50)], [Candidate(system_device, 100)],
+                    FakeStop(), mock.Mock())
+        self.assertIn(("system", "unavailable", mock.ANY, "BlackHole 2ch"), recorder.states)
+        self.assertIsNone(recorder.system)
+
+    def test_monitor_does_not_alert_during_tap_startup_grace(self) -> None:
+        from zoom_record import Candidate, Config, Device, monitor
+
+        mic_device = Device(0, "Built-in Microphone", "input")
+
+        class FakeStop:
+            def __init__(self):
+                self.calls = 0
+
+            def wait(self, _seconds):
+                self.calls += 1
+                return self.calls > 1
+
+        class FakeTap:
+            def stalled_after(self, _seconds):
+                return False
+
+            def running_seconds(self):
+                return 15.0
+
+            def silent_seconds(self):
+                return 15.0
+
+            def name(self):
+                return "System Tap (macOS)"
+
+        class FakeRecorder:
+            def __init__(self):
+                self.mic = Candidate(mic_device, 50)
+                self.system = None
+                self.pcm_source = FakeTap()
+                self.states = []
+                self.warnings = []
+
+            def is_alive(self):
+                return True
+
+            def set_source_state(self, *args):
+                self.states.append(args)
+
+            def set_system_warning(self, message):
+                self.warnings.append(message)
+
+        cfg = Config(60, 0.0, 2, 999.0, 0.01, -60.0, None, None,
+                     True, False, Path("model"), Path("base"), Path("out"),
+                     Path("work"), "tap", True)
+        recorder = FakeRecorder()
+        with mock.patch("zoom_record.load_topology", None), \
+                mock.patch("zoom_record.critical_alert") as critical, \
+                mock.patch("zoom_record.notify_user") as notify:
+            monitor(cfg, recorder, [mic_device], [Candidate(mic_device, 50)], [],
+                    FakeStop(), mock.Mock())
+        self.assertIn(("system", "awaiting_signal", mock.ANY, "System Tap (macOS)"),
+                      recorder.states)
+        self.assertFalse(recorder.warnings)
+        critical.assert_not_called()
+        notify.assert_not_called()
+
+    def test_monitor_alerts_after_tap_startup_grace_when_still_silent(self) -> None:
+        from zoom_record import Candidate, Config, Device, monitor
+
+        mic_device = Device(0, "Built-in Microphone", "input")
+
+        class FakeStop:
+            def __init__(self):
+                self.calls = 0
+
+            def wait(self, _seconds):
+                self.calls += 1
+                return self.calls > 1
+
+        class FakeTap:
+            def stalled_after(self, _seconds):
+                return False
+
+            def running_seconds(self):
+                return 31.0
+
+            def silent_seconds(self):
+                return 11.0
+
+            def name(self):
+                return "System Tap (macOS)"
+
+        class FakeRecorder:
+            def __init__(self):
+                self.mic = Candidate(mic_device, 50)
+                self.system = None
+                self.pcm_source = FakeTap()
+                self.states = []
+                self.warnings = []
+
+            def is_alive(self):
+                return True
+
+            def set_source_state(self, *args):
+                self.states.append(args)
+
+            def set_system_warning(self, message):
+                self.warnings.append(message)
+
+        cfg = Config(60, 0.0, 2, 999.0, 0.01, -60.0, None, None,
+                     True, False, Path("model"), Path("base"), Path("out"),
+                     Path("work"), "tap", True)
+        recorder = FakeRecorder()
+        with mock.patch("zoom_record.load_topology", None), \
+                mock.patch("zoom_record.critical_alert") as critical, \
+                mock.patch("zoom_record.notify_user") as notify:
+            monitor(cfg, recorder, [mic_device], [Candidate(mic_device, 50)], [],
+                    FakeStop(), mock.Mock())
+        self.assertIn(("system", "silent", mock.ANY, "System Tap (macOS)"),
+                      recorder.states)
+        self.assertTrue(any("Other-party audio" in message for message in recorder.warnings))
+        critical.assert_called_once()
+        notify.assert_called_once()
+
+    def test_integrity_report_classifies_silent_source(self) -> None:
+        verification = mock.Mock(
+            duration_s=120.0,
+            expected_duration_s=120.0,
+            mean_db=-91.0,
+            max_db=-91.0,
+            coverage_pct=0.0,
+            long_silences=[(0.0, 120.0)],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segment = root / ".segments" / "session_0001" / "seg_00000_sys.wav"
+            segment.parent.mkdir(parents=True)
+            segment.write_bytes(b"segment")
+            merged = root / "recording_sys.wav"
+            merged.write_bytes(b"merged")
+            entry = source_record(
+                expected=True, segments=[segment], merged=merged,
+                verification=verification, selected_device="BlackHole 2ch",
+                session_root=root,
+            )
+            self.assertEqual(entry["state"], "silent")
+            self.assertEqual(entry["segments"], [".segments/session_0001/seg_00000_sys.wav"])
+
+            report_path = root / "recording_integrity.json"
+            write_report(report_path, {"state": "degraded", "sources": {"system": entry}})
+            saved = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["sources"]["system"]["state"], "silent")
+
+    def test_verification_counts_silence_that_reaches_eof(self) -> None:
+        from zoom_record import Log, verify_recording
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "silent.wav"
+            with wave.open(str(path), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(48000)
+                handle.writeframes(b"\x00\x00" * (48000 * 3))
+            with mock.patch("zoom_record.alert"):
+                result = verify_recording(path, [path], Log(None), "system")
+            self.assertIsNotNone(result)
+            self.assertEqual(result.coverage_pct, 0.0)
+
+    def test_merge_does_not_publish_failed_partial_output(self) -> None:
+        from zoom_record import Log, merge_segments
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / ".work"
+            workdir.mkdir()
+            first = root / "seg_00000_mic.wav"
+            second = root / "seg_00001_mic.wav"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            output = root / "recording_mic.wav"
+            failed = mock.Mock(returncode=1, stderr="ffmpeg failed")
+            with mock.patch("zoom_record.subprocess.run", return_value=failed):
+                self.assertFalse(merge_segments([first, second], output, workdir, Log(None)))
+            self.assertFalse(output.exists())
+            self.assertFalse((root / ".recording_mic.partial.wav").exists())
+
+    def test_merge_gives_ffmpeg_temporary_output_a_wav_suffix(self) -> None:
+        from zoom_record import Log, merge_segments
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir = root / ".work"
+            workdir.mkdir()
+            first = root / "seg_00000_mic.wav"
+            second = root / "seg_00001_mic.wav"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            output = root / "recording_mic.wav"
+
+            def fake_run(command, **_kwargs):
+                temporary = Path(command[-1])
+                self.assertEqual(temporary.name, ".recording_mic.partial.wav")
+                temporary.write_bytes(b"R" * 64)
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch("zoom_record.subprocess.run", side_effect=fake_run):
+                self.assertTrue(merge_segments([first, second], output, workdir, Log(None)))
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.read_bytes(), b"R" * 64)
+
+    def test_recovery_rebuilds_audio_from_disk_without_live_recorder_state(self) -> None:
+        from zoom_record import recover_session_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "2026-09-23" / "10-00-00_recovery"
+            segment_dir = root / ".work" / "session_0001"
+            segment_dir.mkdir(parents=True)
+            segment = segment_dir / "seg_00000_mic.wav"
+            with wave.open(str(segment), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(tone(3.0))
+            (root / "recording_integrity.json").write_text(json.dumps({
+                "expected_sources": {"mic": True, "system": False},
+                "sources": {"mic": {"selected_device": "Built-in Microphone"}},
+            }), encoding="utf-8")
+
+            self.assertEqual(recover_session_audio(root), 0)
+            self.assertTrue((root / "recording_mic.wav").is_file())
+            self.assertTrue((root / ".segments" / "session_0001" / segment.name).is_file())
+            report = json.loads((root / "recording_integrity.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["state"], "recovered")
+            self.assertEqual(report["sources"]["mic"]["state"], "captured")
+
     def test_fixture_lifecycle_keeps_partial_out_of_canonical_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1181,6 +1662,7 @@ class MemoryAndReplayTests(unittest.TestCase):
                 (outdir / "derived" / "live_diagnostics.json").read_text())
             self.assertEqual(diagnostics["meta"]["shutdown_reason"], "requested")
             self.assertIn("stt_stop", diagnostics["meta"]["lifecycle_stages"])
+
 
     def test_fixture_lifecycle_failure_injection_preserves_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1494,6 +1976,34 @@ class MemoryAndReplayTests(unittest.TestCase):
         self.assertEqual(state.latest_id(), 0)
 
 
+class ResourceTests(unittest.TestCase):
+    def test_resource_parsers_and_process_tree(self) -> None:
+        self.assertEqual(parse_free_percent("System-wide memory free percentage: 18%"), 18.0)
+        self.assertEqual(parse_swap_used_mb("total = 8G used = 2.5G free = 5.5G"), 2560.0)
+        rows = parse_process_rows("  10 1 1024 /python\n  11 10 2048 whisper-server")
+        self.assertEqual(process_tree_memory(rows, 10), (3.0, 2.0))
+
+    def test_resource_warning_is_actionable(self) -> None:
+        warning = warning_for(ResourceSnapshot(free_percent=8, swap_used_mb=3072,
+                                               pressure="critical"))
+        self.assertIn("CRITICAL", warning)
+        self.assertIn("Close unused browsers", warning)
+        self.assertEqual(warning_for(ResourceSnapshot(free_percent=55, swap_used_mb=0)), "")
+
+    def test_resource_monitor_publishes_without_event_storm_metrics(self) -> None:
+        state = LiveState()
+        snapshot = ResourceSnapshot(free_percent=12, swap_used_mb=2500,
+                                    process_rss_mb=512, whisper_rss_mb=384,
+                                    physical_memory_mb=24576, pressure="warning",
+                                    checked_at=123.0)
+        monitor = ResourceMonitor(state, lambda _m: None, sampler=lambda: snapshot)
+        monitor.sample()
+        meta = state.snapshot()["meta"]
+        self.assertEqual(meta["resource_memory_free_percent"], 12.0)
+        self.assertIn("resource_warning", meta)
+        self.assertEqual(state.metrics()["resource_whisper_rss_mb"]["p50"], 384.0)
+
+
 class TranscriptWritebackTests(unittest.TestCase):
     def test_mirrors_transcript_events_and_drains_on_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1575,6 +2085,12 @@ class BudgetTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_local_turbo_is_default_with_remote_stt_fallback(self) -> None:
+        cfg = config_from_dict({})
+        self.assertEqual(cfg.stt_backend, "local")
+        self.assertEqual(cfg.stt_fallbacks, ["groq"])
+        self.assertTrue(cfg.stt_context_correction_enabled)
+
     def test_file_load_and_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -2234,6 +2750,28 @@ class AnswerEngineTests(unittest.TestCase):
         }])
         return engine
 
+    def test_auto_embeddings_never_probe_ollama(self) -> None:
+        engine = AnswerEngine(LiveState(), lambda _m: None,
+                              HudConfig(kb_embed_backend="auto"))
+        with mock.patch("hud.kb.LocalEmbedder", side_effect=ImportError("not installed")), \
+                mock.patch("hud.answers.get_provider", side_effect=AssertionError(
+                    "auto embedding must not select a remote provider")):
+            embedder = engine._build_embedder()
+        self.assertEqual(embedder.label, "hashing-384")
+
+    def test_contextual_asr_candidate_is_available_to_answers_but_not_transcript(self) -> None:
+        state = LiveState()
+        state.add("transcript", text="the rollout is next week", source="live",
+                  speaker="Client", speaker_id="remote", finalized=True)
+        state.add("transcript_context", text="the rollout is next weak", source="local_context",
+                  source_key="remote", speaker="Client", speaker_id="remote",
+                  published_at=time.time())
+        engine = self._engine(state, HudConfig(answers_backend="groq", rolling_enabled=False,
+                                                kb_enabled=False))
+        engine._drain_events()
+        self.assertIn("next weak", engine._answer_context_text())
+        self.assertNotIn("next weak", state.transcript_text())
+
     def test_json_mode_400_falls_back_to_plain_text(self) -> None:
         cfg = HudConfig(answers_backend="groq", rolling_enabled=False,
                         kb_enabled=False, question_rewrite=False)
@@ -2654,17 +3192,27 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("window.setMovableByWindowBackground_(False)", source)
         self.assertIn("setIgnoresMouseEvents_", source)
         self.assertIn("hudRegions", source)
+        self.assertIn("bounds.size.height - y - height", source)
 
     def test_glass_hud_has_independent_arrangeable_modules(self) -> None:
         source = Path("hud/static/hud.html").read_text(encoding="utf-8")
-        for module in ("transcript", "suggestions", "answers"):
+        for module in ("transcript", "suggestions", "answers", "ask"):
             self.assertIn('data-module="{}"'.format(module), source)
             self.assertIn('data-drag-handle="{}"'.format(module), source)
         self.assertIn('id="arrangeBtn"', source)
+        self.assertIn('id="interactionBtn"', source)
         self.assertIn('id="askInput"', source)
         self.assertIn('class="askbar hud-interactive"', source)
         self.assertIn("sendInteractiveRegions", source)
+        self.assertIn('id="windowDragHandle"', source)
+        for gesture in ("nw", "ne", "sw", "se"):
+            self.assertIn('data-window-gesture="{}"'.format(gesture), source)
+        self.assertIn("sendWindowGesture", source)
         self.assertIn("localStorage", source)
+
+        native = Path("hud/native_window.py").read_text(encoding="utf-8")
+        self.assertIn("def _handle_window_gesture", native)
+        self.assertIn("setFrame_display_", native)
 
 
 class DevicesTests(unittest.TestCase):
@@ -2777,6 +3325,21 @@ class DevicesTests(unittest.TestCase):
             session._publish_devices()
             self.assertIn("microphone only",
                           session.state.meta["system_audio_warning"])
+
+    def test_hud_publishes_audio_route_context(self) -> None:
+        from hud.session import LiveSession
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = LiveSession(HudConfig(), Path(tmp), lambda _m: None,
+                                  "Mic", "BlackHole 2ch")
+            session.set_audio_route_context({
+                "capture_backend": "loopback",
+                "physical_output": "External Headphones",
+                "application_route_verified": False,
+            })
+            self.assertEqual(session.state.meta["audio_route"]["capture_backend"],
+                             "loopback")
+            self.assertFalse(session.state.meta["audio_route"]["application_route_verified"])
 
 
 class WavTests(unittest.TestCase):
@@ -2912,15 +3475,96 @@ class RoutingFixTests(unittest.TestCase):
             path.write_text("not json", encoding="utf-8")
             self.assertEqual(load_state(path), {})
 
+    def test_route_session_marker_roundtrip(self) -> None:
+        from hud.routing_fix import (clear_route_session, load_route_session,
+                                     save_route_session)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "routing-session.json"
+            self.assertEqual(load_route_session(path), {})
+            save_route_session("tap", path)
+            marker = load_route_session(path)
+            self.assertEqual(marker["mode"], "tap")
+            self.assertEqual(marker["multi_output_name"],
+                             "zoom-recorder Multi-Output")
+            self.assertEqual(marker["pid"], os.getpid())
+            clear_route_session(path)
+            self.assertEqual(load_route_session(path), {})
+
+    def test_begin_tap_route_restores_existing_managed_output(self) -> None:
+        from hud import routing_fix
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "routing-session.json"
+            restored = routing_fix.FixResult(True, True,
+                                             "Default output -> 'External Headphones'")
+            with mock.patch.object(routing_fix, "deactivate_loopback",
+                                   return_value=restored) as deactivate:
+                result = routing_fix.begin_route_session(
+                    "tap", self._topology([
+                        {"name": routing_fix.MULTI_OUTPUT_NAME,
+                         "transport": "aggregate", "output_channels": 2,
+                         "default_output": True},
+                        {"name": "External Headphones", "transport": "builtin",
+                         "output_channels": 2},
+                    ]), path)
+            self.assertTrue(result.ok)
+            self.assertTrue(result.changed)
+            deactivate.assert_called_once()
+            self.assertEqual(routing_fix.load_route_session(path)["mode"], "tap")
+
+    def test_recover_route_session_cleans_stale_marker(self) -> None:
+        from hud import routing_fix
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "routing-session.json"
+            path.write_text(json.dumps({"pid": 999999, "mode": "loopback"}),
+                            encoding="utf-8")
+            restored = routing_fix.FixResult(True, True,
+                                             "Default output -> 'External Headphones'")
+            with mock.patch.object(routing_fix, "end_route_session",
+                                   return_value=restored) as end:
+                result = routing_fix.recover_route_session(self._broken_topo(), path)
+            self.assertTrue(result.ok)
+            self.assertTrue(result.changed)
+            end.assert_called_once()
+
+    def test_recover_route_session_does_not_touch_live_marker(self) -> None:
+        from hud import routing_fix
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "routing-session.json"
+            routing_fix.save_route_session("tap", path)
+            result = routing_fix.recover_route_session(self._broken_topo(), path)
+            self.assertTrue(result.ok)
+            self.assertFalse(result.changed)
+            self.assertTrue(path.exists())
+
     def test_choose_physical_output_prefers_stored_and_falls_back(self) -> None:
         from hud.routing_fix import choose_physical_output
 
         topo = self._broken_topo()
-        # Stored preference wins over the ranked choice.
+        # A currently selected physical output wins over a stale pairing.
         self.assertEqual(
             choose_physical_output(topo, None,
                                    {"physical_name": "MacBook Air Speakers"}).name,
-            "MacBook Air Speakers")
+            "External Headphones")
+        # A newly available headset wins over a lower-priority remembered
+        # output when the managed aggregate is the current default. This is
+        # the safety case where headphones were plugged in after a prior
+        # speaker pairing was saved.
+        managed = self._topology([
+            {"name": "zoom-recorder Multi-Output", "transport": "aggregate",
+             "output_channels": 2, "default_output": True},
+            {"name": "External Headphones", "transport": "builtin",
+             "output_channels": 2},
+            {"name": "MacBook Air Speakers", "transport": "builtin",
+             "output_channels": 2},
+        ])
+        self.assertEqual(
+            choose_physical_output(managed, None,
+                                   {"physical_name": "MacBook Air Speakers"}).name,
+            "External Headphones")
         # Stored device unplugged -> best available (preference not deleted).
         self.assertEqual(
             choose_physical_output(topo, None,
@@ -2931,6 +3575,29 @@ class RoutingFixTests(unittest.TestCase):
             choose_physical_output(topo, "MacBook Air Speakers",
                                    {"physical_name": "External Headphones"}).name,
             "MacBook Air Speakers")
+
+    def test_route_snapshot_records_pairing_without_claiming_app_route(self) -> None:
+        from hud import routing_fix
+
+        topo = self._topology([
+            {"name": routing_fix.MULTI_OUTPUT_NAME, "transport": "aggregate",
+             "output_channels": 2, "default_output": True},
+            {"name": "External Headphones", "transport": "builtin",
+             "output_channels": 2},
+        ])
+        state = {
+            "multi_output_name": routing_fix.MULTI_OUTPUT_NAME,
+            "loopback_uid": "blackhole-uid",
+            "loopback_name": "BlackHole 2ch",
+            "physical_uid": "headphones-uid",
+            "physical_name": "External Headphones",
+        }
+        with mock.patch.object(routing_fix, "load_state", return_value=state):
+            snapshot = routing_fix.route_snapshot(topo, "BlackHole 2ch")
+        self.assertEqual(snapshot["managed_output"], routing_fix.MULTI_OUTPUT_NAME)
+        self.assertEqual(snapshot["physical_output"], "External Headphones")
+        self.assertEqual(snapshot["loopback_name"], "BlackHole 2ch")
+        self.assertFalse(snapshot["application_route_verified"])
 
     def test_fix_routing_rebuilds_when_state_mismatches(self) -> None:
         from hud import routing_fix
@@ -3091,14 +3758,18 @@ class SystemTapTests(unittest.TestCase):
         self.assertEqual(resolve_system_capture(self._args(capture="loopback")),
                          "loopback")
 
-    def test_resolve_system_capture_is_loopback_by_default(self) -> None:
+    def test_resolve_system_capture_uses_authorized_tap_automatically(self) -> None:
         import zoom_record as zr
+        import hud.system_tap as st
 
-        # Auto is loopback: the tap is strictly opt-in so a shared install
-        # never touches the audio-capture permission path by surprise.
-        self.assertEqual(zr.resolve_system_capture(self._args()), "loopback")
-        self.assertEqual(zr.resolve_system_capture(
-            self._args(capture="auto", system="BlackHole 2ch")), "loopback")
+        with mock.patch.object(st, "usable_in_this_context", return_value=True):
+            self.assertEqual(zr.resolve_system_capture(self._args()), "tap")
+        with mock.patch.object(st, "usable_in_this_context", return_value=False):
+            self.assertEqual(zr.resolve_system_capture(self._args()), "loopback")
+        # A pinned loopback device always wins over auto tap selection.
+        with mock.patch.object(st, "usable_in_this_context", return_value=True):
+            self.assertEqual(zr.resolve_system_capture(
+                self._args(capture="auto", system="BlackHole 2ch")), "loopback")
         self.assertEqual(zr.resolve_system_capture(self._args(capture="loopback")),
                          "loopback")
         self.assertEqual(zr.resolve_system_capture(self._args(capture="tap")), "tap")
@@ -3184,6 +3855,37 @@ class SystemTapTests(unittest.TestCase):
             self.assertTrue(available())
         with mock.patch.object(_platform_module(), "mac_ver", return_value=("13.6.0", "", "")):
             self.assertFalse(available())
+
+    def test_tap_uses_unique_aggregate_identity(self) -> None:
+        from hud.system_tap import SystemTap
+
+        self.assertNotEqual(SystemTap()._aggregate_uid, SystemTap()._aggregate_uid)
+
+    def test_tap_probe_reports_start_failure_without_traceback(self) -> None:
+        import hud.system_tap as st
+
+        messages = []
+
+        class BrokenTap:
+            def __init__(self, log=None):
+                self.stopped = False
+
+            def start(self):
+                raise st.TapError("synthetic tap start failure")
+
+            def stop(self):
+                self.stopped = True
+
+        with mock.patch.object(st, "SystemTap", BrokenTap):
+            self.assertFalse(st.system_tap_self_test(0.1, log=messages.append))
+        self.assertTrue(any("synthetic tap start failure" in item for item in messages))
+
+    def test_tap_feeder_noops_when_shutdown_clears_pipe_before_thread_runs(self) -> None:
+        from hud.system_tap import SystemTap
+
+        tap = SystemTap()
+        tap.write_fd = None
+        tap._feeder_loop()
 
     def test_available_on_non_darwin(self) -> None:
         from hud.system_tap import available
@@ -3502,6 +4204,111 @@ class ControlCenterTests(unittest.TestCase):
             cfg = load_config(Path(tmp) / "config.json")
             self.assertEqual(cfg.recorder.mode, "mic")
             self.assertTrue(cfg.offline)
+
+    def test_control_center_opens_native_main_app_host(self) -> None:
+        from hud.control import ControlApp
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("hud.control.subprocess.Popen") as popen, \
+                mock.patch("hud.control.time.sleep"), \
+                mock.patch("hud.control.webbrowser.open") as browser:
+            popen.return_value.poll.return_value = None
+            app = ControlApp(config_path=Path(tmp) / "config.json", markers=False,
+                             open_browser=False)
+            app.port = 43123
+            app.open()
+            command = popen.call_args.args[0]
+            self.assertTrue(command[1].endswith("hud/native_window.py"))
+            self.assertIn("--exit-on-close", command)
+            self.assertIn("zoom-recorder — Main App", command)
+            browser.assert_not_called()
+        self.assertIn("Open Main App", Path("menubar.py").read_text(encoding="utf-8"))
+
+    def test_persistent_workspace_api_loads_and_saves_revision(self) -> None:
+        import urllib.parse
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "recordings"
+            session = root / "2026-09-23" / "10-00-00_demo_a1b2c3d4"
+            (session / "derived").mkdir(parents=True)
+            (session / "session.json").write_text(json.dumps({
+                "title": "Demo meeting", "started_at": "2026-09-23T10:00:00"
+            }), encoding="utf-8")
+            (session / "derived" / "live_transcript.txt").write_text(
+                "[10:00:02] You: hello\n", encoding="utf-8")
+            app, port = self._server(tmp)
+            config_body = json.dumps({"config": {"recorder": {"basedir": str(root)}}}).encode()
+            config_req = urllib.request.Request(
+                "http://127.0.0.1:{}/api/config?token={}".format(port, app.token),
+                method="POST", data=config_body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(config_req, timeout=5) as response:
+                self.assertTrue(json.loads(response.read())["ok"])
+            query = urllib.parse.urlencode({"token": app.token, "path": str(session)})
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:{}/api/session?{}".format(port, query), timeout=5) as response:
+                loaded = json.loads(response.read())
+            self.assertEqual(loaded["workspace"]["segments"][0]["text"], "hello")
+            changed = dict(loaded["workspace"]["segments"][0])
+            changed["text"] = "hello again"
+            save_body = json.dumps({
+                "path": str(session), "expected_revision": 0,
+                "speakers": loaded["workspace"]["speakers"], "segments": [changed],
+            }).encode()
+            save_req = urllib.request.Request(
+                "http://127.0.0.1:{}/api/session/save?token={}".format(port, app.token),
+                method="POST", data=save_body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(save_req, timeout=5) as response:
+                saved = json.loads(response.read())
+            self.assertTrue(saved["ok"])
+            self.assertEqual(saved["revision"], 1)
+            self.assertEqual(json.loads((session / "derived" / "transcript_workspace.json").read_text())["revision"], 1)
+
+    def test_persistent_workspace_media_rejects_paths_outside_recordings(self) -> None:
+        import urllib.parse
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "recordings"
+            root.mkdir()
+            app, port = self._server(tmp)
+            query = urllib.parse.urlencode({"token": app.token, "path": str(Path.home() / "secret.wav")})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen("http://127.0.0.1:{}/api/media?{}".format(port, query), timeout=5)
+            self.assertEqual(caught.exception.code, 403)
+
+    def test_persistent_workspace_media_supports_browser_ranges(self) -> None:
+        import urllib.parse
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "recordings"
+            session = root / "2026-09-23" / "10-00-00_demo_a1b2c3d4"
+            session.mkdir(parents=True)
+            wav_path = session / "recording_mic.wav"
+            with wave.open(str(wav_path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(16000)
+                stream.writeframes(b"\x00\x00" * 1600)
+            app, port = self._server(tmp)
+            config_body = json.dumps({"config": {"recorder": {"basedir": str(root)}}}).encode()
+            config_req = urllib.request.Request(
+                "http://127.0.0.1:{}/api/config?token={}".format(port, app.token),
+                method="POST", data=config_body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(config_req, timeout=5):
+                pass
+            query = urllib.parse.urlencode({"token": app.token, "path": str(wav_path)})
+            request = urllib.request.Request(
+                "http://127.0.0.1:{}/api/media?{}".format(port, query),
+                headers={"Range": "bytes=0-31"})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.headers.get("Accept-Ranges"), "bytes")
+                self.assertEqual(len(response.read()), 32)
 
     def test_login_agent_uses_nondestructive_modes(self) -> None:
         """Regression: a full install would bootout the agent and kill the
@@ -3846,6 +4653,79 @@ class AuditHardeningTests(unittest.TestCase):
                 items = recordings.list_recordings(tmp)
             probe.assert_not_called()
             self.assertEqual(items[0].duration_s, 42.0)
+
+    def test_workspace_bootstraps_real_transcript_without_mutating_source(self) -> None:
+        from hud.workspace import load_session, resolve_session
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-09-23" / "10-00-00_demo_a1b2c3d4"
+            (session / "derived").mkdir(parents=True)
+            (session / "session.json").write_text(json.dumps({
+                "title": "Demo", "started_at": "2026-09-23T10:00:00"
+            }), encoding="utf-8")
+            source = session / "derived" / "live_transcript.txt"
+            source.write_text("[10:00:02] You: hello\n[10:00:05] Others: hi\n", encoding="utf-8")
+            result = load_session(session)
+            self.assertEqual(len(result["workspace"]["segments"]), 2)
+            self.assertEqual(result["workspace"]["segments"][0]["speaker_id"], "local")
+            self.assertEqual(result["workspace"]["segments"][1]["speaker_id"], "others")
+            self.assertIsNotNone(resolve_session(str(session), str(root)))
+            self.assertEqual(source.read_text(encoding="utf-8"),
+                             "[10:00:02] You: hello\n[10:00:05] Others: hi\n")
+
+    def test_workspace_edits_are_revisioned_and_conflict_safe(self) -> None:
+        from hud.workspace import (load_session, restore_workspace_revision,
+                                   save_workspace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-09-23" / "10-00-00_demo_a1b2c3d4"
+            (session / "derived").mkdir(parents=True)
+            (session / "derived" / "live_transcript.txt").write_text(
+                "[10:00:02] You: hello\n", encoding="utf-8")
+            state = load_session(session)["workspace"]
+            segment = dict(state["segments"][0])
+            segment["text"] = "corrected hello"
+            segment["text_source"] = "user"
+            saved = save_workspace(session, {
+                "expected_revision": 0, "segments": [segment], "speakers": state["speakers"]})
+            self.assertTrue(saved["ok"])
+            self.assertEqual(saved["revision"], 1)
+            self.assertEqual(load_session(session)["workspace"]["segments"][0]["text"],
+                             "corrected hello")
+            conflict = save_workspace(session, {
+                "expected_revision": 0, "segments": [segment], "speakers": state["speakers"]})
+            self.assertFalse(conflict["ok"])
+            self.assertTrue(conflict["conflict"])
+            undone = restore_workspace_revision(session, 0, expected_revision=1)
+            self.assertTrue(undone["ok"])
+            self.assertEqual(undone["workspace"]["revision"], 2)
+            self.assertEqual(undone["workspace"]["segments"][0]["text"], "hello")
+
+    def test_workspace_export_is_derived_and_never_replaces_raw_transcript(self) -> None:
+        from hud.workspace import export_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-09-23" / "10-00-00_demo_a1b2c3d4"
+            (session / "derived").mkdir(parents=True)
+            raw = session / "derived" / "live_transcript.txt"
+            raw.write_text("[10:00:02] You: original\n", encoding="utf-8")
+            result = export_workspace(session, "markdown")
+            self.assertTrue(result["ok"])
+            self.assertTrue(Path(result["path"]).is_file())
+            self.assertEqual(raw.read_text(encoding="utf-8"), "[10:00:02] You: original\n")
+
+    def test_workspace_media_path_cannot_escape_session(self) -> None:
+        from hud.workspace import resolve_session
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "2026-09-23" / "10-00-00_demo_a1b2c3d4"
+            session.mkdir(parents=True)
+            self.assertIsNone(resolve_session(str(root / "outside"), str(root)))
+            self.assertIsNone(resolve_session(str(Path.home()), str(root)))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import json
+import os
 import re
 import sys
 import time
@@ -47,6 +48,11 @@ MULTI_OUTPUT_NAME = "zoom-recorder Multi-Output"
 # Where the last successful pairing is remembered (so rebuilds track the
 # device you actually listen on instead of re-guessing).
 STATE_PATH = Path.home() / ".zoom_recorder_routing.json"
+
+# A short-lived marker proving that this process may have changed the default
+# output. If the process is killed or the Mac sleeps during teardown, the next
+# launch can restore a physical output before starting another recording.
+ROUTING_SESSION_PATH = Path.home() / ".zoom_recorder_routing_session.json"
 
 # Real output devices, best first (this is what plays to your ears).
 PHYSICAL_OUTPUT_PRIORITY = [
@@ -441,6 +447,50 @@ def save_state(loopback_uid: str, loopback_name: str,
         pass  # preference is a nicety; the routing itself is already applied
 
 
+def load_route_session(path: Path = ROUTING_SESSION_PATH) -> Dict[str, object]:
+    """Load the crash-recovery marker for the current routing session."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_route_session(mode: str, path: Path = ROUTING_SESSION_PATH) -> None:
+    """Write a marker before any recording-owned route transition."""
+    data = {
+        "schema_version": 1,
+        "pid": os.getpid(),
+        "mode": mode,
+        "multi_output_name": MULTI_OUTPUT_NAME,
+        "started_at": time.time(),
+    }
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_route_session(path: Path = ROUTING_SESSION_PATH) -> None:
+    """Remove a completed routing-session marker."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def decide_action(state: Dict[str, str], existing_name: Optional[str],
                   loop_uid: str, phys_uid: str) -> str:
     """Return "reuse" when the existing multi-output is known-good, else "rebuild".
@@ -471,10 +521,14 @@ def choose_physical_output(topo: Topology,
                            state: Optional[Dict[str, str]] = None) -> Optional[AudioDevice]:
     """Pick the real (non-virtual) output device to pair with the loopback.
 
-    Priority: explicit --output override > remembered preference (when that
-    device is still present) > ranked choice. When the remembered device is
-    unplugged we fall back to the best available so sound always works, but
-    the preference stays stored so it wins again the moment it reappears.
+    Priority: explicit output override > the current real system output > a
+    remembered preference > ranked choice.  The current real output must win
+    over a stale remembered pairing: otherwise plugging in headphones can
+    leave the recorder's Multi-Output device pointed at speakers that are no
+    longer in use, while the call application sends audio directly to the
+    headphones.  A remembered preference is still useful when the managed
+    Multi-Output device is already the system default and macOS does not expose
+    its physical member in the topology snapshot.
     """
     options = real_outputs(topo)
     if override:
@@ -484,11 +538,57 @@ def choose_physical_output(topo: Topology,
         return None
     if not options:
         return None
+    current = topo.device(topo.default_output)
+    if current is not None and current in options:
+        return current
     if state:
         for dev in options:
             if dev.name == state.get("physical_name"):
+                # A managed aggregate can remain the default after a user
+                # plugs in headphones. CoreAudio may then report only the
+                # aggregate, so trusting a stale speaker pairing can leak
+                # call audio through the built-in speakers. Prefer a newly
+                # available headset/headphone; an explicit override above
+                # remains authoritative.
+                if (physical_output_priority(dev.name) < 60 and
+                        any(physical_output_priority(candidate.name) >= 60
+                            for candidate in options)):
+                    return next(candidate for candidate in options
+                                if physical_output_priority(candidate.name) >= 60)
                 return dev
     return options[0]
+
+
+def route_snapshot(topo: Optional[Topology] = None,
+                   selected_system: Optional[str] = None,
+                   capture_backend: str = "loopback") -> Dict[str, object]:
+    """Return auditable routing facts for a recording-integrity report.
+
+    CoreAudio does not reliably expose the member list of an existing stacked
+    device through the same topology query used for defaults.  The recorder
+    therefore reports both the live topology and the persisted pairing used to
+    create the managed device.  This is intentionally evidence, not a claim
+    that the call application selected the managed output; that distinction is
+    surfaced as ``application_route_verified: false`` until a live signal is
+    observed.
+    """
+    topo = topo or read_system_profiler()
+    state = load_state()
+    current = topo.device(topo.default_output)
+    physical = state.get("physical_name") or None
+    if current is not None and current.name != MULTI_OUTPUT_NAME and current.output_channels:
+        physical = current.name
+    return {
+        "capture_backend": capture_backend,
+        "default_output": topo.default_output,
+        "managed_output": MULTI_OUTPUT_NAME if topo.device(MULTI_OUTPUT_NAME) else None,
+        "loopback_name": state.get("loopback_name") or selected_system,
+        "loopback_uid": state.get("loopback_uid"),
+        "physical_output": physical,
+        "physical_output_uid": state.get("physical_uid"),
+        "paired_output": state.get("physical_name"),
+        "application_route_verified": False,
+    }
 
 
 def needs_fix(topo: Topology) -> bool:
@@ -712,6 +812,65 @@ def deactivate_loopback(topo: Optional[Topology] = None) -> FixResult:
         return FixResult(False, False, str(exc))
     return FixResult(True, True, "Default output -> '{}' (loopback device kept)."
                      .format(physical.name))
+
+
+def begin_route_session(mode: str, topo: Optional[Topology] = None,
+                        path: Path = ROUTING_SESSION_PATH) -> FixResult:
+    """Prepare recording-owned routing and record a crash-recovery marker.
+
+    Loopback mode changes the default output later during its normal setup.
+    Tap mode does not need that route at all, so if an old tool-owned
+    Multi-Output is still active, put the Mac back on a physical output before
+    the tap starts. This keeps volume keys and ordinary playback behavior
+    normal outside the loopback capture window.
+    """
+    if mode not in {"tap", "loopback"}:
+        return FixResult(False, False, "Unknown routing session mode: {}".format(mode))
+    topo = topo or read_system_profiler()
+    save_route_session(mode, path)
+    if mode == "tap" and is_loopback_active(topo):
+        result = deactivate_loopback(topo)
+        if not result.ok:
+            return result
+        return FixResult(True, True,
+                         "Tap mode restored the physical output: {}".format(result.message))
+    return FixResult(True, False, "Routing session started in {} mode.".format(mode))
+
+
+def end_route_session(topo: Optional[Topology] = None,
+                      path: Path = ROUTING_SESSION_PATH) -> FixResult:
+    """Restore a physical output and clear the recording route marker."""
+    marker = load_route_session(path)
+    if not marker:
+        return FixResult(True, False, "No active routing session.")
+    topo = topo or read_system_profiler()
+    if is_loopback_active(topo):
+        result = deactivate_loopback(topo)
+        if not result.ok:
+            return result
+        clear_route_session(path)
+        return FixResult(True, True, result.message)
+    clear_route_session(path)
+    return FixResult(True, False, "Physical output already active; routing session cleared.")
+
+
+def recover_route_session(topo: Optional[Topology] = None,
+                          path: Path = ROUTING_SESSION_PATH) -> FixResult:
+    """Repair a route marker left by a process that did not reach teardown."""
+    marker = load_route_session(path)
+    if not marker:
+        return FixResult(True, False, "No stale routing session found.")
+    try:
+        pid = int(marker.get("pid", 0))
+    except (TypeError, ValueError):
+        pid = 0
+    if _process_is_alive(pid):
+        return FixResult(True, False, "Another routing session is still active.")
+    result = end_route_session(topo, path)
+    if result.ok:
+        return FixResult(True, result.changed,
+                         "Recovered stale routing session: {}".format(result.message))
+    return result
 
 
 def list_real_outputs(topo: Optional[Topology] = None) -> List[str]:

@@ -47,6 +47,7 @@ import platform
 import struct
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, List, Optional
@@ -209,6 +210,11 @@ class SystemTap:
         self.log = log or (lambda _msg: None)
         self._tap_id: Optional[int] = None
         self._agg_id: Optional[int] = None
+        # Private aggregate devices are normally destroyed with the process,
+        # but Core Audio can retain a stale object briefly after a failed
+        # start.  A per-session UID prevents one failed attempt from blocking
+        # the next recording.
+        self._aggregate_uid = "{}-{}".format(AGGREGATE_UID, uuid.uuid4())
         self._ioproc_id: Optional[int] = None
         self._io = None
         self.read_fd: Optional[int] = None
@@ -264,7 +270,7 @@ class SystemTap:
 
         agg_id = ctypes.c_uint32(0)
         err = ca.AudioHardwareCreateAggregateDevice(
-            self._aggregate_desc(tap_uuid), ctypes.byref(agg_id))
+            self._aggregate_desc(tap_uuid, self._aggregate_uid), ctypes.byref(agg_id))
         if err != 0:
             self._destroy_tap()
             raise TapError("AudioHardwareCreateAggregateDevice failed: {}".format(err))
@@ -332,17 +338,23 @@ class SystemTap:
 
     # -- plumbing ----------------------------------------------------------
     @staticmethod
-    def _aggregate_desc(tap_uuid: str):
+    def _aggregate_desc(tap_uuid: str, aggregate_uid: str = AGGREGATE_UID):
         helpers = backend()
         cf, c_void_p = helpers.cf, ctypes.c_void_p
         KDK = c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
         KDV = c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
         KAC = c_void_p.in_dll(cf, "kCFTypeArrayCallBacks")
-        true = c_void_p.in_dll(cf, "kCFBooleanTrue")
+        # Core Audio's aggregate-device composition keys are documented as
+        # CFNumber values, not CFBoolean values.  Some macOS releases accept
+        # kCFBooleanTrue here, but newer releases reject the whole descriptor
+        # with the opaque four-character status ``nope``.  Keep the value
+        # type aligned with AudioHardware.h for reliable tap creation.
+        one = ctypes.c_int32(1)
+        true = cf.CFNumberCreate(None, 9, ctypes.byref(one))
 
         adesc = cf.CFDictionaryCreateMutable(None, 0, KDK, KDV)
         cf.CFDictionarySetValue(adesc, helpers.cfstr("name"), helpers.cfstr(TAP_NAME))
-        cf.CFDictionarySetValue(adesc, helpers.cfstr("uid"), helpers.cfstr(AGGREGATE_UID))
+        cf.CFDictionarySetValue(adesc, helpers.cfstr("uid"), helpers.cfstr(aggregate_uid))
         cf.CFDictionarySetValue(adesc, helpers.cfstr("private"), true)
         taps = cf.CFArrayCreateMutable(None, 0, KAC)
         entry = cf.CFDictionaryCreateMutable(None, 0, KDK, KDV)
@@ -350,7 +362,12 @@ class SystemTap:
         cf.CFDictionarySetValue(entry, helpers.cfstr("drift"), true)
         cf.CFArrayAppendValue(taps, entry)
         cf.CFDictionarySetValue(adesc, helpers.cfstr("taps"), taps)
-        num = cf.CFNumberCreate(None, 9, ctypes.byref(ctypes.c_int32(1)))
+        # Start the aggregate explicitly after its IO proc is installed.
+        # Apple's sample and Chromium's production implementation both use
+        # auto-start=false; asking Core Audio to wait for first tap audio while
+        # creating a tap-only aggregate is rejected on some macOS 15 builds.
+        zero = ctypes.c_int32(0)
+        num = cf.CFNumberCreate(None, 9, ctypes.byref(zero))
         cf.CFDictionarySetValue(adesc, helpers.cfstr("tapautostart"), num)
         return adesc
 
@@ -366,7 +383,17 @@ class SystemTap:
                 self.bytes_dropped += 1
 
     def _feeder_loop(self) -> None:
-        os.set_blocking(self.write_fd, False)
+        # Keep a private fd reference for the whole feeder lifetime. stop()
+        # may tear down the tap after its bounded join while this thread is
+        # still draining; reading self.write_fd after _destroy_all() used to
+        # turn that normal shutdown race into os.write(None).
+        write_fd = self.write_fd
+        if write_fd is None:
+            return
+        try:
+            os.set_blocking(write_fd, False)
+        except OSError:
+            return
         pending = bytearray()
         running = True
         while running or pending:
@@ -390,20 +417,21 @@ class SystemTap:
                 chunk = pending[:65536]
                 self._track_level(bytes(chunk))
                 try:
-                    written = os.write(self.write_fd, chunk)
+                    written = os.write(write_fd, chunk)
                     del pending[:written]
                 except OSError as exc:
-                    if exc.errno == errno.EPIPE:
+                    if exc.errno in (errno.EPIPE, errno.EBADF):
                         return  # reader gone (ffmpeg exited); stop feeding
                     if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                         raise
                     time.sleep(0.02)  # pipe full: let the reader drain
                     break
         try:
-            os.close(self.write_fd)
+            os.close(write_fd)
         except OSError:
             pass
-        self.write_fd = None
+        if self.write_fd == write_fd:
+            self.write_fd = None
 
     def _track_level(self, chunk: bytes) -> None:
         """Feeder-thread level accounting: peaks of float32 PCM."""
@@ -505,9 +533,9 @@ def system_tap_self_test(probe_seconds: float = 4.0,
     import tempfile
 
     tap = SystemTap(log=say)
-    tap.start()
     tmpdir = tempfile.mkdtemp(prefix="zoomrec_tap_")
     try:
+        tap.start()
         tmp = os.path.join(tmpdir, "tone.wav")
         subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                         "-f", "lavfi",
