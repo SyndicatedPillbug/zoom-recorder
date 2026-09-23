@@ -1588,6 +1588,10 @@ class ConfigTests(unittest.TestCase):
             cfg = load_config(path)
             self.assertEqual(cfg.answers_backend, "groq")
 
+    def test_glass_opacity_has_readability_floor(self) -> None:
+        cfg = config_from_dict({"hud": {"mode": "glass", "opacity": 0.1}})
+        self.assertEqual(cfg.hud_opacity, 0.60)
+
     def test_provider_model_resolution(self) -> None:
         cfg = HudConfig(answers_backend="groq")
         self.assertTrue(cfg.resolve_chat_model())

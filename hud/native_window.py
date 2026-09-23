@@ -122,7 +122,7 @@ def run(url: str, title: str = "Meeting HUD", mode: str = "window",
         window.setHidesOnDeactivate_(False)
         window.setOpaque_(False)
         window.setBackgroundColor_(NSColor.clearColor())
-        window.setAlphaValue_(min(1.0, max(0.45, float(opacity))))
+        window.setAlphaValue_(min(1.0, max(0.60, float(opacity))))
         window.setFrameAutosaveName_("zoom-recorder-glass-hud")
         if not window.setFrameUsingName_("zoom-recorder-glass-hud"):
             window.center()
@@ -136,9 +136,12 @@ def run(url: str, title: str = "Meeting HUD", mode: str = "window",
             window.center()
     window.setReleasedWhenClosed_(False)
     window.setLevel_(NSFloatingWindowLevel)
-    collection = NSWindowCollectionBehaviorCanJoinAllSpaces
-    collection |= (NSWindowCollectionBehaviorCanJoinAllApplications
-                   if glass else NSWindowCollectionBehaviorFullScreenAuxiliary)
+    # FullScreenAuxiliary keeps the panel in the call's full-screen Space.
+    # Glass also opts into all-app visibility; both behaviors are intentional.
+    collection = (NSWindowCollectionBehaviorCanJoinAllSpaces
+                  | NSWindowCollectionBehaviorFullScreenAuxiliary)
+    if glass:
+        collection |= NSWindowCollectionBehaviorCanJoinAllApplications
     window.setCollectionBehavior_(collection)
     # This is a compatibility feature, not a security promise. Apple has
     # deprecated the old sharing enum for some modern capture paths.

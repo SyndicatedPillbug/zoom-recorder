@@ -523,7 +523,8 @@ def config_from_dict(data: Dict[str, Any]) -> HudConfig:
         hud_mode=(str(hud.get("mode") or "window").strip().lower()
                   if str(hud.get("mode") or "window").strip().lower() in ("window", "glass")
                   else "window"),
-        hud_opacity=min(1.0, max(0.45, _as_float(hud.get("opacity"), 0.90))),
+        # Keep a readable floor so the overlay cannot visually disappear.
+        hud_opacity=min(1.0, max(0.60, _as_float(hud.get("opacity"), 0.90))),
         hud_compact=bool(hud.get("compact", False)),
         open_browser=bool(hud.get("open_browser", True)),
         host=str(hud.get("host") or "127.0.0.1"),
