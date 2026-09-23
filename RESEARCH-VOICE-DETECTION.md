@@ -22,21 +22,23 @@ Replaying the source through the original live detector after downsampling to
   output was not yet the Multi-Output Device. This is a routing failure, not a
   voice-detection failure.
 
-After the RMS/crest/two-frame hardening below, the same normalized recording
-produced 0.0% speech frames. Whisper's direct full-file decode returned only
-repeated `Thank you` filler rather than intelligible transcript content, so
-this sample is best treated as a false-positive/noise stress test, not as a
+The first RMS/crest/two-frame experiment classified 0.0% of frames as speech.
+An amplified local-Turbo pass still returned only repeated `Thank you` filler
+rather than intelligible transcript content, so this sample is not sufficient
+to label speech versus noise. Because the recording owner reported that it
+did contain some real speech, RMS-only gating is not enabled as the default.
+This remains a useful false-positive/noise stress test, but not a
 speech-accuracy benchmark.
 
 ### Interpretation
 
 This sample does not justify lowering the current speech threshold. The
-original gate was clearly too permissive for this recording, while the
-hardened gate correctly refused to forward it. Lowering the threshold would
-increase the chance that fan, hum, keyboard transients, and empty-call audio
-reach Whisper—the exact path that caused the earlier hallucinated “oh, oh,
-oh, oh” and slide-navigation lines. A real speech recording is still needed
-before changing the default toward greater sensitivity.
+original gate was clearly too permissive for this recording, but the RMS
+experiment was too aggressive when the sample's reported speech was extremely
+quiet. The live default therefore preserves peak sensitivity, adds a
+two-frame open delay and isolated-click rejection, and leaves RMS available
+for diagnostics. A labeled speech recording is required before making RMS a
+hard gate or selecting a neural-VAD threshold.
 
 The immediate audio problem was routing. `zoom_record.py --fix-routing` now
 repairs the existing Multi-Output Device, and `--check-routing` confirmed that
@@ -48,9 +50,11 @@ continuing after a failed repair.
 
 The benchmark exposed a real weakness in the original energy gate: it relied
 on peak energy, so a low-level noise bed with occasional peaks could look like
-98% speech. The live gate now:
+98% speech. The first RMS experiment then showed the opposite risk: a hard
+RMS threshold can suppress very quiet reported speech. The live gate now:
 
-- makes its adaptive decision on RMS energy rather than a single peak sample;
+- keeps peak energy for the default decision so quiet speech remains eligible;
+- retains RMS for diagnostics and future calibrated VAD work;
 - rejects frames with an excessive peak-to-RMS crest ratio, which filters
   isolated clicks and spikes; and
 - requires two consecutive qualifying frames before opening speech.
@@ -87,6 +91,6 @@ optional WebRTC VAD, and Silero VAD against the same files. Do not select a
 new default from a single clean one-sided recording.
 
 The present implementation keeps the low-latency adaptive energy path as the
-default, preserves the stronger Whisper evidence gates, and leaves the neural
-VAD upgrade as an evidence-driven next phase rather than adding a model and
-new runtime dependency without measured benefit.
+default, preserves quiet-speech sensitivity and the stronger Whisper evidence
+gates, and leaves RMS/neural VAD selection as an evidence-driven next phase
+rather than adding a model or hard gate without measured benefit.

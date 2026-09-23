@@ -356,8 +356,8 @@ speaker IDs are not reusable identities by themselves.
 
 **How it works.** A dedicated, isolated `ffmpeg` process taps the same mic +
 loopback devices the recorder uses and emits 16 kHz mono PCM. Speech is
-detected by a **voice-activity gate** — an adaptive RMS noise floor per source
-with a peak/crest check for isolated clicks, or
+detected by a **voice-activity gate** — an adaptive peak-energy noise floor per
+source with RMS diagnostics and a peak/crest check for isolated clicks, or
 `webrtcvad` when it is installed — so steady room noise (air conditioning, fan
 hum) is never sent to be transcribed, and chunks are queued to per-source STT
 workers (a slow call never makes the tap fall behind; if it does, the lag is
@@ -454,9 +454,9 @@ The app also keeps a small deterministic meeting-memory stream for decisions,
 commitments, and numeric facts. It is updated off the answer loop and each item
 keeps the exact transcript evidence that produced it.
 
-**Voice activity (optional).** Speech is detected with an adaptive RMS
-noise-floor gate by default, which rejects steady hum and isolated clicks
-without any dependency. Installing
+**Voice activity (optional).** Speech is detected with an adaptive
+peak-energy noise-floor gate by default, with RMS diagnostics and isolated
+click rejection without any dependency. Installing
 `webrtcvad` (`pip install webrtcvad`) switches to a real VAD automatically
 (`stt.vad_backend: "auto"`); set it to `"energy"` to force the stdlib gate or
 `"webrtcvad"` to require the package. `stt.hallucination_filter` and the

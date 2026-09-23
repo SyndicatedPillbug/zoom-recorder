@@ -7,11 +7,12 @@ hallucinates repetitive filler on that non-speech audio. Instead we track a
 per-source adaptive noise floor and only treat energy clearly above it as
 speech.
 
-The stdlib detector uses RMS energy for the decision, with a peak/crest check
-to reject isolated clicks. This matters in practice: the benchmark recording
-had a high peak level from low-level noise but Whisper decoded it as repeated
-"Thank you" despite containing no supported speech. ``webrtcvad`` is used for
-a real VAD when installed; otherwise this dependency-free detector is used.
+The stdlib detector keeps peak energy for the decision so quiet speech is not
+silently discarded, while retaining RMS and a peak/crest check as diagnostics
+and an isolated-click guard. RMS-only gating was tested against a noisy
+recording, but is deliberately not the default until a labeled speech
+benchmark proves it does not miss quiet talkers. ``webrtcvad`` is used for a
+real VAD when installed; otherwise this dependency-free detector is used.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ SAMPLE_WIDTH = 2
 def frame_level_dbfs(pcm: bytes) -> float:
     """Peak level in dBFS for a small PCM block (0 dB == full scale).
 
-    This remains available for diagnostics and capture checks.
+    Peak keeps the fallback gate sensitive to quiet speech. RMS is available
+    separately for diagnostics and future calibrated VAD work.
     """
     return _frame_levels(pcm)[0]
 
@@ -114,26 +116,22 @@ class EnergyVAD:
             # ambient. The quietest frame is the safest floor estimate -- if
             # speech was already happening it is an inter-word gap, not the
             # speech itself, so we never calibrate the gate above the talker.
-            self._calibration.append(level)
+            self._calibration.append(peak)
             self.last_margin_db = 0.0
             if len(self._calibration) >= self.calibration_frames:
-                # Ignore one unusually quiet startup frame. A low percentile
-                # tracks the ambient bed without setting the floor to a peak.
-                ordered = sorted(self._calibration)
-                floor = ordered[min(len(ordered) - 1,
-                                    max(0, int(len(ordered) * 0.2)))]
+                floor = min(self._calibration)
                 self._noise.noise_db = max(self._noise.floor_db,
                                            min(self.max_noise_db, floor))
                 self._calibrated = True
             return False
 
         threshold = self.threshold_db()
-        raw_speech = (level > threshold
+        raw_speech = (peak > threshold
                       and (peak - level) <= self.max_crest_db)
         self._speech_run = self._speech_run + 1 if raw_speech else 0
         speech = raw_speech and self._speech_run >= self.speech_start_frames
-        self.last_margin_db = level - threshold
-        self._noise.update(level, self.margin_db)
+        self.last_margin_db = peak - threshold
+        self._noise.update(peak, self.margin_db)
         return speech
 
 
