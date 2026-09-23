@@ -201,6 +201,10 @@ signals. Cap files, chunks, characters, and prompt tokens.
 Gate: every retrieved chunk carries file/heading provenance and retrieval stays within its latency
 budget; full-vault prompt insertion is impossible.
 
+Current status: the merged static/live retrieval path now enforces `kb.max_chars` (6,000 by
+default) and is covered at the answer-consumption point. Tag/link-aware reranking and large-vault
+latency measurements remain open.
+
 ## Phase 5 — Participant attribution
 
 ### Step 5.1 — Make manual identity edits first-class

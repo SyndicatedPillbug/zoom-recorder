@@ -42,7 +42,7 @@ from hud.evaluation import (first_stable_publication_stats, normalize_words,  # 
                             stable_prefix_stats, word_error_stats)
 from hud.identity import (build_identity, derive_title, meaningful_folder_name,
                           slugify)  # noqa: E402
-from hud.kb import KBIndex, _lexical_score, chunk_markdown  # noqa: E402
+from hud.kb import KBIndex, KBSnippet, _lexical_score, chunk_markdown  # noqa: E402
 from hud.lifecycle import run_fixture  # noqa: E402
 from hud.local_http import host_from_header, url_host  # noqa: E402
 from hud.llm import LLMError, LLMResult  # noqa: E402
@@ -987,6 +987,21 @@ class MemoryAndReplayTests(unittest.TestCase):
             self.assertEqual(saved["fixture"], "speech")
             self.assertEqual(list(target.parent.glob("*.tmp")), [])
 
+    def test_answer_retrieval_respects_total_knowledge_budget(self) -> None:
+        cfg = HudConfig(kb_enabled=True, kb_top_k=5, kb_max_chars=10)
+        engine = AnswerEngine(LiveState(), lambda _m: None, cfg)
+
+        class _Index:
+            def query(self, _text, top_k=5):
+                return [KBSnippet("one.md", "A", "123456789", 0.9),
+                        KBSnippet("two.md", "B", "abcdefghij", 0.8)]
+
+        engine._kb = _Index()
+        snippets = engine._query_all("question", 5)
+        self.assertEqual(sum(len(item.text) for item in snippets), 10)
+        self.assertEqual(snippets[0].text, "123456789")
+        self.assertEqual(snippets[1].text, "a")
+
     def test_benchmark_suite_records_completed_and_skipped_fixtures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1256,6 +1271,7 @@ class ConfigTests(unittest.TestCase):
         again = config_from_dict(config_to_dict(cfg))
         for attr in ("self_name", "remote_name", "answers_backend", "answers_fallback",
                      "kb_dirs", "kb_top_k", "budget_tpm", "budget_tpd", "port",
+                     "kb_max_chars",
                      "open_browser", "answer_interval", "chat_model", "rolling_model",
                      "answers_enabled", "context_max_chars", "question_lookback_seconds",
                      "question_rewrite", "kb_embed_backend", "kb_embed_model",

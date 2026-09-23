@@ -1038,7 +1038,21 @@ class AnswerEngine:
         if self._live_kb is not None:
             results.extend(self._live_kb.query(query_text, top_k))
         results.sort(key=lambda s: s.score, reverse=True)
-        return results[:top_k]
+        selected = []
+        remaining = max(0, int(getattr(self.cfg, "kb_max_chars", 6000)))
+        for snippet in results[:top_k]:
+            if remaining == 0:
+                break
+            text = str(getattr(snippet, "text", "") or "")
+            if remaining > 0 and len(text) > remaining:
+                text = text[:remaining]
+            if not text:
+                continue
+            selected.append(KBSnippet(source=snippet.source,
+                                      heading=snippet.heading,
+                                      text=text, score=snippet.score))
+            remaining -= len(text)
+        return selected
 
     # -- generation --------------------------------------------------------
     def _qa_recent(self) -> List[Dict[str, Any]]:
