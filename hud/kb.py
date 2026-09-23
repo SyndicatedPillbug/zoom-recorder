@@ -31,6 +31,7 @@ DEFAULT_CACHE = Path.home() / ".cache" / "zoom-recorder" / "kb"
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'_-]+", re.I)
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
+INLINE_TAG_RE = re.compile(r"(?<![\w/])#([a-zA-Z][\w/-]*)")
 IGNORED_DIRS = {".obsidian", ".git", ".trash", ".stfolder", "node_modules",
                 "__pycache__"}
 LEXICAL_STOPWORDS = {
@@ -267,8 +268,11 @@ def _chunk_tags(chunk: Dict[str, Any]) -> set:
     """Return normalized Obsidian tags from frontmatter for optional scoping."""
     metadata = chunk.get("metadata") or {}
     raw = str(metadata.get("tags") or metadata.get("tag") or "")
-    return {token.lower().lstrip("#") for token in re.split(r"[,\s]+", raw)
+    tags = {token.lower().lstrip("#") for token in re.split(r"[,\s]+", raw)
             if token.strip().lstrip("#")}
+    tags.update(match.lower() for match in INLINE_TAG_RE.findall(
+        "{}\n{}".format(chunk.get("heading", ""), chunk.get("text", ""))))
+    return tags
 
 
 def _lexical_text(chunk: Dict[str, Any]) -> str:

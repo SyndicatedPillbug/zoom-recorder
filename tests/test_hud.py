@@ -676,6 +676,20 @@ class KBTests(unittest.TestCase):
             hits = index.query("pricing", top_k=5)
             self.assertEqual([hit.source for hit in hits], ["enterprise.md"])
 
+    def test_index_scope_recognizes_inline_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "inline.md").write_text(
+                "# Planning\n\n#enterprise pricing discussion.\n")
+            index = KBIndex([str(root)], self.KeywordEmbedder(),
+                            cache_dir=str(Path(tmp) / "cache"),
+                            log=lambda _m: None, min_score=0.0,
+                            scope_tags=["enterprise"])
+            self.assertTrue(index.build())
+            self.assertEqual([hit.source for hit in index.query("pricing")],
+                             ["inline.md"])
+
     def test_retrieval_benchmark_reports_latency_samples(self) -> None:
         result = run_kb_benchmark(chunk_count=40, query_count=3, top_k=2)
         self.assertEqual(result["chunk_count"], 40)
