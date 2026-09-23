@@ -564,6 +564,11 @@ can be run with:
 python3 -m hud.kb_benchmark --chunks 6000 --queries 40 --output /tmp/kb-retrieval.json
 ```
 
+The index stores conservative path/size/mtime/inode signatures and loads a
+cached index without rereading unchanged note bodies. Any signature change,
+missing signature, forced reindex, or older cache falls back to the existing
+content-fingerprint validation and per-file cache path.
+
 ```bash
 python3 -m hud.replay ~/ZoomRecordings/2026-09-22/14-32-08_enrollment-planning_a1b2c3d4/derived/live_events.jsonl
 ```

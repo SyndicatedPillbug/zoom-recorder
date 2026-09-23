@@ -643,6 +643,21 @@ class KBTests(unittest.TestCase):
             self.assertTrue(again.build())
             self.assertTrue(again.query("alpha"))
 
+    def test_index_fast_path_avoids_content_scan_when_files_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "notes"
+            root.mkdir()
+            (root / "a.md").write_text("# Alpha\n\nalpha content\n")
+            cache = Path(tmp) / "cache"
+            self.assertTrue(KBIndex([str(root)], self.KeywordEmbedder(),
+                                    cache_dir=str(cache), log=lambda _m: None).build())
+            again = KBIndex([str(root)], self.KeywordEmbedder(),
+                            cache_dir=str(cache), log=lambda _m: None)
+            with mock.patch("hud.kb._fingerprint", side_effect=AssertionError(
+                    "unchanged files should use the stat fast path")):
+                self.assertTrue(again.build())
+            self.assertTrue(again.query("alpha"))
+
     def test_index_uses_metadata_to_break_semantic_ties(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "notes"

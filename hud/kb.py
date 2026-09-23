@@ -222,6 +222,24 @@ def _fingerprint(files: List[Path], salt: str = "") -> str:
     return h.hexdigest()
 
 
+def _file_stat_signature(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"path": str(path), "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns), "inode": int(stat.st_ino)}
+
+
+def _file_stats_match(saved: Any, files: List[Path]) -> bool:
+    if not isinstance(saved, list) or len(saved) != len(files):
+        return False
+    current = [_file_stat_signature(path) for path in sorted(files)]
+    if any(item is None for item in current):
+        return False
+    return current == saved
+
+
 def _norm(vector: List[float]) -> float:
     return math.sqrt(sum(x * x for x in vector))
 
@@ -472,9 +490,23 @@ class KBIndex:
             self.log("KB: no markdown files found in {}".format(", ".join(self.dirs)))
             return False
         embedder_label = self._embedder_label()
-        fingerprint = _fingerprint(files, salt=embedder_label)
         meta_file = self.cache_dir / "index.json"
         vectors_file = self.cache_dir / "vectors.json.gz"
+        if not force and meta_file.is_file() and vectors_file.is_file():
+            try:
+                cached_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                cached_meta = None
+            if (isinstance(cached_meta, dict)
+                    and cached_meta.get("embedder") == embedder_label
+                    and _file_stats_match(cached_meta.get("file_stats"), files)
+                    and self._load_cache(meta_file, vectors_file, fingerprint=None)):
+                self._ready = True
+                self.log("KB: loaded cached index after file-stat check ({} chunks, {})".format(
+                    len(self._chunks), getattr(self.embedder, "label", "?")))
+                return True
+
+        fingerprint = _fingerprint(files, salt=embedder_label)
         if not force and meta_file.is_file() and vectors_file.is_file():
             if self._load_cache(meta_file, vectors_file, fingerprint):
                 self._ready = True
@@ -560,6 +592,8 @@ class KBIndex:
                 Path(temp_name).write_text(
                     json.dumps({"fingerprint": fingerprint,
                                 "embedder": embedder_label,
+                                "file_stats": [_file_stat_signature(path)
+                                                for path in sorted(files)],
                                 "chunks": chunks}), encoding="utf-8")
 
             def write_vectors(temp_name: str) -> None:
@@ -578,10 +612,13 @@ class KBIndex:
                 unreadable_files))
         return True
 
-    def _load_cache(self, meta_file: Path, vectors_file: Path, fingerprint: str) -> bool:
+    def _load_cache(self, meta_file: Path, vectors_file: Path,
+                    fingerprint: Optional[str]) -> bool:
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            if meta.get("fingerprint") != fingerprint:
+            if meta.get("embedder") != self._embedder_label():
+                return False
+            if fingerprint is not None and meta.get("fingerprint") != fingerprint:
                 return False
             with gzip.open(vectors_file, "rt", encoding="utf-8") as fh:
                 vectors = json.load(fh)
