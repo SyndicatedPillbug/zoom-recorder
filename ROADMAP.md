@@ -264,8 +264,8 @@ Exit criteria:
 
 Current status: Settings exposes audio, models, providers, writeback, Obsidian folders,
 diarization, and retrieval budgets/scope. The HUD exposes transcript/answer state, editable
-speaker labels, and technical latency details. One-click redacted diagnostics and integrated
-permission recovery remain open.
+speaker labels, and technical latency details. Setup now exports one-click redacted diagnostics;
+integrated permission recovery remains open.
 
 ## Phase 7 — Privacy, security, and operational hardening
 
@@ -318,11 +318,12 @@ Before moving to the next major phase, use these gates:
 
 1. Provision a broader timestamped speech and two-speaker corpus, then rerun interim/model gates
    without changing the Turbo final baseline.
-2. Run the controlled end-to-end audio-file lifecycle harness through capture, STT, answers,
-   writeback, shutdown, and restart with real audio plumbing.
-3. Aggregate answer traces over long replays and measure active-question reconstruction, talking
-   point isolation, and provider fallback behavior.
-4. Complete permission recovery and one-click redacted diagnostics in the control center.
+2. [partially complete] Run the controlled end-to-end audio-file lifecycle harness through capture,
+   local STT, writeback, shutdown, and restart; add an answer-enabled provider-free lane next.
+3. [partially complete] Aggregate answer traces over long replays; measure active-question
+   reconstruction, talking-point isolation, and provider fallback behavior next.
+4. [partially complete] Add one-click redacted diagnostics; complete permission recovery in the
+   control center.
 5. Add labeled diarization fixtures and measure speaker error, unknown rate, corrections, and
    added post-call latency.
 6. Run adverse-environment tests and local privacy/deletion verification.

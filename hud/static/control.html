@@ -91,6 +91,7 @@
         Discord, Slack, or any call in your browser.</p>
       <div class="row"><div class="ctl">
         <button id="runChecks">Check my audio</button>
+        <button class="secondary" id="saveDiagnostics">Save redacted diagnostics</button>
         <span class="status muted" id="checksStatus"></span>
       </div></div>
       <div id="checks"></div>
@@ -531,6 +532,14 @@
     });
   }
   $('runChecks').onclick = runChecks;
+  $('saveDiagnostics').onclick = async () => {
+    await guarded($('checksStatus'), 'Saving…', async () => {
+      const r = await api('/api/diagnostics', 'POST', {});
+      if (r && r.ok) setStatus($('checksStatus'),
+        (r.message || 'Saved.') + ' ' + r.path, 'ok');
+      return r;
+    });
+  };
 
   // ---- mic test --------------------------------------------------------
   $('micTest').onclick = async () => {

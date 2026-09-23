@@ -3322,6 +3322,34 @@ class ControlCenterTests(unittest.TestCase):
             self.assertTrue(checks["ok"])
             self.assertTrue(checks["checks"])
 
+    def test_diagnostics_export_is_redacted_and_user_recoverable(self) -> None:
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app, port = self._server(tmp)
+            checks = [{"name": "provider", "ok": False,
+                       "detail": "missing key", "fix": "set key", "critical": False}]
+            with mock.patch("hud.control.doctor_checks", return_value=checks), \
+                 mock.patch("hud.control.recording_active", return_value=False), \
+                 mock.patch("hud.routing_fix.is_loopback_active", return_value=False), \
+                 mock.patch("hud.routing_fix.get_output_volume", return_value=55), \
+                 mock.patch("hud.diarization.diarization_readiness", return_value={"ready": False}):
+                with mock.patch.object(Path, "home", return_value=Path(tmp)):
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:{}/api/diagnostics?token={}".format(
+                            port, app.token), method="POST", data=b"{}",
+                            headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        result = json.loads(resp.read())
+
+            self.assertTrue(result["ok"])
+            report = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+            rendered = json.dumps(report)
+            self.assertIn("missing key", rendered)
+            self.assertEqual(report["config"]["api_keys"], {})
+            self.assertNotIn("test-secret", rendered)
+            self.assertNotIn("raw audio", rendered.lower())
+
     def test_test_recording_refused_while_recording(self) -> None:
         import urllib.request
 

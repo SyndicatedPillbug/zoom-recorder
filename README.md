@@ -172,7 +172,9 @@ four tabs — Setup (guided checks, microphone test, output picker, a ten-second
 test recording, transcription setup), Recordings (past sessions with
 transcript/summary/play/Show-in-Finder, plus **Move to Trash** — recordings are
 never permanently deleted), Settings (Basics + Advanced), and
-Help. The first run opens Setup automatically and runs the audio check.
+Help. Setup also has **Save redacted diagnostics**, which writes a local report
+of checks and safe configuration/status metadata without transcript, audio, or
+API-key values. The first run opens Setup automatically and runs the audio check.
 
 Click "Stop recording" to send the same clean-shutdown signal Ctrl+C would;
 **Open transcript window** re-opens the window in the browser (you can also

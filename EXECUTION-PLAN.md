@@ -263,6 +263,10 @@ Provide one-click redacted diagnostics.
 
 Gate: a user can identify what is trustworthy and what needs action from the UI alone.
 
+Current status: the Control Center now provides a one-click redacted diagnostics export. It
+includes actionable checks and safe configuration/status metadata while excluding API keys,
+transcript text, and audio. Integrated permission recovery remains open.
+
 ### Step 6.3 — Test adverse environments
 
 Cover sleep/wake, device changes, network loss, disk full, permission changes, provider rate

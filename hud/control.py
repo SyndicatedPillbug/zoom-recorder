@@ -44,6 +44,7 @@ from hud.config import (CONFIG_PATH, PROVIDERS, _defaults, _deep_merge,  # noqa:
 from hud.llm import LLMClient, LLMError  # noqa: E402
 from hud.local_http import bind_local_server, host_from_header, url_host  # noqa: E402
 from hud.recordings import list_recordings, move_to_trash  # noqa: E402
+from hud.diagnostics import build_report as build_diagnostics_report, default_path, write_report  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -438,6 +439,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._trash_recording(body)
             elif parsed.path == "/api/test-provider":
                 self._test_provider(body)
+            elif parsed.path == "/api/diagnostics":
+                self._diagnostics()
             elif parsed.path == "/api/models":
                 self._models(body)
             elif parsed.path == "/api/pick-dir":
@@ -507,6 +510,44 @@ class _Handler(BaseHTTPRequestHandler):
             checks = [{"name": "checks", "ok": False, "detail": str(exc),
                        "fix": "", "critical": True}]
         self._send_json({"ok": True, "checks": checks})
+
+    def _diagnostics(self) -> None:
+        """Write a redacted, user-recoverable setup report."""
+        from hud import routing_fix
+        from hud.diarization import diarization_readiness
+
+        cfg = load_config(self.app.config_path)
+        try:
+            checks = doctor_checks(skip_mic=recording_active())
+        except Exception as exc:  # noqa: BLE001
+            checks = [{"name": "checks", "ok": False, "detail": str(exc),
+                       "fix": "Retry the check from Setup", "critical": True}]
+        try:
+            diarization = diarization_readiness()
+        except Exception as exc:  # noqa: BLE001
+            diarization = {"ready": False, "state": "error", "detail": str(exc)}
+        status = {
+            "recording": recording_active(),
+            "routing_active": routing_fix.is_loopback_active(),
+            "volume": routing_fix.get_output_volume(),
+            "mode": cfg.recorder.mode,
+            "onboarded": cfg.onboarded,
+            "offline": cfg.offline,
+            "stt_backend": cfg.stt_backend,
+            "answers_enabled": cfg.answers_enabled,
+            "transcription_model": cfg.recorder.transcription_model,
+            "diarization": {"enabled": cfg.diarization_enabled, **diarization},
+            "api_keys_set": {
+                name: bool(cfg.api_key_for(name))
+                for name in PROVIDERS if get_provider(name).api_key_env
+            },
+        }
+        report = build_diagnostics_report(
+            checks, status, config_to_dict(cfg, include_keys=False),
+            config_path=str(self.app.config_path))
+        path = write_report(default_path(), report)
+        self._send_json({"ok": True, "path": str(path),
+                         "message": "Saved a redacted diagnostics report."})
 
     def _recordings(self) -> None:
         cfg = load_config(self.app.config_path)
