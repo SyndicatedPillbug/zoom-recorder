@@ -381,6 +381,11 @@ latency, audio egress, and Groq audio-second usage, although it does not make
 the Whisper computation itself faster than Groq's hosted hardware.
 The local server is warmed with a short silence request before capture, so
 one-time model/runtime initialization does not land on the first speech window.
+Local live decoding also uses Whisper's strict no-speech threshold and disables
+temperature fallback, reducing invented text when the microphone receives
+humming, music, or other non-speech audio. Repeated non-speech interjections
+such as “oh, oh, oh, oh” are discarded; low-signal slide-transition loops are
+discarded only when the audio is marginal.
 
 Local mode also enables near-real-time interim words by default. It re-decodes
 an overlapping four-second window about every 0.8 seconds. The HUD shows the

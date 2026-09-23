@@ -51,6 +51,7 @@ HALLUCINATION_PHRASES = re.compile(
     re.I,
 )
 BARE_INTERJECTIONS = {"you", "thank you", "thanks", "bye", "okay", "ok", "yeah", "hmm", "uh"}
+REPEATED_NON_SPEECH = {"oh", "ooh", "ah", "aah", "uh", "um", "hmm", "mm"}
 
 
 @dataclass
@@ -87,6 +88,9 @@ def looks_hallucinated(text: str, marginal: bool = False,
         return True
 
     words = re.findall(r"[a-z0-9']+", t.lower())
+    if (len(words) >= 3 and len(set(words)) == 1
+            and words[0] in REPEATED_NON_SPEECH):
+        return True
     if len(words) >= 6:
         unique_ratio = len(set(words)) / len(words)
         if unique_ratio < 0.45:
@@ -101,6 +105,12 @@ def looks_hallucinated(text: str, marginal: bool = False,
                 return True
 
     if marginal:
+        # Whisper commonly invents slide-transition narration when a short
+        # low-signal chunk gives it no lexical evidence. Keep this narrow and
+        # marginal-only so a clearly spoken real sentence is never discarded.
+        if re.fullmatch(r"(?:i['’]?m|i am) going to go to the next slide[.!]?",
+                        t, re.I):
+            return True
         if avg_logprob is not None and avg_logprob < avg_logprob_min:
             return True
         if len(words) <= 2 and t.lower().strip(".,!? ") in BARE_INTERJECTIONS:
@@ -453,11 +463,15 @@ class LocalWhisperSTT:
 
     def __init__(self, model_path: Path, log: Callable[[str], None],
                  bin_name: str = "whisper-server",
-                 allow_cli_fallback: bool = True) -> None:
+                 allow_cli_fallback: bool = True,
+                 no_speech_threshold: float = 0.60,
+                 no_fallback: bool = True) -> None:
         self.model = Path(model_path)
         self.log = log
         self.bin_name = bin_name
         self.allow_cli_fallback = allow_cli_fallback
+        self.no_speech_threshold = float(no_speech_threshold)
+        self.no_fallback = bool(no_fallback)
         self._server: Optional[subprocess.Popen] = None
         self._port: Optional[int] = None
         self._cli = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
@@ -473,7 +487,9 @@ class LocalWhisperSTT:
     def _start_server(self) -> None:
         port = self._free_port()
         cmd = [self.bin_name, "-m", str(self.model), "--host", "127.0.0.1",
-               "--port", str(port)]
+               "--port", str(port), "-nth", str(self.no_speech_threshold)]
+        if self.no_fallback:
+            cmd.append("-nf")
         try:
             self._server = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -550,7 +566,10 @@ class LocalWhisperSTT:
             out_base = Path(tmp) / "out"
             wav_path.write_bytes(wav)
             cmd = [self._cli, "-m", str(self.model), "-f", str(wav_path),
-                   "-otxt", "-of", str(out_base), "-np"]
+                   "-otxt", "-of", str(out_base), "-np",
+                   "-nth", str(getattr(self, "no_speech_threshold", 0.60))]
+            if getattr(self, "no_fallback", True):
+                cmd.append("-nf")
             if prompt:
                 cmd += ["--prompt", prompt]
             # Metal is substantially faster on Apple Silicon, but a process
@@ -817,7 +836,9 @@ class LiveTranscriber:
         if (self.cfg.stt_backend or "").lower() in LOCAL_STT_BACKENDS:
             if self.model_path is None:
                 raise RuntimeError("local STT needs --model pointing at a ggml model")
-            return LocalWhisperSTT(self.model_path, self.log, self.cfg.stt_whisper_bin)
+            return LocalWhisperSTT(
+                self.model_path, self.log, self.cfg.stt_whisper_bin,
+                no_speech_threshold=min(0.60, self.cfg.stt_no_speech_prob_max))
         provider = self.cfg.provider_for_stt()
         if provider is None:
             raise RuntimeError("unknown STT backend '{}'".format(self.cfg.stt_backend))

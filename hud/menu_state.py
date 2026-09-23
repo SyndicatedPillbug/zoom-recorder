@@ -24,7 +24,7 @@ def format_elapsed(seconds: float) -> str:
 
 
 def describe(recording: bool, hud_active: bool, elapsed_s: float = 0.0,
-             live_available: bool = True) -> Dict[str, Any]:
+             live_available: bool = True, stopping: bool = False) -> Dict[str, Any]:
     """Return the icon and item labels/enabled-state for the current session.
 
     ``hud_active`` is only ever true while recording, since the transcript
@@ -37,12 +37,17 @@ def describe(recording: bool, hud_active: bool, elapsed_s: float = 0.0,
     else:
         icon = ICON_IDLE
 
-    if recording:
+    if recording and stopping:
+        toggle_title = "Finishing recording…"
+    elif recording:
         toggle_title = "Stop recording ({})".format(format_elapsed(elapsed_s))
     else:
         toggle_title = "Start recording"
 
-    if hud_active:
+    if stopping:
+        live_title = "Saving transcript…"
+        live_enabled = False
+    elif hud_active:
         live_title = "Live transcript active ✓"
         live_enabled = False
     elif not live_available:
@@ -58,5 +63,6 @@ def describe(recording: bool, hud_active: bool, elapsed_s: float = 0.0,
         "toggle_title": toggle_title,
         "live_title": live_title,
         "live_enabled": live_enabled,
-        "open_enabled": hud_active,
+        "open_enabled": hud_active and not stopping,
+        "stopping": bool(stopping),
     }

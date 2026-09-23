@@ -171,8 +171,10 @@ class SttPipelineTests(unittest.TestCase):
 
     def test_local_cli_retries_without_metal_after_process_failure(self) -> None:
         logs = []
+        commands = []
 
         def fake_run(command, **_kwargs):
+            commands.append(command)
             if "-ng" in command:
                 out_base = Path(command[command.index("-of") + 1])
                 out_base.with_suffix(".txt").write_text("recovered text", encoding="utf-8")
@@ -185,6 +187,8 @@ class SttPipelineTests(unittest.TestCase):
             result = stt.transcribe(b"\x00\x00" * 1600)
         self.assertEqual(result.text, "recovered text")
         self.assertTrue(any("GPU failed" in item for item in logs))
+        self.assertIn("-nf", commands[0])
+        self.assertIn("-nth", commands[0])
 
     def test_local_server_warmup_is_best_effort(self) -> None:
         logs = []
@@ -221,6 +225,14 @@ class SttPipelineTests(unittest.TestCase):
                 self.assertIs(tr._build_partial_stt(), expected)
                 factory.assert_called_once_with(
                     model, mock.ANY, "whisper-server", allow_cli_fallback=False)
+
+    def test_local_final_lane_uses_strict_no_speech_defaults(self) -> None:
+        cfg = HudConfig(stt_backend="local", stt_no_speech_prob_max=0.8)
+        tr = LiveTranscriber(LiveState(), lambda _m: None, cfg, "Mic", None,
+                             model_path=Path("/tmp/turbo.bin"))
+        with mock.patch("hud.stt.LocalWhisperSTT") as factory:
+            tr._build_stt()
+        self.assertEqual(factory.call_args.kwargs["no_speech_threshold"], 0.60)
 
     def test_partial_lane_can_run_while_final_lane_is_busy(self) -> None:
         cfg = HudConfig(stt_backend="local", stt_partial_window_seconds=0.2,
@@ -487,6 +499,15 @@ class HallucinationTests(unittest.TestCase):
     def test_bare_interjection_only_when_marginal(self) -> None:
         self.assertTrue(looks_hallucinated("you", marginal=True))
         self.assertFalse(looks_hallucinated("you", marginal=False))
+
+    def test_repeated_humming_interjection_is_dropped(self) -> None:
+        self.assertTrue(looks_hallucinated("Oh, oh, oh, oh."))
+        self.assertTrue(looks_hallucinated("oh oh oh", marginal=True))
+
+    def test_slide_loop_is_only_dropped_on_marginal_audio(self) -> None:
+        text = "I'm going to go to the next slide."
+        self.assertTrue(looks_hallucinated(text, marginal=True))
+        self.assertFalse(looks_hallucinated(text, marginal=False))
 
     def test_low_confidence_segments_dropped(self) -> None:
         self.assertTrue(looks_hallucinated(
@@ -1954,6 +1975,24 @@ class MenuStateTests(unittest.TestCase):
         self.assertEqual(state["live_title"], "Live transcript active ✓")
         self.assertFalse(state["live_enabled"])
         self.assertTrue(state["open_enabled"])
+
+    def test_stop_requested_changes_menu_state_before_process_exits(self) -> None:
+        state = describe(recording=True, hud_active=True, stopping=True)
+        self.assertEqual(state["toggle_title"], "Finishing recording…")
+        self.assertEqual(state["live_title"], "Saving transcript…")
+        self.assertTrue(state["stopping"])
+        self.assertFalse(state["open_enabled"])
+
+    def test_menu_bar_matches_stop_request_to_live_pid(self) -> None:
+        from menubar import _stop_requested
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "stop.requested"
+            marker.write_text("123", encoding="utf-8")
+            self.assertTrue(_stop_requested(123, marker))
+            self.assertFalse(_stop_requested(456, marker))
+            self.assertFalse(_stop_requested(None, marker))
+            self.assertFalse(marker.exists())
 
     def test_live_unavailable(self) -> None:
         state = describe(recording=False, hud_active=False, live_available=False)

@@ -58,6 +58,7 @@ except Exception:  # noqa: BLE001 - recorder must run even without the HUD packa
         return ""
 
 DEFAULT_MODEL = "~/.cache/whisper-cpp/ggml-large-v3-turbo-q5_0.bin"
+STOP_REQUEST_FILE = Path.home() / ".zoom_recorder_stop_requested"
 FLOOR_DB = -91.0
 LOW_COVERAGE_PCT = 50.0
 DURATION_TOLERANCE_PCT = 0.02
@@ -1594,6 +1595,14 @@ def main(argv: List[str]) -> int:
     def handle_signal(signum, frame):
         stop.set()
 
+    def request_stop():
+        """Share a stop request with the menu bar before finalization begins."""
+        stop.set()
+        try:
+            STOP_REQUEST_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
@@ -1619,7 +1628,7 @@ def main(argv: List[str]) -> int:
                 mic.device.name if mic is not None else None,
                 system_name(),
                 cfg.model,
-                on_stop=stop.set,
+                on_stop=request_stop,
                 started_at=started,
             )
             live.start()

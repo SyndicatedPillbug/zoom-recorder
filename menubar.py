@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import rumps
 
@@ -36,6 +37,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDER = SCRIPT_DIR / "zoom_record.py"
 SETTINGS = SCRIPT_DIR / "settings.py"
 PIDFILE = Path.home() / ".zoom_recorder.pid"
+STOP_REQUEST_FILE = Path.home() / ".zoom_recorder_stop_requested"
 HUD_URLFILE = Path.home() / ".zoom_recorder_hud.url"
 SETTINGS_PIDFILE = Path.home() / ".zoom_recorder_settings.pid"
 SETTINGS_URLFILE = Path.home() / ".zoom_recorder_settings.url"
@@ -117,6 +119,20 @@ def _read_pidfile(path: Path = PIDFILE) -> "int | None":
     return pid
 
 
+def _stop_requested(pid: Optional[int], path: Path = STOP_REQUEST_FILE) -> bool:
+    """Return whether this live recorder has entered finalization."""
+    if pid is None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    try:
+        return int(path.read_text().strip()) == pid
+    except (OSError, ValueError):
+        return False
+
+
 class RecorderApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(IDLE_TITLE, quit_button=None)
@@ -169,6 +185,7 @@ class RecorderApp(rumps.App):
     def _sync_ui(self) -> None:
         pid = _read_pidfile()
         recording = pid is not None
+        stopping = _stop_requested(pid)
         elapsed = 0.0
         if recording:
             try:
@@ -176,9 +193,10 @@ class RecorderApp(rumps.App):
             except OSError:
                 elapsed = 0.0
         state = describe(recording, self._hud_active(), elapsed_s=elapsed,
-                         live_available=live_transcript_available())
+                         live_available=live_transcript_available(), stopping=stopping)
         self.title = state["icon"]
         self.toggle_item.title = state["toggle_title"]
+        self.toggle_item.set_callback(None if state["stopping"] else self.toggle)
         self.live_item.title = state["live_title"]
         self.live_item.set_callback(self.start_live if state["live_enabled"] else None)
         self.open_hud_item.set_callback(self.open_hud if state["open_enabled"] else None)
@@ -458,6 +476,10 @@ class RecorderApp(rumps.App):
                 return
         except Exception:  # noqa: BLE001
             pass
+        try:
+            STOP_REQUEST_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
         args = [sys.executable, str(RECORDER)]
         extra = os.environ.get("ZOOM_RECORDER_ARGS")
         if extra:
@@ -474,6 +496,10 @@ class RecorderApp(rumps.App):
         # Send the clean stop signal but keep the pidfile until the process
         # actually exits: it still has to merge, verify and archive, and a
         # second recording must not start in the meantime.
+        try:
+            STOP_REQUEST_FILE.write_text(str(pid), encoding="utf-8")
+        except OSError:
+            pass
         try:
             os.kill(pid, signal.SIGINT)
         except ProcessLookupError:
